@@ -143,6 +143,31 @@ def cleanup_fixture(docker, container, image, share):
                        check=True, capture_output=True, text=True, timeout=30)
 
 
+def create_fixture_file(docker, container, relative, content):
+    """Create an independent server-side file inside this fixture's share."""
+    if (not isinstance(relative, str) or "\\" in relative or "\0" in relative
+            or any(part in ("", ".", "..") for part in relative.split("/"))):
+        raise ValueError("Fixture file must have a contained relative share path")
+    # Native Linux bind mounts retain Samba's root ownership. Inject the
+    # independent filesystem actor through the same disposable container,
+    # without changing share permissions or using the client under test.
+    script = """set -euC
+umask 022
+root=$1
+target=$root/$2
+parent=${target%/*}
+while :; do
+    [ -d "$parent" ] && [ ! -L "$parent" ] || exit 1
+    [ "$parent" = "$root" ] && break
+    parent=${parent%/*}
+done
+cat > "$target"
+"""
+    subprocess.run([docker, "exec", "--interactive", "--user", "0:0", container,
+                    "sh", "-c", script, "rdrive-fixture-create", "/share", relative],
+                   input=content, check=True, capture_output=True, timeout=30)
+
+
 def run_tests(binary):
     docker = os.environ.get("RDRIVE_DOCKER") or shutil.which("docker")
     if not docker:
@@ -374,7 +399,8 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                         success(**delete_request)
                         deleted_path = share / "provider-own-write/ns-renamed.txt"
                         assert not deleted_path.exists()
-                        deleted_path.write_bytes(b"external replacement after completed delete")
+                        create_fixture_file(docker, container, "provider-own-write/ns-renamed.txt",
+                                            b"external replacement after completed delete")
                         success(**delete_request)
                         assert deleted_path.read_bytes() == b"external replacement after completed delete"
                         moved_directory = success(op="item", id=moved_directory["id"])["item"]
