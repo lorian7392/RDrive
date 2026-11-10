@@ -1,0 +1,19 @@
+{
+  "binary": "target/release/rdrive",
+  "binary_sha256": "ba4f81c2968e87ceffa3fc93202386de650424c1ff2f76f40fae16bc86333c98",
+  "version": "rdrive 0.6.0",
+  "checks": [
+    "raw DAV external body after publication is rejected and local A remains exportable",
+    "raw DAV external tags after publication cannot become our successful metadata receipt",
+    "managed competing commit before final response cannot be misattributed as our receipt",
+    "confirmed receipt graph crosses own tags and attribute-removal saves but refuses unrelated external metadata",
+    "actual broker SIGKILL after DAV delete recovers absence without issuing a second DELETE",
+    "lost DAV delete acknowledgement preserves a same-path replacement after broker restart",
+    "SIGKILL after metadata-only publication reconciles exact own tags without conflict or a second PUT"
+  ],
+  "passed": 7,
+  "scope": "synthetic authenticated loopback DAV, independent writer home, actual broker SIGKILL; no real storage",
+  "path_format": {
+    "binary": "repository-relative when inside the repository; otherwise absolute"
+  }
+}

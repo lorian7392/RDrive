@@ -141,6 +141,7 @@ def run(binary):
             print("PASS " + text, flush=True)
         try:
             cli("profile", "add", "fixture", "--protocol", "webdav", "--url", f"http://127.0.0.1:{server.server_port}/dav/", "--allow-http", "--username", "user", "--password-env", "RDRIVE_SMART_TEST_PASSWORD")
+            cli("index", "config", "--disable", "--refresh-seconds", "3", "--active-refresh-seconds", "3")
             cli("smart", "setup", "smart-fixture", "fixture")
             root_started = time.monotonic()
             start()
@@ -351,7 +352,10 @@ def run(binary):
             server.server_close()
             log.close()
     report = {"binary":str(binary),"version":subprocess.check_output([str(binary),"--version"],text=True).strip(),"binary_sha256":hashlib.sha256(binary.read_bytes()).hexdigest(),"checks":checks,"passed":len(checks),"scope":"synthetic loopback DAV; no real remote mutations"}
-    report_path = ROOT / "docs/SMART_VALIDATION.json"
+    version = report["version"].split()[-1]
+    suffix = ".debug" if "debug" in binary.parts else ""
+    report["binary"] = str(binary.relative_to(ROOT)) if binary.is_relative_to(ROOT) else binary.name
+    report_path = ROOT / f"docs/SMART_VALIDATION_{version}{suffix}.json"
     report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2)+"\n")
     print(json.dumps(report,ensure_ascii=False))
 

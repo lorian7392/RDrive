@@ -1,0 +1,57 @@
+{
+  "version": "0.6.0",
+  "validated_utc": "2026-11-10T03:13:25.087147+00:00",
+  "release_binary_sha256": "ba4f81c2968e87ceffa3fc93202386de650424c1ff2f76f40fae16bc86333c98",
+  "command": "cargo test --locked --offline",
+  "compilation": "debug test artifacts; final release built from same Rust source",
+  "passed": 167,
+  "failed": 0,
+  "ignored": 4,
+  "groups": {
+    "library": 123,
+    "cli_parser": 2,
+    "http_cache": 1,
+    "mount_api": 3,
+    "smart_journal": 8,
+    "webdav": 30
+  },
+  "new_library_tests": {
+    "sqlite_storage": 9,
+    "index_scheduler": 17
+  },
+  "ignored_scope": "3 dedicated Rust Samba integrations and 1 actual native mount remain ignored; separate raw/Smart encrypted SMB provider workflows passed",
+  "release_workflows": {
+    "directory_index": 10,
+    "smart": 15,
+    "mcp": 14,
+    "receipts_and_crash": 7,
+    "encrypted_smb_provider": 4
+  },
+  "source_sha256": {
+    "src/backend.rs": "5af1d42936c29dd55ea30df2a28b5291044433e8338505b26990d40fe243223b",
+    "src/cache.rs": "5f4214cfe98a6380b040041b0fd4b1ce8981f32cf7c71bf78c8b4c025074fd71",
+    "src/config.rs": "6c3e8c48bab6e713f1332a1c78eb2010fadf31f2de35109beb2192c6d2e4aa58",
+    "src/factory.rs": "c682f09a9760253f6ba289a0a5ac3b5167e257ac3cfe28220ee7d3fc2ddf67d8",
+    "src/lib.rs": "e2314b26808e65d45a0d539b0801dcc0856f62139d000d494d50b272b41aba5a",
+    "src/main.rs": "8ae652731800fd4e5740310c6f833fe8f2d88e3ce99de57e14a81054a5ecd8ee",
+    "src/mcp/catalog.rs": "302b82d538d0bef4647fed22237372a83dab1738d0c0ffbe40b53b07d43d5e7e",
+    "src/mcp.rs": "8d77bfa3e931987cd3547cc9566b64963ed0effe22e432e9bfc58660e9d0fd5c",
+    "src/metadata.rs": "4a630464ba9d492897f89cf0b5c361deddec206a89f317fc19a971f84c7ff627",
+    "src/metadata_remote.rs": "be65100c9c49b3eff7f606d11b4247492290849d576c7f00514e152e226841d7",
+    "src/mount.rs": "42f8bdfc01ec19017693eb426c25d2538dfcd7c34f46df122ce37ac5daad2654",
+    "src/operations.rs": "8ea8a369f6f09474e9dbad723bb8c30902a282b31d155c0049fbf291d9f93546",
+    "src/provider/index.rs": "46145549100b6b4579d4782c1f1c88678c46be39e0a88eac48f1bb42b6e4d54c",
+    "src/provider/index_scheduler.rs": "e4a2e3c8ca6ca2510c60846d0444d68a8e5aa9b3c98a4f0d72da2b8185a58e10",
+    "src/provider.rs": "f707fc625f147e92ae8a758621e27cd60b3a1687502246fb16764521bd14b4c2",
+    "src/provider_scopes_tests.rs": "52784ae7dff98d01774160384531ff08af3daa971b0959614c579d2a6d8d2161",
+    "src/repository.rs": "dbcaec7d30a7a396efe751e90d42848fd17bd5c92fc9ec13b5c4a8412a01249c",
+    "src/resume.rs": "641749c4c3f89b7145a1dea71d2f31e5555aa644c66337fa8a10c922c73d18bd",
+    "src/scheduler.rs": "ecafa305f1156df6b64aa779081fe6af1354466edfda7d19a53b8dfeed3329d3",
+    "src/smart.rs": "3e50e3bbed993f3e11bcae06c7b69551bec351bd34ea48f78e06561debbfe7c6",
+    "src/smb.rs": "b31427c31d152e11ea637be7db6a37055fdc67bcf0fe9c487b74414ddd788c48",
+    "src/state.rs": "efc839a9e9c66ed84850110e254485648f72f0fc36aefe1dcc66ade7f84bd6be",
+    "src/sync.rs": "18fa4727271c2cc4fdc8fcd1e63b8d86daa3e838751400c851020f01da395110",
+    "src/transfer.rs": "431f0cc60e76bca78d1594eb1c5adff3d1917f64317177e28c8bf179674884d8",
+    "src/webdav.rs": "6695d2ead70a019822906cee31f25a27ab189c197405bb9edf2bac09d30e43f0"
+  }
+}

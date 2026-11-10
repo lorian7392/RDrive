@@ -161,7 +161,8 @@ fn resources() -> Value {
         {"uri":"rdrive://status","name":"RDrive status","mimeType":"application/json"},
         {"uri":"rdrive://profiles","name":"Connection profiles","mimeType":"application/json"},
         {"uri":"rdrive://domains","name":"Finder domains","mimeType":"application/json"},
-        {"uri":"rdrive://cache","name":"Clean-cache budget","mimeType":"application/json"}
+        {"uri":"rdrive://cache","name":"Clean-cache budget","mimeType":"application/json"},
+        {"uri":"rdrive://index","name":"Directory index progress","mimeType":"application/json"}
     ]})
 }
 fn resource_tool(uri: &str) -> Option<&'static str> {
@@ -170,6 +171,7 @@ fn resource_tool(uri: &str) -> Option<&'static str> {
         "rdrive://profiles" => Some("rdrive_profiles"),
         "rdrive://domains" => Some("rdrive_domains"),
         "rdrive://cache" => Some("rdrive_cache_status"),
+        "rdrive://index" => Some("rdrive_index_status"),
         _ => None,
     }
 }

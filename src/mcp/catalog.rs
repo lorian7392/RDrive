@@ -150,6 +150,15 @@ impl Tool {
                 bail!("provide exactly one of max_bytes or unlimited=true");
             }
         }
+        if self.name == "rdrive_index_config" {
+            let yes=|name| args.get(name).and_then(Value::as_bool)==Some(true);
+            if yes("enable")&&yes("disable") {bail!("enable and disable are mutually exclusive");}
+            if args.contains_key("depth")&&yes("all") {bail!("depth and all are mutually exclusive");}
+            if args.get("depth").and_then(Value::as_u64).is_some_and(|n|n>u32::MAX as u64) {bail!("depth exceeds u32 range");}
+            for name in ["refresh_seconds","active_refresh_seconds"] {
+                if args.get(name).and_then(Value::as_u64).is_some_and(|n|n==0||n>31_536_000) {bail!("index intervals must be between one second and one year");}
+            }
+        }
         Ok(())
     }
     pub fn argv(&self, arguments: &Value) -> Vec<String> {
@@ -585,5 +594,8 @@ pub fn catalog() -> Vec<Tool> {
         true
     );
     tool!("versions_prune","Prune custom versions, keeping keep entries (default 10). Deletion only occurs with apply=true.",&["versions","prune"],vec![p(),r(),n("keep","--keep"),b("apply","--apply")],true);
+    tool!("index_status","Inspect SQLite directory-index counts and background metadata policy without networking.",&["index","status"],vec![Field::positional("domain",String,false)],false);
+    tool!("index_config","Configure background metadata crawl and directory refresh intervals. Does not download contents.",&["index","config"],vec![b("enable","--enable"),b("disable","--disable"),n("depth","--depth"),b("all","--all"),n("refresh_seconds","--refresh-seconds"),n("active_refresh_seconds","--active-refresh-seconds")],true);
+    tool!("index_refresh","Queue a targeted metadata refresh for an indexed Smart directory; recursive discovers descendants. Requires a running provider service to execute.",&["index","refresh"],vec![d(),ro(),recursive()],true);
     tools
 }

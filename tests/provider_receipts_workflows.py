@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 from cli_workflows import Dav
+from index_workflows import read_provider_journal, report_binary_path
 
 ROOT = Path(__file__).resolve().parents[1]
 TAGS = "com.apple.metadata:_kMDItemUserTags"
@@ -220,7 +221,7 @@ def run(binary):
             if contents is not None:
                 snapshot = home / "smart" / hashlib.sha256(domain.encode()).hexdigest() / "dirty" / mutation["snapshot"]["file"]
                 assert snapshot.read_bytes() == contents
-            journal = json.loads((home / "provider" / (hashlib.sha256(domain.encode()).hexdigest() + ".json")).read_text())
+            journal = read_provider_journal(home, domain)
             plan = journal["smart_replays"].get(mutation["id"], mutation["request"])
             identity = "create:" + plan["client_item_id"] if plan["op"] == "create" else plan["request_id"]
             key = hashlib.sha256(domain.encode()).hexdigest() + ":" + identity
@@ -393,8 +394,12 @@ def run(binary):
     with binary.open("rb") as executable:
         binary_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
     version = subprocess.run([str(binary), "--version"], capture_output=True, text=True, check=True, timeout=10).stdout.strip()
-    report = dict(binary=str(binary), binary_sha256=binary_sha256, version=version, checks=checks, passed=len(checks), scope="synthetic authenticated loopback DAV, independent writer home, actual broker SIGKILL; no real storage")
-    destination = ROOT / "docs/PROVIDER_RECEIPTS_VALIDATION.json"
+    report = dict(binary=report_binary_path(binary), binary_sha256=binary_sha256, version=version, checks=checks, passed=len(checks),
+                  path_format=dict(binary="repository-relative when inside the repository; otherwise absolute"),
+                  scope="synthetic authenticated loopback DAV, independent writer home, actual broker SIGKILL; no real storage")
+    release_version = version.removeprefix("rdrive ").replace("/", "_")
+    build_kind = ".debug" if binary.parent.name == "debug" else ""
+    destination = ROOT / "docs" / f"PROVIDER_RECEIPTS_VALIDATION.{release_version}{build_kind}.json"
     destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(report, ensure_ascii=False))
 

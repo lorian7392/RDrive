@@ -206,6 +206,7 @@ impl Store {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
         }
         let config: Config = read_json(&home.join("config.json"))?;
+        config.index.validate()?;
         for p in config.profiles.values() {
             crate::config::validate_profile(p)?;
         }

@@ -19,6 +19,8 @@ import tempfile
 import time
 import uuid
 
+from index_workflows import read_provider_journal
+
 
 def native_xattr(path, name, value=None):
     if sys.platform != "darwin":
@@ -152,7 +154,8 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             if os.environ.get("RDRIVE_SMB_PROVIDER_ONLY") == "1":
                 cli("mkdir", "fixture", "provider-own-write")
                 domain = "smb-own-write"
-                cli("provider", "domain-add", domain, "fixture", "provider-own-write")
+                smart = os.environ.get("RDRIVE_SMB_SMART") == "1"
+                cli("provider", "domain-add", domain, "fixture", "provider-own-write", *(["--smart"] if smart else []))
                 with tempfile.TemporaryDirectory(prefix="rd-smb-fp-", dir="/private/tmp") as bridge_temporary:
                     group = Path(bridge_temporary).resolve()
                     group.chmod(0o700)
@@ -192,8 +195,7 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                             return str(path)
 
                         def verify_strong(item):
-                            journal_path = home / "provider" / (hashlib.sha256(domain.encode()).hexdigest() + ".json")
-                            journal = json.loads(journal_path.read_bytes())
+                            journal = read_provider_journal(home, domain)
                             record = journal["items"][item["id"]]
                             assert record["entry"]["etag"].startswith("W/"), "fixture did not exercise weak SMB enumeration"
                             assert record.get("strong") and not record["strong"]["etag"].startswith("W/"), "successful write lost its strong SMB edit guard"
@@ -236,8 +238,9 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                             process.kill()
                             stdout, stderr = process.communicate()
                         assert b"testpass" not in stdout + stderr
-                passed_test("raw SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch")
-                print(json.dumps({"passed": passed}, indent=2))
+                mode = "Smart" if smart else "raw"
+                passed_test(f"{mode} SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch")
+                print(json.dumps({"passed": passed, "domain_mode": {"smart": smart, "repository": False}, "catalog_storage": "SQLite authoritative state"}, indent=2))
                 return
 
             content = bytes(range(256)) * 9001  # Several MiB, many 64 KiB chunks.

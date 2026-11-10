@@ -198,6 +198,8 @@ enum Command {
     Provider {#[command(subcommand)]command:ProviderCommand},
     /// Configure on-demand offline domains and manage retained local edits.
     Smart {#[command(subcommand)]command:SmartCommand},
+    /// Configure background metadata indexing and request scoped refreshes.
+    Index {#[command(subcommand)]command:IndexCommand},
     /// Capture, apply or synchronize selected user extended attributes/Finder tags.
     Metadata {#[command(subcommand)]command:MetadataCommand},
     /// Save, inspect, restore and prune custom remote file versions.
@@ -314,6 +316,22 @@ enum SmartCommand {
     Discard { domain:String, mutation:String },
     /// Perform one reconnect/replay pass; provider serve also runs automatically.
     Run { #[arg(long)]staging:Option<PathBuf> },
+}
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Inspect local index progress without waiting for a network operation.
+    Status { domain: Option<String> },
+    /// Persist background crawl and refresh policy. None of these options downloads files.
+    Config {
+        #[arg(long,conflicts_with="disable")] enable: bool,
+        #[arg(long,conflicts_with="enable")] disable: bool,
+        #[arg(long,conflicts_with="all")] depth: Option<u32>,
+        #[arg(long,conflicts_with="depth")] all: bool,
+        #[arg(long,value_parser=clap::value_parser!(u64).range(1..=31_536_000))] refresh_seconds: Option<u64>,
+        #[arg(long,value_parser=clap::value_parser!(u64).range(1..=31_536_000))] active_refresh_seconds: Option<u64>,
+    },
+    /// Queue a metadata refresh; provider serve performs it asynchronously.
+    Refresh { domain:String, #[arg(default_value="")]remote:String, #[arg(long)]recursive:bool },
 }
 #[derive(Subcommand)]enum MetadataCommand {
     Capture{local:PathBuf},
@@ -523,6 +541,22 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
     let json = cli.json;
     match &cli.command {
         Command::Mcp { .. } => unreachable!(),
+        Command::Index { command } => match command {
+            IndexCommand::Config { enable, disable, depth, all, refresh_seconds, active_refresh_seconds } => {
+                let mut policy=store.config.index.clone();
+                if *enable { policy.enabled=true; }
+                if *disable { policy.enabled=false; }
+                if let Some(depth)=depth { policy.prefetch_depth=Some(*depth); }
+                if *all { policy.prefetch_depth=None; }
+                if let Some(seconds)=refresh_seconds { policy.refresh_secs=*seconds; }
+                if let Some(seconds)=active_refresh_seconds { policy.active_refresh_secs=*seconds; }
+                policy.validate()?;
+                store.config.index=policy;
+                store.save_config()?;
+                emit(json,&store.config.index)?;
+            },
+            IndexCommand::Status { .. } | IndexCommand::Refresh { .. } => unreachable!(),
+        },
         Command::Repo{command}=>match command {
             RepoCommand::Init{profile:name,root}=>{let b=connect(store,name).await?;emit(json,&rdrive::repository::init(store,b.as_ref(),root).await?)?;},
             RepoCommand::Begin{profile:name,root}=>{let b=connect(store,name).await?;emit(json,&rdrive::repository::begin(store,b.as_ref(),name,root).await?)?;},
@@ -1131,6 +1165,12 @@ async fn main() {
 async fn run(cli: &Cli) -> Result<()> {
     let home = cli.home.clone().unwrap_or_else(config::default_home);
     match &cli.command {
+        Command::Index { command:IndexCommand::Status { domain } } => {
+            return emit(cli.json,&rdrive::provider::index_status(&home,domain.as_deref())?);
+        },
+        Command::Index { command:IndexCommand::Refresh { domain,remote,recursive } } => {
+            return emit(cli.json,&rdrive::provider::index_refresh(&home,domain,remote,*recursive)?);
+        },
         Command::Mcp { command: McpCommand::Tools { allow_write } } => {
             return emit(true, &rdrive::mcp::tools(*allow_write));
         },

@@ -10,6 +10,7 @@ import argparse
 import http.server
 import importlib.util
 import json
+from index_workflows import provider_journal_from_db
 import os
 import plistlib
 from pathlib import Path
@@ -396,7 +397,7 @@ def run_tests(options):
                     if options.smart:
                         summary = subprocess.run(cli + ["smart", "status"], env=env, capture_output=True, text=True, timeout=15)
                         report["smart_status"] = json.loads(summary.stdout) if summary.returncode == 0 else {"stderr": summary.stderr}
-                        report["provider_journals"] = {path.name: json.loads(path.read_text()) for path in (home / "provider").glob("*.json")}
+                        report["provider_indexes"] = {path.name: provider_journal_from_db(path) for path in (home / "provider").glob("*.sqlite3")}
                 except Exception as error:
                     report["diagnostic_error"] = str(error)
             if registered:

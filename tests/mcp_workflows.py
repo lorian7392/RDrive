@@ -214,7 +214,7 @@ def main():
             assert readonly.request("ping") == {}
             catalog = readonly.request("tools/list")["tools"]
             names = {tool["name"] for tool in catalog}
-            assert {"rdrive_profiles", "rdrive_list", "rdrive_stat", "rdrive_sync_plan"} <= names
+            assert {"rdrive_profiles", "rdrive_list", "rdrive_stat", "rdrive_sync_plan", "rdrive_index_status"} <= names
             assert not {"rdrive_upload", "rdrive_remove", "rdrive_download", "rdrive_sync_apply"} & names
             for tool in catalog:
                 assert tool["inputSchema"]["type"] == "object", tool
@@ -237,7 +237,8 @@ def main():
                        for command, path in LocalDav.requests_seen) == large_gets, "oversized text was downloaded before rejection"
             assert set((home / "tmp").iterdir()) == temporary_payloads, "oversized text left a temporary payload"
             resources = readonly.request("resources/list")["resources"]
-            assert resources
+            assert {"rdrive://status", "rdrive://profiles", "rdrive://domains", "rdrive://cache",
+                    "rdrive://index"} == {resource["uri"] for resource in resources}, resources
             for resource in resources:
                 response = readonly.request("resources/read", {"uri": resource["uri"]})
                 assert response["contents"][0]["uri"] == resource["uri"], response
@@ -276,6 +277,48 @@ def main():
             readonly.invalid_tool("smart_pause")
             readonly.invalid_tool("smart_resume")
             readonly.invalid_tool("queue_run")
+            readonly.invalid_tool("index_config", enable=True)
+            readonly.invalid_tool("index_refresh", domain="mcp-index")
+
+            # Configuration goes through the actual CLI process; subsequent
+            # calls and the index resource must read the same persisted policy.
+            initial_index = readonly.tool("index_status")
+            assert initial_index["domains"] == [] and initial_index["policy"]["enabled"], initial_index
+            index_requests = len(LocalDav.requests_seen)
+            policy = writable.tool("index_config", disable=True, depth=2,
+                                   refresh_seconds=91, active_refresh_seconds=17)
+            assert policy == {"enabled": False, "prefetch_depth": 2,
+                              "refresh_secs": 91, "active_refresh_secs": 17}, policy
+            assert readonly.tool("index_status")["policy"] == policy
+            assert cli("index", "status")["policy"] == policy
+            index_resource = readonly.request("resources/read", {"uri": "rdrive://index"})
+            assert json.loads(index_resource["contents"][0]["text"])["policy"] == policy
+            saved_config = (home / "config.json").read_bytes()
+            for invalid_policy in ({"enable": True, "disable": True}, {"depth": 1, "all": True},
+                                   {"refresh_seconds": 0}, {"active_refresh_seconds": 0},
+                                   {"refresh_seconds": 31_536_001},
+                                   {"active_refresh_seconds": 31_536_001}, {"depth": 2**32},
+                                   {"depth": -1}, {"enable": "true"}):
+                writable.invalid_tool("index_config", **invalid_policy)
+                assert (home / "config.json").read_bytes() == saved_config, invalid_policy
+            enabled = writable.tool("index_config", enable=True, all=True)
+            assert enabled["enabled"] and enabled["prefetch_depth"] is None, enabled
+            root_only = writable.tool("index_config", depth=0)
+            assert root_only["prefetch_depth"] == 0 and root_only["refresh_secs"] == 91, root_only
+            cli("smart", "setup", "mcp-index", "test")
+            domain_index = readonly.tool("index_status", domain="mcp-index")
+            assert len(domain_index["domains"]) == 1, domain_index
+            assert domain_index["domains"][0]["domain"] == "mcp-index", domain_index
+            assert not domain_index["domains"][0]["initialized"], domain_index
+            readonly.tool("index_status", domain="missing-domain", fail=True)
+            refresh = writable.tool("index_refresh", domain="mcp-index", recursive=True)
+            assert refresh["queued"] and not refresh["completed"] and refresh["requires_provider_service"], refresh
+            assert refresh["remote"] == "" and refresh["recursive"], refresh
+            writable.invalid_tool("index_refresh", domain="mcp-index", remote="../escape")
+            writable.tool("index_refresh", domain="mcp-index", remote="unindexed-child", fail=True)
+            assert len(LocalDav.requests_seen) == index_requests, "index control operations contacted remote storage"
+            passed.append("index policy persists through MCP/CLI/resource, invalid combinations preserve state, targeted refresh queues metadata-only demand")
+
             target = allowed / "download.txt"
             writable.tool("download", profile="test", remote="hello.txt", local=str(target))
             assert target.read_text() == "你好，MCP\n"

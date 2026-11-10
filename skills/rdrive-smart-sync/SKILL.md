@@ -16,11 +16,14 @@ rdrive --json provider domains
 rdrive --json cache status
 rdrive --json cache list
 rdrive --json queue list
+rdrive --json index status
 ```
 
 MCP inspection tools: `rdrive_smart_status`, `rdrive_smart_list`, `rdrive_domains`, `rdrive_cache_status`, `rdrive_cache_list`, `rdrive_queue_list`. The ordinary upload queue and Smart retained-mutation journal are separate. Distinguish their identifiers and cancellation behavior.
 
-Ordinary `rdrive mount` is a native network volume. Smart uses a registered macOS File Provider domain and running Rust bridge; it browses a local index, downloads on access, and retains offline changes. A newly configured domain is not proof that Finder registration or the background service is running. Directory indexes load progressively; an unvisited subtree is not evidence of deletion. MCP does not launch the native companion or a long-running provider service.
+Ordinary `rdrive mount` is a native network volume. Smart uses a registered macOS File Provider domain and running Rust bridge; it browses a local SQLite index, downloads on access, and retains offline changes. A newly configured domain is not proof that Finder registration or the background service is running. Directory indexes build progressively in the background; an unvisited subtree is not evidence of deletion. MCP does not launch the native companion or a long-running provider service.
+
+For slow folder discovery, inspect `rdrive_index_status` / `index status`. Background preindex is enabled by default and reads metadata only. Configure it with `rdrive_index_config` or `index config --enable --all`, `--depth 2`, or `--disable`; active/background intervals use `--active-refresh-seconds` and `--refresh-seconds`. Request an asynchronous one-shot subtree refresh with `rdrive_index_refresh` or `index refresh cloud-smart documents --recursive`. A queued refresh is not completed indexing. The worker must be running; ordinary native mounts do not consume this index. Preserve the SQLite database, its recovery records and original migration JSON; never delete them as clean cache, and stop an older broker before upgrading the same state directory.
 
 ## Cache capacity and offline files
 

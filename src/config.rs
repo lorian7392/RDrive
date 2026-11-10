@@ -38,6 +38,35 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub cache: CachePolicy,
+    #[serde(default)]
+    pub index: IndexPolicy,
+}
+
+/// Background namespace metadata only; this does not pin or download content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexPolicy {
+    pub enabled: bool,
+    /// Root is depth zero; None walks the complete tree progressively.
+    pub prefetch_depth: Option<u32>,
+    pub refresh_secs: u64,
+    pub active_refresh_secs: u64,
+}
+impl Default for IndexPolicy {
+    fn default() -> Self {
+        Self { enabled: true, prefetch_depth: None, refresh_secs: 300, active_refresh_secs: 30 }
+    }
+}
+impl IndexPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if self.refresh_secs == 0 || self.active_refresh_secs == 0 {
+            bail!("index refresh intervals must be positive");
+        }
+        if self.refresh_secs > 31_536_000 || self.active_refresh_secs > 31_536_000 {
+            bail!("index refresh intervals cannot exceed one year");
+        }
+        Ok(())
+    }
 }
 
 /// Clean cached file payloads only. Upload snapshots and pending offline edits

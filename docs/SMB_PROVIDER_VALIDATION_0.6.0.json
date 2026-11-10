@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "validated_utc": "2026-11-10T03:10:40.934463+00:00",
+  "started_utc": "2026-11-10T03:10:17.242014+00:00",
+  "product_version": "rdrive 0.6.0",
+  "binary": {
+    "relative_path": "target/release/rdrive",
+    "sha256": "ba4f81c2968e87ceffa3fc93202386de650424c1ff2f76f40fae16bc86333c98",
+    "bytes": 18187024,
+    "unchanged_during_test": true
+  },
+  "server": {
+    "protocol": "SMB3",
+    "server_min_protocol": "SMB3_00",
+    "server_max_protocol": "SMB3_11",
+    "encryption": "required by both client profile and synthetic Samba share",
+    "fixture_image": "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f",
+    "storage": "temporary synthetic share only"
+  },
+  "modes": {
+    "raw": {
+      "passed": true,
+      "group_count": 2,
+      "groups": [
+        "encrypted SMB3 connection and truthful capabilities",
+        "raw SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch"
+      ],
+      "domain_mode": {
+        "smart": false,
+        "repository": false
+      },
+      "catalog_storage": "SQLite authoritative state",
+      "server": "SERVER Version 4.21.9; IMAGE alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f"
+    },
+    "smart": {
+      "passed": true,
+      "group_count": 2,
+      "groups": [
+        "encrypted SMB3 connection and truthful capabilities",
+        "Smart SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch"
+      ],
+      "domain_mode": {
+        "smart": true,
+        "repository": false
+      },
+      "catalog_storage": "SQLite authoritative state",
+      "server": "SERVER Version 4.21.9; IMAGE alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f"
+    }
+  },
+  "total_group_count": 4,
+  "checks": [
+    "Own create/content/metadata/content receipts retain exact tags and selected user xattrs without a refetch",
+    "Each acknowledged write has a persisted strong SMB revision matching its own confirmed receipt while directory enumeration remains weak",
+    "Strong revisions and mutation receipts are inspected from one consistent authoritative SQLite snapshot",
+    "An external SMB client edit causes a stale provider overwrite to report version_conflict and preserves external bytes"
+  ],
+  "cleanup": {
+    "verified": true,
+    "new_test_containers_remaining": []
+  },
+  "test_commands": [
+    [
+      "RDRIVE_SMB_PROVIDER_ONLY=1",
+      "RDRIVE_SMB_SMART=0",
+      "python3",
+      "tests/smb_workflows.py",
+      "target/release/rdrive"
+    ],
+    [
+      "RDRIVE_SMB_PROVIDER_ONLY=1",
+      "RDRIVE_SMB_SMART=1",
+      "python3",
+      "tests/smb_workflows.py",
+      "target/release/rdrive"
+    ]
+  ],
+  "elapsed_seconds": 23.69,
+  "scope": "Focused raw and Smart Rust provider IPC regression over isolated encrypted SMB3, with authoritative SQLite-loaded guards and receipts. No real NAS or cloud account was contacted.",
+  "limits": [
+    "The exact negotiated SMB3 dialect was not captured; Samba accepts only SMB3_00 through SMB3_11.",
+    "This is a Rust provider bridge proof; macOS File Provider activation and server power-loss durability are outside this fixture."
+  ]
+}

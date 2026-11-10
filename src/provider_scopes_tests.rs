@@ -69,6 +69,11 @@ async fn cached_catalog_requests_do_not_take_the_store_network_lock_or_expand_wo
     let working:Request=serde_json::from_value(json!({"v":1,"op":"list","domain":d.id,"parent_id":"working_set"})).unwrap();
     let answer=process(&store.home,&stage,&fd,working,Default::default()).await.unwrap();assert_eq!(answer["items"].as_array().unwrap().len(),1);assert!(catalog_demands(&store,&d,&j).unwrap().is_empty());
     let child=id(&j,"a");let browse:Request=serde_json::from_value(json!({"v":1,"op":"list","domain":d.id,"parent_id":child})).unwrap();let answer=process(&store.home,&stage,&fd,browse,Default::default()).await.unwrap();assert!(answer["items"].as_array().unwrap().is_empty());assert_eq!(catalog_demands(&store,&d,&j).unwrap()[0].id,child);
+    let hint=demand_directory(&store.home,&d.id).join(format!("directory-{}.json",state::key(&child)));
+    let original=fs::read(&hint).unwrap();tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let repeat:Request=serde_json::from_value(json!({"v":1,"op":"list","domain":d.id,"parent_id":child})).unwrap();
+    process(&store.home,&stage,&fd,repeat,Default::default()).await.unwrap();
+    assert_eq!(fs::read(&hint).unwrap(),original,"repeated indexed reads coalesce pending browse hints instead of rewriting them");
     fs::write(demand_directory(&store.home,&d.id).join(".rdrive-interrupted.tmp"),b"{").unwrap();assert_eq!(catalog_demands(&store,&d,&j).unwrap().len(),1,"atomic temporary files cannot block namespace work");
 }
 
