@@ -1,0 +1,24 @@
+{
+  "binary": "target/release/rdrive",
+  "version": "rdrive 0.8.0",
+  "binary_sha256": "78ddbbac8b6aaca8d13a5a763061f64af47b68bcddfeeee580b122baba2fcf56",
+  "checks": [
+    "root catalog stays responsive with a deep tree whose recursive metadata delays exceed five seconds; working_set stays lazy",
+    "metadata-only initial catalog and exact on-demand hydration",
+    "offline browsing, item lookup and change anchors return immediately",
+    "offline edit survives source deletion and process crash, then uploads automatically on reconnect; confirmed transfer copies are reclaimed",
+    "new transport request IDs replay the same confirmed receipt without another upload",
+    "successive offline saves replay in order using only confirmed own-write version guards",
+    "repeated saves to an offline new file retain every snapshot and publish the newest version safely",
+    "concurrent remote changes stop overwrites and retain an exportable local conflict copy",
+    "folder pin is inherited by existing and new descendants and reverses on unpin",
+    "version-bound native errors and cached state update Finder metadata even while uploads are paused",
+    "persistent combined cache cap denies over-admission and never evicts retained dirty edits",
+    "each cold child scans only after explicit browsing and delayed child metadata never blocks cached root reads",
+    "successful root refresh retains cached descendant metadata when an independent directory scan fails",
+    "successful parent listing removes a remotely deleted known directory and its cached descendants while preserving siblings",
+    "pinned directory policy recursively discovers new nested descendants without browsing those children"
+  ],
+  "passed": 15,
+  "scope": "synthetic loopback DAV; no real remote mutations"
+}

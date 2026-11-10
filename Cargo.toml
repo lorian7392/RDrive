@@ -1,6 +1,6 @@
 [package]
 name = "rdrive"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.90"
 description = "A conservative WebDAV and SMB command-line file and sync client"

@@ -57,7 +57,7 @@ impl Options {
                 if !root.is_dir() {
                     bail!("MCP local roots must be existing directories");
                 }
-                if root.starts_with(&self.home) {
+                if crate::cache::path_is_within(&root,&self.home)? {
                     bail!("MCP local root cannot be inside the RDrive state directory");
                 }
                 Ok(root)
@@ -65,18 +65,21 @@ impl Options {
             .collect::<Result<Vec<_>>>()?;
         Ok(self)
     }
-    fn local_path(&self, value: &str) -> Result<PathBuf> {
+    fn local_path(&self, value: &str) -> Result<PathBuf> { self.checked_local_path(value,false) }
+    fn checked_local_path(&self,value:&str,cache_target:bool)->Result<PathBuf> {
         let resolved = absolute_resolved(Path::new(value))?;
-        if resolved.starts_with(&self.home) || self.home.starts_with(&resolved) {
+        if crate::cache::paths_overlap(&resolved,&self.home)? {
             bail!("local path overlaps the RDrive state directory");
         }
-        if !self
-            .local_roots
-            .iter()
-            .any(|root| resolved.starts_with(root))
-        {
-            bail!("local path is outside server --local-root directories");
+        if !cache_target {
+            let config:crate::config::Config=crate::state::read_json(&self.home.join("config.json"))?;
+            for directory in crate::cache::protected_directories(&self.home,&config)? {
+                if crate::cache::paths_overlap(&resolved,&directory)?{bail!("local path overlaps the protected RDrive content cache");}
+            }
         }
+        let mut allowed=false;
+        for root in &self.local_roots {if crate::cache::path_is_within(&resolved,root)?{allowed=true;break;}}
+        if !allowed {bail!("local path is outside server --local-root directories");}
         Ok(resolved)
     }
 }
@@ -472,7 +475,8 @@ pub async fn serve(options: Options) -> Result<()> {
                     for field in &tool.fields {
                         if matches!(field.kind, catalog::Kind::Local) {
                             if let Some(value) = arguments.get(field.name).and_then(Value::as_str) {
-                                options.local_path(value)?;
+                                if tool.name=="rdrive_cache_set_directory"&&field.name=="directory"{options.checked_local_path(value,true)?;}
+                                else{options.local_path(value)?;}
                             }
                         }
                     }

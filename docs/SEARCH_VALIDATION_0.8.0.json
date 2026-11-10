@@ -1,0 +1,10 @@
+{
+  "checks": [
+    "offline substring, short Chinese, literal wildcard, type scope and page queries",
+    "rule changes immediately filter stored search rows without deleting canonical metadata",
+    "read-only MCP search/resources, mutation gating and typed glob arrays without network traffic"
+  ],
+  "passed": 3,
+  "binary": "target/release/rdrive",
+  "sha256": "78ddbbac8b6aaca8d13a5a763061f64af47b68bcddfeeee580b122baba2fcf56"
+}

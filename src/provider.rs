@@ -702,7 +702,7 @@ fn quick(home:&Path,req:&Request)->Result<Value>{
     let record=index::lookup(home,&d.id,&binding,id)?.context("no_such_item: item not enumerated")?;
     let db:crate::state::Database=state::read_json(&home.join("state.json"))?;
     let path=remote(&d,&record.path)?;let cached=db.cache.get(&Store::cache_key(&d.profile,&path));
-    let state=if record.item.sync_state.as_deref().is_some_and(|s|["queued","queued_delete","conflict","error","syncing"].contains(&s)){record.item.sync_state.as_deref().unwrap()}else if db.jobs.iter().any(|x|x.profile==d.profile&&x.remote==path&&["pending","running","interrupted"].contains(&x.status.as_str())){"syncing"}else if record.item.pinned{"pinned"}else if read_native_cached(home,&config,&d)?.get(id)==Some(&record.item.content_version)||cached.is_some_and(|c|home.join("cache").join(&c.object).is_file()){"cached"}else{"online"};
+    let state=if record.item.sync_state.as_deref().is_some_and(|s|["queued","queued_delete","conflict","error","syncing"].contains(&s)){record.item.sync_state.as_deref().unwrap()}else if db.jobs.iter().any(|x|x.profile==d.profile&&x.remote==path&&["pending","running","interrupted"].contains(&x.status.as_str())){"syncing"}else if record.item.pinned{"pinned"}else if read_native_cached(home,&config,&d)?.get(id)==Some(&record.item.content_version)||cached.is_some_and(|c|crate::cache::configured_directory(home,&config).is_ok_and(|root|root.join(&c.object).is_file())){"cached"}else{"online"};
     Ok(json!({"state":state,"item":record.item,"smart":d.smart,"message":record.item.sync_message.as_deref().unwrap_or("状态来自本地索引，未探测网络")}))
 }
 fn local_native_error(home:&Path,req:&Request)->Result<Value>{

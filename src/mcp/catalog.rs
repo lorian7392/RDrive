@@ -151,6 +151,11 @@ impl Tool {
                 }
             }
         }
+        if self.name == "rdrive_cache_set_directory" {
+            let target=args.contains_key("directory");
+            let restore=args.get("default").and_then(Value::as_bool)==Some(true);
+            if target==restore{bail!("provide exactly one of directory or default=true");}
+        }
         if self.name == "rdrive_cache_config" {
             let limit = args.contains_key("max_bytes");
             let unlimited = args
@@ -638,5 +643,8 @@ pub fn catalog() -> Vec<Tool> {
     tool!("service_stop","Stop only this RDrive home's installed supervisor.",&["service","stop"],vec![b("dry_run","--dry-run")],true);
     tool!("service_restart","Restart only this RDrive home's installed supervisor.",&["service","restart"],vec![b("dry_run","--dry-run")],true);
     tool!("service_uninstall","Remove this RDrive home's supervisor configuration; user data is retained.",&["service","uninstall"],vec![b("dry_run","--dry-run")],true);
+    tool!("cache_directory","Inspect the configured Rust content-cache location. macOS Finder storage is managed separately.",&["cache","directory"],vec![],false);
+    tool!("cache_set_directory","Migrate verified clean content to an owned private empty directory, or restore default. Live readers block migration; queued edits and Finder storage remain separate.",&["cache","directory"],vec![Field::positional("directory",Local,false),b("default","--default"),b("dry_run","--dry-run")],true);
+    tool!("cache_clear","Preview clean-cache eviction, or apply to removable unpinned/inactive payloads. Does not delete pending edits, pinned content or macOS Finder downloads.",&["cache","clear"],vec![b("apply","--apply")],true);
     tools
 }

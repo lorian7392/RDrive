@@ -423,6 +423,11 @@ enum TransferCommand {
 }
 #[derive(Subcommand)]
 enum CacheCommand {
+    /// Preview eligible clean cache removal; --apply evicts only unpinned/inactive payloads.
+    Clear { #[arg(long)] apply:bool },
+    /// Show or safely migrate the Rust content cache (system Finder storage is separate).
+    Directory { path:Option<PathBuf>, #[arg(long="default",conflicts_with="path")] restore_default:bool,
+        #[arg(long)] dry_run:bool },
     /// Inspect the persistent clean-cache limit and actual usage, without networking.
     Status,
     /// Persist an aggregate clean-cache maximum (bytes); --unlimited removes it.
@@ -555,6 +560,9 @@ async fn do_sync(
     let local = local
         .canonicalize()
         .context("local sync directory must exist")?;
+    for cache in rdrive::cache::protected_directories(&store.home,&store.config)? {
+        if rdrive::cache::paths_overlap(&local,&cache)?{bail!("sync root overlaps the RDrive content cache; choose a separate data directory");}
+    }
     let identity = format!(
         "{}\0{}\0{}\0{}\0{}",
         name,
@@ -1005,6 +1013,12 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             }
         }
         Command::Cache { command } => match command {
+            CacheCommand::Clear{apply}=>emit(json,&rdrive::cache::clear(store,*apply)?)?,
+            CacheCommand::Directory{path,restore_default,dry_run}=>{
+                if path.is_none()&&!*restore_default {emit(json,&rdrive::cache::directory_status(store)?)?;}
+                else if *dry_run {emit(json,&rdrive::cache::plan_directory(store,path.as_deref())?)?;}
+                else {emit(json,&rdrive::cache::set_directory(store,path.as_deref())?)?;}
+            },
             CacheCommand::Status => emit(json, &rdrive::cache::status(store)?)?,
             CacheCommand::Config {max_bytes,..} => emit(json, &rdrive::cache::set_limit(store,*max_bytes)?)?,
             CacheCommand::Fetch {

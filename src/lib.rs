@@ -21,3 +21,5 @@ pub mod mcp;
 pub mod filtering;
 pub mod policies;
 pub mod service;
+
+pub mod cache_directory;

@@ -1,5 +1,9 @@
 //! Bounded, account-bound clean file payloads. Upload snapshots and offline edits
 //! live in other directories and are never candidates for eviction here.
+pub use crate::cache_directory::{
+    cache_directory, configured_directory, directory_status, object_path, path_is_within,
+    paths_overlap, plan_directory, protected_directories, set_directory,
+};
 use crate::{
     backend::{self, Backend, Entry},
     state::{self, CacheItem, CacheReservation, Store},
@@ -12,7 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::{
-        fs::{FileExt, MetadataExt, OpenOptionsExt},
+        fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
     },
     path::{Path, PathBuf},
@@ -73,7 +77,7 @@ impl Default for NativeLedger {
 }
 const NATIVE_RESERVATION_TTL: i64 = 120;
 
-fn budget_lock(home: &Path, exclusive: bool) -> Result<File> {
+pub(crate) fn budget_lock(home: &Path, exclusive: bool) -> Result<File> {
     let metadata = fs::symlink_metadata(home)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
@@ -205,7 +209,7 @@ pub fn report_native_usage(
     let usage = aggregate_native(&ledger)?;
     let config: crate::config::Config = state::read_json(&home.join("config.json"))?;
     let db: crate::state::Database = state::read_json(&home.join("state.json"))?;
-    let payloads = inventory_parts(home, &db.cache)?;
+    let payloads = inventory_parts(home, &config, &db.cache)?;
     let rust_used = payloads
         .iter()
         .try_fold(0, |total, payload| add(total, payload.size))?;
@@ -264,7 +268,6 @@ struct Payload {
     key: Option<String>,
     pinned: bool,
     accessed: i64,
-    generated: bool,
 }
 
 pub fn scope(store: &Store, profile: &str) -> Result<String> {
@@ -319,10 +322,14 @@ fn lock_exclusive(path: &Path) -> Result<Option<File>> {
 }
 
 fn inventory(store: &Store) -> Result<Vec<Payload>> {
-    inventory_parts(&store.home, &store.db.cache)
+    inventory_parts(&store.home, &store.config, &store.db.cache)
 }
-fn inventory_parts(home: &Path, cache: &BTreeMap<String, CacheItem>) -> Result<Vec<Payload>> {
-    let directory = home.join("cache");
+fn inventory_parts(
+    home: &Path,
+    config: &crate::config::Config,
+    cache: &BTreeMap<String, CacheItem>,
+) -> Result<Vec<Payload>> {
+    let directory = configured_directory(home, config)?;
     let metadata = fs::symlink_metadata(&directory)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("cache directory was replaced or is not a directory");
@@ -338,6 +345,9 @@ fn inventory_parts(home: &Path, cache: &BTreeMap<String, CacheItem>) -> Result<V
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("non-UTF8 object in cache directory"))?;
+        if crate::cache_directory::is_marker(&object) {
+            continue;
+        }
         let file = payload_file(&entry.path())
             .context("unsafe or unreadable cache payload; no eviction was performed")?;
         let (key, pinned, accessed) = indexed
@@ -353,7 +363,6 @@ fn inventory_parts(home: &Path, cache: &BTreeMap<String, CacheItem>) -> Result<V
             })
             .unwrap_or((None, false, i64::MIN));
         payloads.push(Payload {
-            generated: uuid::Uuid::parse_str(&object).is_ok(),
             object,
             path: entry.path(),
             size: file.metadata()?.len(),
@@ -409,7 +418,7 @@ fn status_parts(
     db: &crate::state::Database,
 ) -> Result<CacheStatus> {
     let native = aggregate_native(&read_native(home)?)?;
-    let payloads = inventory_parts(home, &db.cache)?;
+    let payloads = inventory_parts(home, config, &db.cache)?;
     let mut used_bytes = 0;
     let mut pinned_bytes = 0;
     let mut leased_bytes = 0;
@@ -423,7 +432,7 @@ fn status_parts(
             leased_bytes = add(leased_bytes, payload.size)?;
         }
         if payload.key.is_none()
-            && !payload.generated
+            && !db.cache_garbage.contains(&payload.object)
             && !db.cache_reservations.contains_key(&payload.object)
         {
             unmanaged_bytes = add(unmanaged_bytes, payload.size)?;
@@ -454,20 +463,26 @@ pub fn recover(store: &mut Store) -> Result<()> {
     let _guard = budget_lock(&store.home, true)?;
     let payloads = inventory(store)?;
     let mut removed = false;
+    let mut retained = BTreeSet::new();
     for payload in payloads {
         if payload.key.is_none()
-            && (payload.generated || store.db.cache_reservations.contains_key(&payload.object))
+            && (store.db.cache_garbage.contains(&payload.object)
+                || store.db.cache_reservations.contains_key(&payload.object))
         {
             if let Some(_guard) = lock_exclusive(&payload.path)? {
                 fs::remove_file(&payload.path)?;
                 removed = true;
+            } else {
+                retained.insert(payload.object);
             }
         }
     }
     if removed {
-        File::open(store.home.join("cache"))?.sync_all()?;
+        File::open(cache_directory(store)?)?.sync_all()?;
     }
-    if !store.db.cache_reservations.is_empty() {
+    if !store.db.cache_reservations.is_empty() || store.db.cache_garbage != retained {
+        // Retain ownership of interrupted reservations with active readers.
+        store.db.cache_garbage = retained;
         store.db.cache_reservations.clear();
         store.save()?;
     }
@@ -503,7 +518,7 @@ fn make_room(
         if payload.pinned
             || protected.contains(&payload.object)
             || store.db.cache_reservations.contains_key(&payload.object)
-            || (payload.key.is_none() && !payload.generated)
+            || (payload.key.is_none() && !store.db.cache_garbage.contains(&payload.object))
         {
             continue;
         }
@@ -515,17 +530,20 @@ fn make_room(
     if strict && projected > limit {
         bail!("cache capacity is insufficient: pinned, active or unmanaged payloads and the requested reservation cannot fit; increase the limit or release/unpin existing content");
     }
+    let previous_garbage = store.db.cache_garbage.clone();
     let mut removed_items = Vec::new();
     for (payload, _) in &candidates {
+        store.db.cache_garbage.insert(payload.object.clone());
         if let Some(key) = &payload.key {
             if let Some(item) = store.db.cache.remove(key) {
                 removed_items.push((key.clone(), item));
             }
         }
     }
-    if !removed_items.is_empty() {
+    if !candidates.is_empty() {
         if let Err(error) = store.save() {
             store.db.cache.extend(removed_items);
+            store.db.cache_garbage = previous_garbage;
             return Err(error);
         }
     }
@@ -537,7 +555,11 @@ fn make_room(
         freed_bytes = add(freed_bytes, payload.size)?;
     }
     if !candidates.is_empty() {
-        File::open(store.home.join("cache"))?.sync_all()?;
+        File::open(cache_directory(store)?)?.sync_all()?;
+        for (payload, _) in &candidates {
+            store.db.cache_garbage.remove(&payload.object);
+        }
+        store.save()?;
     }
     let remaining_bytes = before.saturating_sub(freed_bytes);
     Ok(CachePruneReport {
@@ -571,7 +593,76 @@ pub fn set_limit(store: &mut Store, max_bytes: Option<u64>) -> Result<CacheStatu
     status(store)
 }
 
-fn hash_fd(file: &mut File) -> Result<String> {
+/// Preview or remove only indexed, unpinned clean payloads. Hold every selected
+/// object's exclusive lock before changing state; active readers keep both the
+/// index entry and its payload. Foreign files and native OS payloads are ignored.
+pub fn clear(store: &mut Store, apply: bool) -> Result<serde_json::Value> {
+    let _guard = budget_lock(&store.home, true)?;
+    let directory = cache_directory(store)?;
+    let mut objects: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, item) in &store.db.cache {
+        objects
+            .entry(item.object.clone())
+            .or_default()
+            .push(key.clone());
+    }
+    let mut candidates = Vec::new();
+    let mut skipped_pinned = 0usize;
+    let mut skipped_active = 0usize;
+    let mut missing_files = 0usize;
+    let mut candidate_bytes = 0u64;
+    for (object, keys) in objects {
+        if keys.iter().any(|key| store.db.cache[key].pinned) {
+            skipped_pinned += 1;
+            continue;
+        }
+        let path = object_path(store, &object)?;
+        if fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            missing_files += 1;
+            continue;
+        }
+        let Some(file) = lock_exclusive(&path)? else {
+            skipped_active += 1;
+            continue;
+        };
+        candidate_bytes = add(candidate_bytes, file.metadata()?.len())?;
+        candidates.push((object, keys, path, file));
+    }
+    if apply && !candidates.is_empty() {
+        let previous = store.db.cache.clone();
+        let previous_garbage = store.db.cache_garbage.clone();
+        for (object, keys, _, _) in &candidates {
+            for key in keys {
+                store.db.cache.remove(key);
+            }
+            store.db.cache_garbage.insert(object.clone());
+        }
+        if let Err(error) = store.save() {
+            store.db.cache = previous;
+            store.db.cache_garbage = previous_garbage;
+            return Err(error);
+        }
+        for (_, _, path, _) in &candidates {
+            fs::remove_file(path)?;
+        }
+        File::open(&directory)?.sync_all()?;
+        for (object, _, _, _) in &candidates {
+            store.db.cache_garbage.remove(object);
+        }
+        store.save()?;
+    }
+    Ok(serde_json::json!({
+        "apply":apply,"directory":directory,"candidates":candidates.len(),"candidate_bytes":candidate_bytes,
+        "evicted":if apply {candidates.len()} else {0},"freed_bytes":if apply {candidate_bytes} else {0},
+        "skipped_pinned":skipped_pinned,"skipped_active":skipped_active,"missing_files":missing_files,
+        "remaining_files":store.db.cache.len(),
+        "scope":"indexed clean Rust payloads only; pinned files, active readers, native OS cache, upload snapshots, pending edits and untracked files are retained"
+    }))
+}
+
+pub(crate) fn hash_fd(file: &mut File) -> Result<String> {
     file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
@@ -590,7 +681,7 @@ fn acquire_item(store: &Store, item: &CacheItem) -> Result<CacheLease> {
     if item.scope.as_deref() != Some(scope(store, &item.profile)?.as_str()) {
         bail!("cached file belongs to another or an unbound legacy account scope; fetch it online before offline use");
     }
-    let path = store.home.join("cache").join(&item.object);
+    let path = object_path(store, &item.object)?;
     let mut file =
         payload_file(&path).context("cached file is missing or unsafe; fetch it online")?;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
@@ -789,7 +880,7 @@ pub async fn fetch_expected(
         make_room(store, limit, expected.size, &BTreeSet::new(), true)?;
     }
     let object = uuid::Uuid::new_v4().to_string();
-    let target = store.home.join("cache").join(&object);
+    let target = object_path(store, &object)?;
     store.db.cache_reservations.insert(
         object.clone(),
         CacheReservation {
@@ -807,11 +898,12 @@ pub async fn fetch_expected(
         let after = backend.stat(&remote).await?.context("remote file disappeared during cache fetch")?;
         if !expected.same_revision(&after) { bail!("remote file changed or lacks a verifiable revision; cache admission was not committed"); }
         let mut file = payload_file(&target)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         if file.metadata()?.len() != expected.size { bail!("cache payload length differs from its reservation"); }
         let sha256 = hash_fd(&mut file)?;
         if backend.content_sha256(expected).is_some_and(|expected_hash| expected_hash != sha256) { bail!("cache payload hash differs from its protected remote revision"); }
         file.sync_all()?;
-        File::open(store.home.join("cache"))?.sync_all()?;
+        File::open(cache_directory(store)?)?.sync_all()?;
         Ok(CacheItem { profile: profile.into(), remote: remote.clone(), object: object.clone(), entry: after, sha256, pinned: pin || store.db.cache.get(&key).is_some_and(|item| item.pinned), accessed: state::now(), scope: Some(scope) })
     }.await;
     let item = match downloaded {
@@ -820,7 +912,7 @@ pub async fn fetch_expected(
             let _guard = budget_lock(&store.home, true)?;
             if target.exists() {
                 fs::remove_file(&target)?;
-                File::open(store.home.join("cache"))?.sync_all()?;
+                File::open(cache_directory(store)?)?.sync_all()?;
             }
             store.db.cache_reservations.remove(&object);
             store.save()?;
@@ -829,10 +921,14 @@ pub async fn fetch_expected(
     };
     let guard = budget_lock(&store.home, true)?;
     let previous = store.db.cache.insert(key.clone(), item.clone());
+    if let Some(previous) = &previous {
+        store.db.cache_garbage.insert(previous.object.clone());
+    }
     store.db.cache_reservations.remove(&object);
     if let Err(error) = store.save() {
         store.db.cache.remove(&key);
         if let Some(previous) = previous {
+            store.db.cache_garbage.remove(&previous.object);
             store.db.cache.insert(key, previous);
         }
         store.db.cache_reservations.insert(

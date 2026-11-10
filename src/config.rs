@@ -58,7 +58,12 @@ pub struct IndexPolicy {
 }
 impl Default for IndexPolicy {
     fn default() -> Self {
-        Self { enabled: true, prefetch_depth: None, refresh_secs: 300, active_refresh_secs: 30 }
+        Self {
+            enabled: true,
+            prefetch_depth: None,
+            refresh_secs: 300,
+            active_refresh_secs: 30,
+        }
     }
 }
 impl IndexPolicy {
@@ -79,6 +84,9 @@ impl IndexPolicy {
 pub struct CachePolicy {
     /// None preserves the previous unlimited policy until explicitly configured.
     pub max_bytes: Option<u64>,
+    /// Clean Rust payloads only. None keeps the legacy state-home/cache path.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
 }
 
 pub fn default_home() -> PathBuf {

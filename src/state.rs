@@ -148,6 +148,9 @@ pub struct Database {
     pub cache: BTreeMap<String, CacheItem>,
     #[serde(default)]
     pub cache_reservations: BTreeMap<String, CacheReservation>,
+    /// Only durably recorded obsolete clean payloads may be reclaimed.
+    #[serde(default)]
+    pub cache_garbage: std::collections::BTreeSet<String>,
     pub history: Vec<Event>,
 }
 
@@ -265,12 +268,18 @@ impl Store {
                 bail!("invalid cache reservation state; no cache payload was removed");
             }
         }
+        for object in &db.cache_garbage {
+            if !safe_component(object) || cache_objects.contains(object) {
+                bail!("invalid obsolete cache object state; no cache payload was removed");
+            }
+        }
         let mut store = Self {
             home,
             config,
             db,
             _lock: lock,
         };
+        crate::cache_directory::recover(&mut store)?;
         crate::cache::recover(&mut store)?;
         Ok(store)
     }

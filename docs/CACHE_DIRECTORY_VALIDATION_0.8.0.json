@@ -1,0 +1,22 @@
+{
+  "binary": "target/release/rdrive",
+  "binary_sha256": "78ddbbac8b6aaca8d13a5a763061f64af47b68bcddfeeee580b122baba2fcf56",
+  "test": "tests/cache_directory_workflows.py",
+  "validated_utc": "2026-11-10T05:17:22.068487+00:00",
+  "scope": "Private temporary state and authenticated loopback WebDAV only; no real accounts, mounts or running application state",
+  "passed": [
+    "default cache directory and backward-compatible cache limit persist across CLI processes",
+    "directory dry-run reports existing payload bytes without changing configuration or creating a target",
+    "a separate process holding a real shared payload lock prevents migration without changing source data",
+    "offline directory migration physically moves all clean payloads and preserves pins, identities, budget and restart reads",
+    "new admissions use the selected directory; --default physically migrates back and remains readable after restart",
+    "relative, nonempty, public, symlink, regular-file and overlapping paths are rejected for apply and dry-run without data or permission changes",
+    "clear defaults to a mutation-free preview; apply removes only recorded unpinned inactive payloads, preserves locks/pins/unmanaged data, and is restart-idempotent",
+    "clear and migration retain real queued snapshots plus separate dirty/native fixture payloads and native accounting",
+    "a queued upload still publishes its original durable snapshot after cache cleanup and both migrations",
+    "real same-inode case aliases cannot bypass state/sync-tree migration guards, CLI sync overlap checks, or MCP cache export/overwrite/local-root protection",
+    "MCP exposes a read-only directory query and write-gated clear/migration with strict schemas and explicit local-root authorization",
+    "MCP blocks custom-cache export, overwrite and overlapping sync even under broad roots; offline cache reads and return-to-default remain available"
+  ],
+  "skipped": []
+}

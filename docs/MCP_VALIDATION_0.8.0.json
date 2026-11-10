@@ -1,0 +1,25 @@
+{
+  "binary_sha256": "78ddbbac8b6aaca8d13a5a763061f64af47b68bcddfeeee580b122baba2fcf56",
+  "server_version": "0.8.0",
+  "validated_utc": "2026-11-10T05:17:26.834383+00:00",
+  "tool_count": 81,
+  "read_only_tool_count": 31,
+  "protocol": "2025-11-25",
+  "passed": [
+    "stdio lifecycle, schemas, resources, read-only enforcement, UTF-8 and read-size bounds",
+    "unknown methods/tools, strict argument types, required fields, traversal and CLI error conversion",
+    "index policy persists through MCP/CLI/resource, invalid combinations preserve state, targeted refresh queues metadata-only demand",
+    "real DAV downloads/uploads, no-clobber and explicit overwrite, copy/move/remove",
+    "explicit local roots, ancestor/symlink escape rejection, protected state and no shell execution",
+    "sync plan has no publication, conflict data and both copies preserved, explicit baseline-backed deletion",
+    "persistent cache budget, pinned cache and verified offline read without network",
+    "durable upload snapshots, queue cancellation and persisted Smart pause/resume",
+    "custom version save/no-clobber restore and guarded portable metadata round trip",
+    "managed transaction stays unpublished until commit, idempotent commit and verified get",
+    "ping stays responsive during file operation, cancellation reaps child and releases state lock",
+    "timed-out CLI is reaped and MCP remains responsive",
+    "active-operation EOF releases state lock; oversized inbound frame fails within its bound",
+    "negotiation of supported older MCP revisions"
+  ],
+  "scope": "Temporary authenticated loopback WebDAV fixture; no real remote storage or mounts"
+}

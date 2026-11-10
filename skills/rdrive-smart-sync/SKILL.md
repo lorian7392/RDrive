@@ -66,3 +66,11 @@ Inspect `rdrive_filter_status` and test rules with `rdrive_filter_test` before c
 Inspect `rdrive_policy_status`; defaults are versions disabled and conflicts stopped. `rdrive_smart_resolve` accepts keep-both, replace or remote. Replace archives the observed remote revision and retains a CAS guard; a second change must stop again. Remote cancels publication while preserving the local recovery snapshot. Configure automatic policy only to match the user’s requested behavior. `smart recovery DOMAIN` reports retained remote trash backups, which still consume remote space.
 
 Use `rdrive_service_install/start/stop/restart/uninstall` only for this home’s supervisor. Install accepts dry-run and does not start. Native App IPC must match the installed service; Keychain credentials are preferable to terminal-only environment variables. A running supervisor is not proof authentication or Finder registration succeeded. These tools require MCP write mode; native App/IPC paths require an allowed local root.
+
+## Clear or relocate Rust cache
+
+Use `rdrive_cache_clear` without apply to inspect eligible clean objects, then apply when cleanup is authorized. Pinned, active, unmanaged and unsent files remain protected; do not invent force-delete behavior. Finder download eviction uses the existing native trim/removal APIs separately.
+
+Inspect `rdrive_cache_directory`; configure with `rdrive_cache_set_directory` using an absolute private empty directory (or default=true), optionally dry_run=true. Migration verifies content and commits the new location only after all copies pass. Active readers/downloads prevent migration; source files remain in place on refusal. Preserve cache-directory-migration.json and both roots after an interruption; normal startup reconciles the durable intent. Untracked files block migration and must not be deleted as cache.
+
+Use RDrive 0.8 or newer for every broker sharing that state before changing the path. The change covers Rust clean payloads, not File Provider storage or offline edits. Generic MCP file tools intentionally reject cache roots, including migration roots; use profile-bound cache get rather than exporting internal object files.
