@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "validated_utc": "2026-11-09T13:50:17.145597+00:00",
+  "product_version": "rdrive 0.3.0",
+  "binary_sha256": "f9f2cf21adcd69ce112e3fb7349c41b24bd12edb0e22f0d011c62f4b28ea4a00",
+  "ordinary_tests": {
+    "passed": 101,
+    "failed": 0,
+    "library_passed": 72,
+    "mount_public_api_passed": 3,
+    "webdav_http_passed": 26,
+    "separately_run_ignored_tests": 4
+  },
+  "webdav_release_workflow_groups": 9,
+  "advanced_release_workflow_groups": 5,
+  "advanced_failures": [],
+  "advanced_scenarios": [
+    "real macOS tags and user xattrs, metadata-only sync and explicit clear, content-only replacement preservation",
+    "three queued uploads overlap, actual payload bandwidth cap and live JSON progress",
+    "multi-file snapshot visibility, immutable replay, two independent homes competing for one slot",
+    "actual SIGKILL after server publication before response; same-checksum replay without a new slot",
+    "authenticated bridge, lazy fetch, 16 concurrent callbacks, CRUD replay, fresh create conflict, delete response-loss replacement safety",
+    "pinned A fetch while B commits returns A; stale A modify conflicts and preserves B; duplicate raw content has distinct item identities"
+  ],
+  "native_mounts": {
+    "webdav_readonly_roundtrip": "passed",
+    "smb_encrypted_readonly_subdirectory": "passed",
+    "smb_encrypted_writable_write_rename_delete": "passed"
+  },
+  "smb_evidence": "SMB_VALIDATION.json",
+  "native_provider_evidence": "../macos/build/provider-native-report.json",
+  "native_build_and_host_evidence": "MACOS_INTEGRATION.md",
+  "scope": "Only synthetic temporary accounts/files, isolated local services. Native UI results are recorded separately.",
+  "native_sdk_host_groups": 11,
+  "native_file_provider_groups": 8,
+  "native_file_provider_scopes": [
+    "actual dataless placeholder enumeration with no file body GET",
+    "exact remote bytes on open and native eviction",
+    "eager offline pin, eviction rejection, unpin/eviction/re-download",
+    "canonical Finder tags and #S syncable xattrs reach sidecars; xattr removal preserves tags",
+    "native create, guarded modify and delete",
+    "materialized file readable after backend stopped"
+  ],
+  "finder_ui": {
+    "native_file_provider_actions_visible": true,
+    "native_unpin_clicked_and_state_independently_verified": true,
+    "custom_finder_sync_menu_badge_render_verified": false,
+    "custom_finder_sync_observation": "Absent in CloudStorage and explicitly mapped synthetic ordinary folder; bootstrap/host handshake observed, cause not established."
+  },
+  "native_ui_report": "../macos/build/finder-ui-report.json",
+  "cleanup_verified": true
+}

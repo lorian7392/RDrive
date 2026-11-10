@@ -1,0 +1,113 @@
+{
+  "schema": 2,
+  "validated_utc": "2026-11-10T00:46:06.834371+00:00",
+  "product_version": "rdrive 0.4.0",
+  "binary_sha256": "e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215",
+  "ordinary_tests": {
+    "passed": 128,
+    "failed": 0,
+    "library_passed": 86,
+    "http_cache_passed": 1,
+    "mount_public_api_passed": 3,
+    "smart_journal_passed": 8,
+    "webdav_http_passed": 30,
+    "environment_dependent_ignored": 4
+  },
+  "workflows": {
+    "smart": {
+      "passed_groups": 10,
+      "report": "SMART_VALIDATION.json",
+      "binary_sha256": "e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215"
+    },
+    "provider_receipts": {
+      "passed_groups": 7,
+      "report": "PROVIDER_RECEIPTS_VALIDATION.json",
+      "binary_sha256": "e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215"
+    },
+    "cli": {
+      "passed_groups": 9,
+      "scope": "0.4.0 CLI regressions; latest Smart-only graph fix separately tested"
+    },
+    "advanced": {
+      "passed_groups": 5,
+      "scope": "0.4.0 transaction/metadata/IPC regressions; latest Smart-only graph fix separately tested"
+    },
+    "encrypted_smb_provider": {
+      "passed_groups": 2,
+      "report": "SMB_PROVIDER_VALIDATION.json",
+      "binary_sha256": "e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215"
+    },
+    "native_file_provider_smart": {
+      "passed_groups": 11,
+      "report": "../macos/build/provider-native-smart-report.json",
+      "scope": "Actual macOS File Provider with synthetic DAV and foreground CLI watcher; final CLI source e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215"
+    },
+    "native_host": {
+      "passed_groups": 13,
+      "scope": "Swift native host tests; see MACOS_INTEGRATION.md"
+    }
+  },
+  "new_behavior": [
+    "persistent clean-cache cap shared by Rust and reported native materializations",
+    "durable admissions, LRU and shared FD reader protection",
+    "account-bound verified cached objects; fail-closed legacy offline entries",
+    "native usage conservative persistence, reservation heartbeats and bounded streams",
+    "Smart local catalog, immutable edits, pause/resume/export/reconnect and receipt replay",
+    "recursive explicit and inherited pin policies, including new descendants",
+    "confirmed own-write graph with independent remote version checks",
+    "content/metadata receipt attribution, crash recovery and replacement protection",
+    "native File Provider decorations, actions and status UI; see native report for observed scope"
+  ],
+  "real_service": {
+    "current_existing_mount_read_only_check": {
+      "present": true,
+      "filesystem": "webdav",
+      "read_only": false
+    },
+    "remote_mutation_during_this_task": false,
+    "route_changes_during_this_task": false,
+    "prior_authentication_and_mount_evidence": "CORE_VALIDATION_0.3.1.json"
+  },
+  "native_validation": "See MACOS_INTEGRATION.md and macos/build reports; build, registration, UI and cache behavior are distinct checks",
+  "limits": [
+    "clean payload/admission cap excludes retained dirty snapshots, upload spool and transient/system overhead",
+    "ordinary native network volumes use macOS cache policy, Smart is a separate File Provider view",
+    "ordinary file+sidecar publication is not a multi-object transaction; managed repository required for atomic snapshot view",
+    "development ad-hoc native signing, no production signing/notarization"
+  ],
+  "prior_version_evidence": [
+    "CORE_VALIDATION_0.3.1.json",
+    "CORE_VALIDATION_0.3.0.json",
+    "SMB_VALIDATION.json"
+  ],
+  "native_ui_observed": {
+    "smart_context_actions_visible": true,
+    "pinned_badge_and_label_visible": true,
+    "status_sheet_resolved_selected_item": true,
+    "ordinary_findersync": "Menu verified; independent badge rendering remains unverified",
+    "ordinary_findersync_menu_visible": true,
+    "ordinary_findersync_badges_verified": false,
+    "ordinary_findersync_scope": "Synthetic ordinary mapped folder inside the explicit development IPC permission; real 123pan mount not tested"
+  },
+  "native_build": {
+    "app": "macos/build/RDrive.app",
+    "version": "0.4.0",
+    "bundle_build": "6",
+    "sdk": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "architecture": "arm64",
+    "identity": "-",
+    "team_id": null,
+    "app_group": null,
+    "development_ipc_root": "/private/tmp/rdrive-native-ipc-501",
+    "distribution_ready": false,
+    "installed": false,
+    "activated": false,
+    "signing_status": "ad-hoc review build; no Developer Team identity",
+    "source_cli_sha256": "e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215",
+    "embedded_cli_sha256": "aa31c63339c2f0be1f16272f59589e828792f0263ea6a417bb9adb408c3ea18f",
+    "cli_version": "rdrive 0.4.0"
+  },
+  "native_cleanup_report": "../macos/build/native-cleanup-report-0.4.json",
+  "native_ui_report": "../macos/build/finder-ui-report-0.4.json",
+  "path_format": "Artifact paths are repository-relative; machine-specific prefixes were omitted before initial publication."
+}

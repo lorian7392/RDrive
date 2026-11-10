@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "validated_utc": "2026-11-09T13:16:04.893086+00:00",
+  "product_version": "rdrive 0.3.0",
+  "binary": {
+    "relative_path": "target/release/rdrive",
+    "sha256": "f9f2cf21adcd69ce112e3fb7349c41b24bd12edb0e22f0d011c62f4b28ea4a00",
+    "bytes": 15718800
+  },
+  "server": {
+    "version": "Samba 4.21.9",
+    "encryption": "required",
+    "fixture_image": "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f",
+    "storage": "temporary synthetic share only"
+  },
+  "release_cli": {
+    "passed": true,
+    "group_count": 10,
+    "groups": [
+      "encrypted SMB3 connection and truthful capabilities",
+      "multi-chunk upload/list/stat/download, publication and byte equality",
+      "copy and rename preserve existing destinations",
+      "explicit replacements publish complete files by rename",
+      "directory copy, file remove and explicit recursive remove",
+      "traversal, ADS, backslash and recursive self-copy rejected",
+      "new-file push sync and pull sync establish verified baselines",
+      "protected sync replacement retains recovery files and completed receipts stay out of sync",
+      "CLI resumable upload/download flags preserve complete content",
+      "managed SMB snapshot publication, content and xattrs, immutable replay and competing homes"
+    ],
+    "transparent_posix_symlink_observed": true,
+    "server_follow_symlinks_no_policy_verified": true
+  },
+  "current_library_proofs": {
+    "guarded_replacement": {
+      "passed": true,
+      "seconds": 0.43
+    },
+    "resumable_crash_and_publication": {
+      "passed": true,
+      "seconds": 13.86
+    },
+    "notifications_leases_and_fault_recovery": {
+      "passed": true,
+      "seconds": 11.66
+    }
+  },
+  "recovery_observations": [
+    {
+      "scenario": "automatic download recovery tcp",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 2,
+        "durable_reconnects": 1,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic download recovery restart",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 2,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 1
+      }
+    },
+    {
+      "scenario": "automatic download recovery wrong-password",
+      "diagnostics": {
+        "authenticated_reconnects": 0,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 1,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 1,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic download recovery changed-content",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 2,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic checkpointed upload recovery tcp",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 0,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic checkpointed upload recovery restart",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 0,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic checkpointed upload recovery wrong-password",
+      "diagnostics": {
+        "authenticated_reconnects": 0,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 0,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 1,
+        "verified_reopens": 0
+      }
+    },
+    {
+      "scenario": "automatic checkpointed upload recovery tampered-prefix",
+      "diagnostics": {
+        "authenticated_reconnects": 1,
+        "automatic_read_recovery_limit": 3,
+        "automatic_write_replay": false,
+        "durable_grants": 0,
+        "durable_reconnects": 0,
+        "live_lease_acknowledgements": 0,
+        "live_lease_breaks": 0,
+        "live_lease_grants": 0,
+        "payload_meter_excludes_protocol_headers": true,
+        "reconnect_authentication_failures": 0,
+        "verified_reopens": 0
+      }
+    }
+  ],
+  "limits": [
+    "Ordinary protected replacement retains a namespace gap; managed snapshots provide separate logical publication.",
+    "Durable-v2 handle grants are server-dependent; server restart used verified reopen, not persistent CA handles.",
+    "No server power-loss durability claim, write cache, DFS or byte-range lock API.",
+    "SMB-visible reparse points are rejected; transparent server POSIX symlinks require server policy.",
+    "Payload metering excludes SMB headers and encryption overhead."
+  ],
+  "fixture_notes": [
+    "A share-wide staging assertion was scoped to the CLI test folder because safe-write proofs intentionally retain recovery artifacts.",
+    "macOS xattr fixture uses independent native fd APIs because this CPython omits os.setxattr."
+  ],
+  "log_sources": {
+    "release_cli": "/private/tmp/rdrive-smb-final-release-cli.log",
+    "lifecycle": "/private/tmp/rdrive-smb-final-lifecycle.log",
+    "guard_and_resume": "/private/tmp/rdrive-smb-final-release.log"
+  }
+}

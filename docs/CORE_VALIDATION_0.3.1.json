@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "validated_utc": "2026-11-09T14:57:02.922634+00:00",
+  "product_version": "rdrive 0.3.1",
+  "ordinary_tests": {
+    "passed": 103,
+    "failed": 0,
+    "library_passed": 72,
+    "mount_public_api_passed": 3,
+    "webdav_http_passed": 28,
+    "separately_run_ignored_tests": 4
+  },
+  "new_regressions": [
+    "collections empty length before/after resourcetype, split successful propstats, zero-byte regular file",
+    "regular files reject empty/missing/invalid/negative/numeric+empty sizes"
+  ],
+  "real_service": {
+    "authorized": true,
+    "provider": "123pan WebDAV",
+    "system_proxy_discovery_without_proxy_environment_verified": true,
+    "authentication_verified": true,
+    "http_directory_entries": 22,
+    "native_directory_entries": 22,
+    "http_names_present_on_native_mount": true,
+    "kernel_filesystem": "webdav",
+    "kernel_readonly": false,
+    "remote_write_tested": false,
+    "certificate_verification_disabled": false,
+    "mount_retained_for_user": true
+  },
+  "native_build": {
+    "version": "0.3.1",
+    "bundle_build": "4",
+    "deep_strict_signature_verified": true,
+    "distribution_ready": false
+  },
+  "prior_version_evidence": {
+    "version": "0.3.0",
+    "core": "CORE_VALIDATION_0.3.0.json",
+    "smb": "SMB_VALIDATION.json",
+    "native_details": "MACOS_INTEGRATION.md",
+    "rerun_claimed": false
+  },
+  "limits": [
+    "Native custom FinderSync display remains unverified in development setup",
+    "No actual remote-account file mutation tested",
+    "No server power-loss guarantee; atomic logical snapshots require managed repository mode"
+  ],
+  "binary_sha256": "af6c9d13fd265059a3196bb9840984fc983bd23af5e13b3f496ede78e47fee84"
+}

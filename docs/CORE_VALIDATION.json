@@ -1,0 +1,75 @@
+{
+  "schema": 2,
+  "product_version": "rdrive 0.4.1",
+  "validated_utc": "2026-11-10T01:32:45.722941+00:00",
+  "binary_sha256": "7e6580fb4add806b21f9c130220ef95a541a5af63ff079e6fb1a7fcc39c97902",
+  "ordinary_tests": {
+    "passed": 135,
+    "failed": 0,
+    "library_passed": 93,
+    "http_cache_passed": 1,
+    "mount_api_passed": 3,
+    "smart_journal_passed": 8,
+    "webdav_http_passed": 30,
+    "environment_dependent_ignored": 4
+  },
+  "workflows": {
+    "smart": {
+      "passed_groups": 15,
+      "report": "SMART_VALIDATION.json"
+    },
+    "provider_receipts": {
+      "passed_groups": 7,
+      "report": "PROVIDER_RECEIPTS_VALIDATION.json"
+    },
+    "encrypted_smb_smart_provider": {
+      "passed_groups": 2,
+      "report": "SMB_PROVIDER_VALIDATION_0.4.1.json"
+    }
+  },
+  "native_build": {
+    "app": "macos/build/RDrive.app",
+    "version": "0.4.1",
+    "bundle_build": "7",
+    "sdk": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "architecture": "arm64",
+    "identity": "-",
+    "team_id": null,
+    "app_group": null,
+    "development_ipc_root": "/private/tmp/rdrive-native-ipc-501",
+    "distribution_ready": false,
+    "installed": false,
+    "activated": false,
+    "signing_status": "ad-hoc review build; no Developer Team identity",
+    "source_cli_sha256": "7e6580fb4add806b21f9c130220ef95a541a5af63ff079e6fb1a7fcc39c97902",
+    "embedded_cli_sha256": "24508467aae8a27aef654ae4062ef1fcd14bf13a5df9a3ee936582f122be4d6b",
+    "cli_version": "rdrive 0.4.1"
+  },
+  "real_service": {
+    "native_mount_present": true,
+    "smart_domain": "123pan-smart",
+    "smart_root_items": 23,
+    "finder_online_only_and_cloud_buttons_observed": true,
+    "browsed_child_directory_observed": true,
+    "five_file_provider_actions_observed": true,
+    "cache_max_bytes": 5368709120,
+    "clean_payload_bytes_at_validation": 0,
+    "remote_mutation_tests_performed": false,
+    "services_retained_for_user": true,
+    "runtime_reports_packaged": false
+  },
+  "prior_version_evidence": {
+    "core": "CORE_VALIDATION_0.4.0.json",
+    "native_host_groups": 13,
+    "native_file_provider_groups": 11,
+    "new_native_synthetic_rerun_claimed": false
+  },
+  "limits": [
+    "development ad-hoc native signing; no production notarization",
+    "clean-cache payload/admission cap excludes dirty recovery data, transfer copies and system overhead",
+    "ordinary native network mount and Smart File Provider view are distinct",
+    "independent FinderSync badges remain unverified",
+    "unvisited directories load on demand; fixed directories discover descendants progressively"
+  ],
+  "path_format": "Artifact paths are repository-relative; machine-specific prefixes were omitted before initial publication."
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "RDrive Smart Sync"
+  short_description: "Manage offline edits, sync plans, and cache limits"
+  default_prompt: "Use $rdrive-smart-sync to inspect my RDrive synchronization and complete the requested cache or recovery action."
+policy:
+  allow_implicit_invocation: true

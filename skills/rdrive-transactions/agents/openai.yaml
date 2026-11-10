@@ -1,0 +1,6 @@
+interface:
+  display_name: "RDrive Transactions"
+  short_description: "Publish and recover atomic repository snapshots"
+  default_prompt: "Use $rdrive-transactions to inspect or complete my RDrive managed-repository transaction while preserving recovery state."
+policy:
+  allow_implicit_invocation: true

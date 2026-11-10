@@ -1,0 +1,6 @@
+interface:
+  display_name: "RDrive Files"
+  short_description: "Browse, transfer, and mount WebDAV or SMB files"
+  default_prompt: "Use $rdrive-files to work with my existing RDrive connection and verify the requested file operation."
+policy:
+  allow_implicit_invocation: true

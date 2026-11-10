@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "validated_utc": "2026-11-10T01:26:17.035833+00:00",
+  "started_utc": "2026-11-10T01:26:00.409596+00:00",
+  "product_version": "rdrive 0.4.1",
+  "binary": {
+    "relative_path": "target/release/rdrive",
+    "absolute_path": "target/release/rdrive",
+    "sha256": "7e6580fb4add806b21f9c130220ef95a541a5af63ff079e6fb1a7fcc39c97902",
+    "bytes": 15956800,
+    "unchanged_during_test": true
+  },
+  "server": {
+    "version": "Samba 4.21.9",
+    "protocol": "SMB3",
+    "server_min_protocol": "SMB3_00",
+    "server_max_protocol": "SMB3_11",
+    "encryption": "required by both client profile and synthetic Samba share",
+    "fixture_image": "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f",
+    "storage": "temporary synthetic share only"
+  },
+  "release_provider": {
+    "passed": true,
+    "group_count": 2,
+    "groups": [
+      "encrypted SMB3 connection and truthful capabilities",
+      "raw SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch"
+    ],
+    "checks": [
+      "SMB3 encrypted session succeeds while server and client require transport encryption",
+      "Create response immediately contains the exact Finder tag plist and selected user xattrs just published",
+      "Content modification succeeds immediately after create without a provider fetch",
+      "Metadata-only modification returns the exact new tags and user xattrs",
+      "Another content modification succeeds immediately after metadata-only modification without a provider fetch",
+      "Each successful operation persists a strong revision matching one of its confirmed own-write receipts while SMB enumeration remains weak",
+      "A separate SMB client publishes an external version; the stale provider overwrite reports version_conflict and preserves external bytes"
+    ],
+    "domain_mode": {
+      "smart": true,
+      "repository": false
+    },
+    "fixture_adaptation": "Added --smart to domain-add in an in-memory copy only; repository test script unchanged"
+  },
+  "scope": "Focused Smart raw SMB provider IPC proof exercising demand-scoped directory refresh, strong own-write receipts, metadata and continuous edits. Historical 0.4 and ten-group SMB reports are preserved. Only a temporary synthetic encrypted share was used; no real NAS or cloud storage was contacted.",
+  "limits": [
+    "The exact negotiated SMB dialect was not captured; the server accepts only SMB3_00 through SMB3_11.",
+    "This validates the Rust provider bridge over encrypted SMB, not macOS native File Provider activation or server power-loss durability."
+  ],
+  "cleanup": {
+    "verified": true,
+    "new_test_containers_remaining": []
+  },
+  "test_command": [
+    "RDRIVE_SMB_PROVIDER_ONLY=1",
+    "python3",
+    "<in-memory Smart variant of tests/smb_workflows.py>",
+    "target/release/rdrive"
+  ],
+  "elapsed_seconds": 16.6,
+  "log_source": "/private/tmp/rdrive-smb-smart-provider-0.4.1-ih0igw4u.log",
+  "path_format": "Artifact paths are repository-relative; machine-specific prefixes were omitted before initial publication."
+}
