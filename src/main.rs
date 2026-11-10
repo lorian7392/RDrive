@@ -1799,6 +1799,13 @@ mod cli_contract {
             let mut invocation = base.clone();
             if cache_config && arg.get_id()=="max_bytes" { invocation.retain(|argument|argument!="--unlimited"); }
             if arg.get_id()=="app" && command.get_arguments().any(|argument|argument.get_id()=="register") { invocation.push("--register".into()); }
+            if path == ["conflict", "repair"] {
+                match arg.get_id().as_str() {
+                    "apply" => invocation.extend(["--expect".into(), "fixture-token".into()]),
+                    "expect" => invocation.push("--apply".into()),
+                    _ => {}
+                }
+            }
             if !arg.is_required_set() && !(cache_config && arg.get_id()=="unlimited") { append(&mut invocation, arg); }
             Cli::try_parse_from(&invocation).unwrap_or_else(|error| panic!("parameter {invocation:?}: {error}"));
             let mut values = 1;
@@ -1828,7 +1835,7 @@ mod cli_contract {
     fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
         let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
         let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(leaves.len(),97,"update the public interface inventory when adding a command");
+        assert_eq!(leaves.len(),101,"update the public interface inventory when adding a command");
         assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
         let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();
