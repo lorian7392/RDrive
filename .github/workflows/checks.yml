@@ -87,6 +87,8 @@ jobs:
         run: |
           rustup override set 1.90.0
           cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Test vendored SMB protocol regressions
+        run: cargo test --locked --package smb --no-default-features --features async,sign,encrypt --lib -- --nocapture
       - name: Collect Rust tests and disposable Samba coverage
         run: python3 tests/run_rust_coverage.py --output-dir target/coverage/rust-linux --workflows smb --test-suite portable-smb
       - name: Preserve measured reports

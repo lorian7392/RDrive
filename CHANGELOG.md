@@ -2,7 +2,14 @@
 
 Changes are organized from source history and versioned validation records. Dates identify the recorded changes or checks; they do not imply that a signed distribution was published. Historical test counts and deployment observations remain in their original reports and do not establish current coverage or installation status.
 
-## Unreleased
+## 0.8.1 — 2026-11-10
+
+- Account for credits granted by SMB `STATUS_PENDING` responses before waiting for final completion, so interim grants remain available to other requests.
+- Preserve a queued pending response when the same message ID receives its final response before the caller drains the queue.
+- Add deterministic protocol regressions for both conditions and run the vendored SMB library tests explicitly in CI using the root lockfile and the client's async/sign/encrypt feature set.
+- Keep ordinary builds and tests scoped to RDrive through workspace default members; update the native development bundle to version 0.8.1/build 11.
+
+## 0.8.0 — 2026-11-10
 
 - Publish English project, installation, quick-start, feature, architecture, configuration, and troubleshooting documentation.
 - Add a GitHub Pages documentation site and main-branch build/test and version-tag workflows.
@@ -14,8 +21,6 @@ Changes are organized from source history and versioned validation records. Date
 - Compare metadata selections independently of order and duplicates, and check actual xattr read lengths to reject changing values.
 - Return diagnostic errors for command-output failures instead of panicking when a pipe closes.
 - Require configured Finder roots to be real directories rather than ordinary files.
-
-## 0.8.0 — 2026-11-10
 
 - Add clean-cache clearing with preview by default and explicit application, protecting pinned, active, and non-clean content.
 - Support custom Rust clean-payload directories, verified migration, return to the default directory, and persistent migration recovery.

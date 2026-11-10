@@ -662,13 +662,14 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    #[maybe_async]
-    async fn process_sequence_incoming(&self, msg: &IncomingMessage) -> crate::Result<()> {
+    fn process_sequence_incoming(&self, msg: &IncomingMessage, account_charge: bool) -> crate::Result<()> {
         if let Some(neg) = self.conn_info.get()
             && neg.negotiation.caps.large_mtu()
         {
             let granted_credits = msg.message.header.credit_request;
-            let charged_credits = msg.message.header.credit_charge;
+            // Interim and final replies refer to the same request. Apply its
+            // charge only once, but return every response's granted credits.
+            let charged_credits = if account_charge { msg.message.header.credit_charge } else { 0 };
             // Update the pool size - return how many EXTRA credits were granted.
             // also, handle the case where the server granted less credits than charged.
             if charged_credits > granted_credits {
@@ -685,8 +686,10 @@ impl ConnectionMessageHandler {
         }
 
         // Default case: return a single credit to the pool.
-        self.curr_credits
-            .add_permits(Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize);
+        if account_charge {
+            self.curr_credits
+                .add_permits(Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize);
+        }
         debug_assert!(
             self.curr_credits.available_permits() <= Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize,
             "Expected at most {} credits available with no large mtu, got {}",
@@ -791,23 +794,20 @@ impl MessageHandler for ConnectionMessageHandler {
 
     #[maybe_async]
     async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        let msg = self.worker.get().unwrap().receive(&options).await?;
-
-        // Command matching (if needed).
-        if let Some(cmd) = options.cmd
-            && msg.message.header.command != cmd
-        {
-            return Err(Error::UnexpectedMessageCommand(msg.message.header.command));
-        }
-
-        // Direction matching.
-        if !msg.message.header.flags.server_to_redir() {
-            return Err(Error::InvalidMessage(
-                "Expected server-to-redir message".into(),
-            ));
-        }
-
-        self.process_sequence_incoming(&msg).await?;
+        let mut account_charge = true;
+        let msg = self.worker.get().unwrap().receive_with_callback(&options, |response| {
+            if let Some(cmd) = options.cmd
+                && response.message.header.command != cmd
+            {
+                return Err(Error::UnexpectedMessageCommand(response.message.header.command));
+            }
+            if !response.message.header.flags.server_to_redir() {
+                return Err(Error::InvalidMessage("Expected server-to-redir message".into()));
+            }
+            self.process_sequence_incoming(response, account_charge)?;
+            account_charge = false;
+            Ok(())
+        }).await?;
 
         // Expected status matching. Error if no match.
         if !options
@@ -889,6 +889,9 @@ impl Drop for ConnectionMessageHandler {
         }
     }
 }
+
+#[cfg(all(test, feature = "async", not(feature = "single_threaded")))]
+mod credit_tests;
 
 #[cfg(feature = "async")]
 impl Drop for ConnectionMessageHandler {

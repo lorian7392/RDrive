@@ -35,6 +35,29 @@ The default-ignored Samba proofs need the fixture below. Ignored tests are not p
 cargo test --locked --manifest-path tools/coverage-scope/Cargo.toml
 ```
 
+## Vendored SMB protocol regressions
+
+The root workspace contains RDrive and the patched SMB SDK. Its default member
+is RDrive, so ordinary `cargo build` and `cargo test` keep their application
+scope. Run the SDK's library unit tests explicitly with the same async,
+signing, and encryption features used by the client:
+
+```sh
+cargo test --locked --package smb --no-default-features \
+  --features async,sign,encrypt --lib -- --nocapture
+```
+
+This uses the root `Cargo.lock`, including the SDK's test dependencies. It runs
+the library regressions for interim `STATUS_PENDING` credit grants and queued
+pending/final responses without an external server. `--lib` keeps upstream
+integration targets out of this command; the isolated Samba fixture below is
+the documented integration suite. The AST helper and `vendor/smb-msg` remain
+outside workspace membership; the helper retains its independent lockfile,
+while the SMB message crate continues to resolve through the root patch.
+
+These tests supplement application coverage. Vendored dependencies remain
+outside the first-party production line percentage.
+
 ## Isolated behavior workflows
 
 Each script accepts the CLI executable under test. The DAV/IPC suite does not require Docker:
@@ -66,6 +89,12 @@ RDRIVE_SMB_PROVIDER_ONLY=1 RDRIVE_SMB_SMART=1 \
 ```
 
 `RDRIVE_DOCKER` selects the Docker executable. With `RDRIVE_SMB_TEST_RUNNER` pointing to the compiled Rust library test executable, the fixture also runs the ignored guarded/resumable proofs. Set `RDRIVE_SMB_LIFECYCLE=1 RDRIVE_SMB_PROOF_ONLY=1` to run the lifecycle proof separately in that fixture. These variables control test scripts, not production client configuration.
+
+If a concurrent managed-SMB commit exceeds its timeout, the fixture preserves
+bounded partial stdout/stderr and records available transaction phases,
+commit sequence information, and published slot names before temporary data
+is cleaned up. The original timeout remains fatal; diagnostic collection does
+not convert it into a pass.
 
 ## Test map
 
@@ -159,7 +188,7 @@ Three workflows keep compilation, validation, and the website separate:
 - **Checks** (`.github/workflows/checks.yml`) runs Rust, DAV/IPC, Swift, Python, and documentation contracts, plus disposable Linux Samba coverage. Its final job requires 100% production line coverage for each language.
 - **Documentation** (`.github/workflows/docs.yml`) builds the documentation site and deploys GitHub Pages from `main`. Pull requests validate the site without deploying it.
 
-Checks collects ordinary Rust/DAV/IPC, Swift, and Python on macOS, and Docker-backed Samba on Linux. Both Rust collectors freeze source and objects at the same Git revision. The final job checks every source hash and uses the first macOS result's executable-line inventory as the acceptance target. Linux executions contribute hits only to **those same macOS source lines**. Linux-only platform lines are outside macOS coverage, while the original Linux report is retained. This does not establish 100% coverage for a Linux client.
+Checks collects ordinary Rust/DAV/IPC, Swift, and Python on macOS, and Docker-backed Samba on Linux. Before the Samba workflows, the Linux job also runs every vendored SMB library unit test explicitly through the root locked workspace. Both Rust collectors freeze source and objects at the same Git revision. The final job checks every source hash and uses the first macOS result's executable-line inventory as the acceptance target. Linux executions contribute hits only to **those same macOS source lines**. Linux-only platform lines are outside macOS coverage, while the original Linux report is retained. This does not establish 100% coverage for a Linux client.
 
 Merge with the tested helper, listing macOS before Linux:
 

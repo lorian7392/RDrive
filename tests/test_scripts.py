@@ -243,7 +243,7 @@ class BuildPeer:
         if arguments == ["uname", "-m"]:
             return "arm64\n"
         if arguments == [str(self.cli), "--version"]:
-            return "rdrive 0.8.0\n"
+            return "rdrive 0.8.1\n"
         raise AssertionError("unexpected external query: " + repr(arguments))
 
     def run(self, arguments, *, check, **options):
@@ -303,7 +303,9 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual((self.output / "RDrive.app/Contents/Resources/rdrive").read_bytes(), self.cli.read_bytes())
         self.assertEqual(report["source_cli_sha256"], hashlib.sha256(self.cli.read_bytes()).hexdigest())
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
-        self.assertEqual(report["cli_version"], "rdrive 0.8.0")
+        self.assertEqual(report["cli_version"], "rdrive 0.8.1")
+        self.assertEqual(report["version"], "0.8.1")
+        self.assertEqual(report["bundle_build"], "11")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])

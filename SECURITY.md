@@ -1,6 +1,6 @@
 # Security policy
 
-RDrive 0.8.0 operates on remote files and retains local configuration, cached content, upload snapshots, and recovery records. Limit its access according to the storage account's permissions and the sensitivity of the data. The project does not declare long-term-support versions, fixed remediation deadlines, or a security-response SLA.
+RDrive 0.8.1 operates on remote files and retains local configuration, cached content, upload snapshots, and recovery records. Limit its access according to the storage account's permissions and the sensitivity of the data. The project does not declare long-term-support versions, fixed remediation deadlines, or a security-response SLA.
 
 ## Report a vulnerability
 

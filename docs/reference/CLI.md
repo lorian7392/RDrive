@@ -194,7 +194,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.0`: **111 command entries** (including groups, excluding the root and automatic `help`), **97 executable leaf commands**, and **788 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.1`: **111 command entries** (including groups, excluding the root and automatic `help`), **97 executable leaf commands**, and **788 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 

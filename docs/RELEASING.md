@@ -1,6 +1,6 @@
 # Version tags and CI builds
 
-RDrive uses `v<version>` Git tags, such as `v0.8.0`, for source versions. The tag must exactly match `package.version` in `Cargo.toml`, the compiled CLI's `--version`, and the optional native host and extension bundle versions.
+RDrive uses `v<version>` Git tags, such as `v0.8.1`, for source versions. The tag must exactly match `package.version` in `Cargo.toml`, the compiled CLI's `--version`, and the optional native host and extension bundle versions.
 
 A source tag does not create a GitHub Release, install an application, or certify a signed and notarized distribution. CI's companion build uses ad-hoc signing for build verification.
 
@@ -20,16 +20,16 @@ Both workflows also support manual runs. Their results are separate: a successfu
 3. Push the version commit to `main` and wait for both **Build** and **Checks** to pass for that exact commit.
 4. Create and push an annotated version tag. Never move a published version tag to a different commit; publish a new version for a correction.
 
-For the current `0.8.0` version:
+For the current `0.8.1` version:
 
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.8.0 -m "RDrive 0.8.0"
-git push origin refs/tags/v0.8.0
+git tag -a v0.8.1 -m "RDrive 0.8.1"
+git push origin refs/tags/v0.8.1
 ```
 
-Use `git tag -s` instead of `git tag -a` when a signing key is configured. Replace the example version for later releases. A tag push reruns the workflows; a tag such as `v0.8.1` on source that still declares `0.8.0` fails version validation.
+Use `git tag -s` instead of `git tag -a` when a signing key is configured. Replace the example version for later releases. A tag push reruns the workflows; a tag such as `v0.8.2` on source that still declares `0.8.1` fails version validation.
 
 ## Check a build locally
 
@@ -39,7 +39,7 @@ python3 macos/build.py --cli target/release/rdrive --output target/native-versio
 python3 tests/check_version.py \
   --binary target/release/rdrive \
   --app target/native-version-check/RDrive.app \
-  --tag v0.8.0 \
+  --tag v0.8.1 \
   --output target/version-report.json
 python3 -m unittest discover -s tests -p 'test_version.py' -v
 ```

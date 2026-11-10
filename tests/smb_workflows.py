@@ -168,6 +168,33 @@ cat > "$target"
                    input=content, check=True, capture_output=True, timeout=30)
 
 
+def timeout_diagnostics(error, homes, share):
+    """Retain bounded process output and transaction phases before cleanup."""
+    def output(value):
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        return text[-65536:]
+
+    command = error.cmd if isinstance(error.cmd, (list, tuple)) else [error.cmd]
+    result = {"command": [str(value) for value in command], "timeout": error.timeout,
+              "stdout": output(error.stdout), "stderr": output(error.stderr), "transactions": {}}
+    for home in dict.fromkeys(homes):
+        transactions = []
+        for journal in sorted((home / "transactions").glob("*.json"))[:64]:
+            try:
+                if journal.is_symlink() or journal.stat().st_size > 1024 * 1024:
+                    raise ValueError("journal is a symlink or exceeds the diagnostic limit")
+                value = json.loads(journal.read_bytes())
+                transactions.append({"journal": journal.name, "id": value.get("id"),
+                                     "phase": value.get("phase"), "base_sequence": value.get("base_sequence"),
+                                     "commit_sequence": (value.get("commit") or {}).get("commit", {}).get("sequence")})
+            except (OSError, ValueError, AttributeError) as failure:
+                transactions.append({"journal": journal.name, "diagnostic_error": str(failure)})
+        result["transactions"][home.name] = transactions
+    result["published_slots"] = [path.name for path in sorted(
+        (share / "managed/.rdrive-repository/commits").glob("*.json"))[:64]]
+    return result
+
+
 def run_tests(binary):
     docker = os.environ.get("RDRIVE_DOCKER") or shutil.which("docker")
     if not docker:
@@ -277,8 +304,17 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             passed = []
 
             def cli(*args, success=True, state_home=None, timeout=45):
-                result = subprocess.run([str(binary), "--home", str(state_home or home), "--json", *args],
-                                        env=env, capture_output=True, text=True, timeout=timeout)
+                try:
+                    result = subprocess.run([str(binary), "--home", str(state_home or home), "--json", *args],
+                                            env=env, capture_output=True, text=True, timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    try:
+                        diagnostics = timeout_diagnostics(
+                            error, [home, root / "rival-state", state_home or home], share)
+                    except Exception as diagnostic_error:
+                        diagnostics = {"diagnostic_error": str(diagnostic_error)}
+                    report.setdefault("timeout_diagnostics", []).append(diagnostics)
+                    raise
                 if success is not None and (result.returncode == 0) != success:
                     raise AssertionError(f"{args}: exit={result.returncode}\n{result.stdout}\n{result.stderr}")
                 return result

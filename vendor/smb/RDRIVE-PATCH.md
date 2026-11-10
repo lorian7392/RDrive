@@ -27,3 +27,14 @@ No encryption, signing, credential verification, authentication algorithm, DFS,
 or write replay implementation is replaced. Automatic reconnect policy,
 revalidation, metering and persistent upload checkpoints live in rdrive's
 src/smb.rs. See docs/SMB_LIFECYCLE.md for actual supported workflows and limits.
+
+Asynchronous response handling returns credits from each validated interim
+response immediately, as required by
+[MS-SMB2 section 3.3.4.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/46256e72-b361-4d73-ac7d-d47c04b32e4b).
+The request's credit charge is accounted once across interim and final replies;
+the received packet headers remain unchanged. Parallel workers retain a FIFO
+queue for responses sharing a message ID, so a final reply cannot overwrite an
+unconsumed interim reply. Connection-level tests use the real parallel worker
+and a scripted packet transport to exercise both defects, malformed replies,
+collision reconciliation, and the legacy single-credit path. The Linux CI job
+runs all SDK library unit tests through the root workspace and lockfile.

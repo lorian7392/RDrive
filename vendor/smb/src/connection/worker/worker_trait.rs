@@ -84,6 +84,20 @@ pub trait Worker: Sized + std::fmt::Debug {
     /// Receive a message from the server.
     /// This is a user function that will wait for the message to be received.
     async fn receive(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
+        self.receive_with_callback(options, |_| Ok(())).await
+    }
+
+    /// Process every response before waiting for an asynchronous final reply.
+    /// In particular, interim credit grants must be available to other requests
+    /// (including lease acknowledgements) while the original request is pending.
+    async fn receive_with_callback<F>(
+        &self,
+        options: &ReceiveOptions<'_>,
+        mut on_response: F,
+    ) -> crate::Result<IncomingMessage>
+    where
+        F: FnMut(&IncomingMessage) -> crate::Result<()>,
+    {
         if options.msg_id == u64::MAX {
             return Err(Error::InvalidArgument(
                 "Message ID -1 is not valid for receive()".to_string(),
@@ -91,17 +105,22 @@ pub trait Worker: Sized + std::fmt::Debug {
         }
 
         let curr = self.receive_next(options).await?;
+        if curr.message.header.status == Status::Pending as u32
+            && (!curr.message.header.flags.async_command()
+                || curr.message.header.async_id.is_none_or(|id| id == 0))
+        {
+            return Err(Error::InvalidArgument("Pending response lacks a valid async ID".into()));
+        }
+        if curr.message.header.flags.async_command() && !options.allow_async {
+            return Err(Error::InvalidArgument(
+                "Async command is not allowed in this context.".to_string(),
+            ));
+        }
+        on_response(&curr)?;
 
         // Not async -- return the result.
         if !curr.message.header.flags.async_command() {
             return Ok(curr);
-        }
-
-        // Handle async.
-        if !options.allow_async {
-            return Err(Error::InvalidArgument(
-                "Async command is not allowed in this context.".to_string(),
-            ));
         }
 
         // If not pending, that's the result, right away!
@@ -146,6 +165,7 @@ pub trait Worker: Sized + std::fmt::Debug {
                     async_id
                 )));
             }
+            on_response(&msg)?;
 
             // We've got a result!
             if msg.message.header.status != Status::Pending as u32 {

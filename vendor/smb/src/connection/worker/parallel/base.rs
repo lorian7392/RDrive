@@ -7,7 +7,7 @@ use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, VecDeque}, sync::Arc};
 
 use crate::{
     Error,
@@ -62,8 +62,9 @@ where
 {
     /// Stores the awaiting tasks that are waiting for a specific message ID.
     pub awaiting: HashMap<u64, T::AwaitingNotifier>,
-    /// Stores the pending messages, waiting to be receive()-d.
-    pub pending: HashMap<u64, crate::Result<IncomingMessage>>,
+    /// Keep interim and final replies in arrival order when no waiter exists.
+    /// They share a message ID, so a single map value would discard credits.
+    pub pending: HashMap<u64, VecDeque<crate::Result<IncomingMessage>>>,
 }
 
 impl<T> WorkerAwaitState<T>
@@ -167,7 +168,7 @@ where
             }
             None => {
                 log::trace!("Storing message until awaited: {msg_id}.",);
-                state.pending.insert(msg_id, msg);
+                state.pending.entry(msg_id).or_default().push_back(msg);
             }
         }
         Ok(())
@@ -291,14 +292,17 @@ where
                 log::trace!("Connection is closed, avoid receiving.");
                 return Err(Error::ConnectionStopped);
             }
-            if state.pending.contains_key(&options.msg_id) {
+            if let Some(messages) = state.pending.get_mut(&options.msg_id) {
                 log::trace!(
                     "Message with ID {} is already received, remove from pending.",
                     options.msg_id
                 );
-                let data = state.pending.remove(&options.msg_id).ok_or_else(|| {
+                let data = messages.pop_front().ok_or_else(|| {
                     Error::InvalidState("Message ID not found in pending messages.".to_string())
                 })?;
+                if messages.is_empty() {
+                    state.pending.remove(&options.msg_id);
+                }
                 return data;
             }
 

@@ -106,7 +106,7 @@ Local caches, upload snapshots, and retained edits are stored in plaintext. RDri
 
 ## Development
 
-The current source version is **0.8.0**, licensed under [MIT](LICENSE).
+The current source version is **0.8.1**, licensed under [MIT](LICENSE).
 
 The [2026-11-10 coverage snapshot](docs/COVERAGE.md) measured **100% production line coverage** for Rust, Swift, and Python. It records the measured source hashes and scope; it is distinct from the status of subsequent CI runs. System-boundary mocks and isolated DAV/Samba fixtures complement real-system validation.
 
