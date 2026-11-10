@@ -276,9 +276,9 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                     return
             passed = []
 
-            def cli(*args, success=True, state_home=None):
+            def cli(*args, success=True, state_home=None, timeout=45):
                 result = subprocess.run([str(binary), "--home", str(state_home or home), "--json", *args],
-                                        env=env, capture_output=True, text=True, timeout=45)
+                                        env=env, capture_output=True, text=True, timeout=timeout)
                 if success is not None and (result.returncode == 0) != success:
                     raise AssertionError(f"{args}: exit={result.returncode}\n{result.stdout}\n{result.stderr}")
                 return result
@@ -548,9 +548,13 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             writer_b = json.loads(cli("repo", "begin", "fixture", "managed", state_home=rival_home).stdout)["id"]
             cli("repo", "mkdir", writer_a, "writer-A")
             cli("repo", "mkdir", writer_b, "writer-B", state_home=rival_home)
+            # The profile's 15-second deadline applies to each SMB operation.
+            # Competing commits verify history, inherited blobs, staging and
+            # publication through many operations, so allow a bounded total
+            # beyond the ordinary CLI's 45 seconds while preserving the race.
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as writers:
-                first = writers.submit(cli, "repo", "commit", writer_a, success=None)
-                second = writers.submit(cli, "repo", "commit", writer_b, success=None, state_home=rival_home)
+                first = writers.submit(cli, "repo", "commit", writer_a, success=None, timeout=180)
+                second = writers.submit(cli, "repo", "commit", writer_b, success=None, state_home=rival_home, timeout=180)
                 outcomes = [first.result(), second.result()]
             assert sum(result.returncode == 0 for result in outcomes) == 1, [result.stderr for result in outcomes]
             final = json.loads(cli("repo", "ls", "fixture", "managed").stdout)
