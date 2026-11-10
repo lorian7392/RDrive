@@ -10,6 +10,7 @@ pub enum Kind {
     Local,
     Remote,
     Direction,
+    Patterns,
 }
 #[derive(Clone, Copy)]
 pub struct Field {
@@ -61,6 +62,7 @@ impl Tool {
                 Kind::Number => {
                     json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64})
                 }
+                Kind::Patterns => json!({"type":"array","maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}}),
                 Kind::Direction => json!({"type":"string","enum":["push","pull","both"]}),
                 Kind::Local => {
                     json!({"type":"string","minLength":1,"description":"Absolute local path within a server --local-root. Symlinks and the RDrive state directory are excluded."})
@@ -101,6 +103,15 @@ impl Tool {
                         bail!("{} must be boolean", field.name);
                     }
                 }
+                Kind::Patterns => {
+                    let values=value.as_array().ok_or_else(||anyhow::anyhow!("{} must be an array",field.name))?;
+                    if values.len()>256 {bail!("too many patterns");}
+                    for value in values {
+                        let pattern=value.as_str().ok_or_else(||anyhow::anyhow!("patterns must be strings"))?;
+                        if pattern.starts_with('-') {bail!("patterns cannot begin with a hyphen");}
+                        crate::filtering::matches_pattern(pattern,"")?;
+                    }
+                },
                 Kind::Number => {
                     if value.as_u64().is_none_or(|v| v > 9_007_199_254_740_991) {
                         bail!("{} must be a nonnegative safe integer", field.name);
@@ -159,6 +170,14 @@ impl Tool {
                 if args.get(name).and_then(Value::as_u64).is_some_and(|n|n==0||n>31_536_000) {bail!("index intervals must be between one second and one year");}
             }
         }
+        let yes=|name|args.get(name).and_then(Value::as_bool)==Some(true);
+        for (a,b) in [("exclude_temporary","include_temporary"),("enable_versions","disable_versions"),("clear_include","include"),("clear_exclude","exclude")] {
+            if yes(a) && (yes(b)||args.get(b).is_some_and(Value::is_array)) {bail!("{a} and {b} are mutually exclusive");}
+        }
+        if self.name=="rdrive_smart_resolve" && !args.get("strategy").and_then(Value::as_str).is_some_and(|s|["keep-both","replace","remote"].contains(&s)) {bail!("strategy must be keep-both, replace or remote");}
+        if let Some(strategy)=args.get("conflicts").and_then(Value::as_str) {if !["stop","keep-both","replace"].contains(&strategy){bail!("invalid conflict strategy");}}
+        if let Some(kind)=args.get("kind").and_then(Value::as_str) {if !["file","directory"].contains(&kind){bail!("kind must be file or directory");}}
+        if args.get("page_size").and_then(Value::as_u64).is_some_and(|n|n==0||n>1000){bail!("page_size must be 1..1000");}
         Ok(())
     }
     pub fn argv(&self, arguments: &Value) -> Vec<String> {
@@ -171,6 +190,12 @@ impl Tool {
             let value = arguments.get(field.name);
             if let Some(flag) = field.flag {
                 match field.kind {
+                    Kind::Patterns => {
+                        if let Some(values)=value.and_then(Value::as_array) {
+                            if values.is_empty() { out.push(format!("--clear-{}",field.name)); }
+                            for value in values {out.push(flag.to_owned());out.push(value.as_str().unwrap().to_owned());}
+                        }
+                    },
                     Kind::Bool => {
                         if value.and_then(Value::as_bool) == Some(true) {
                             out.push(flag.to_owned());
@@ -597,5 +622,21 @@ pub fn catalog() -> Vec<Tool> {
     tool!("index_status","Inspect SQLite directory-index counts and background metadata policy without networking.",&["index","status"],vec![Field::positional("domain",String,false)],false);
     tool!("index_config","Configure background metadata crawl and directory refresh intervals. Does not download contents.",&["index","config"],vec![b("enable","--enable"),b("disable","--disable"),n("depth","--depth"),b("all","--all"),n("refresh_seconds","--refresh-seconds"),n("active_refresh_seconds","--active-refresh-seconds")],true);
     tool!("index_refresh","Queue a targeted metadata refresh for an indexed Smart directory; recursive discovers descendants. Requires a running provider service to execute.",&["index","refresh"],vec![d(),ro(),recursive()],true);
+    tool!("index_search","Search local SQLite name/path index offline; does not crawl or contact storage.",&["index","search"],vec![d(),Field::positional("query",String,true),Field::option("scope",Remote,"--scope"),Field::option("kind",String,"--kind"),n("page_size","--page-size"),n("offset","--offset")],false);
+    tool!("smart_resolve","Resolve a retained Smart conflict: keep-both, replace (guarded and versioned), or remote (keep local recovery).",&["smart","resolve"],vec![d(),m(),Field{required:true,..Field::option("strategy",String,"--strategy")}],true);
+    tool!("smart_recovery","List retained remote namespace recovery backups without deleting them.",&["smart","recovery"],vec![d()],false);
+    tool!("filter_status","Read Smart inclusion/exclusion rules and optional profile override.",&["filter","status"],vec![Field::option("profile",String,"--profile")],false);
+    tool!("filter_test","Check Smart path selection without networking or deleting anything.",&["filter","test"],vec![p(),r(),b("directory","--directory")],false);
+    tool!("filter_config","Replace provided Smart rule lists. Excluded remote files and unsent local edits are preserved.",&["filter","config"],vec![Field::option("profile",String,"--profile"),b("exclude_temporary","--exclude-temporary"),b("include_temporary","--include-temporary"),Field::option("include",Patterns,"--include"),Field::option("exclude",Patterns,"--exclude"),b("clear_include","--clear-include"),b("clear_exclude","--clear-exclude")],true);
+    tool!("filter_reset","Remove a profile filter override and inherit global rules.",&["filter","reset"],vec![p()],true);
+    tool!("policy_status","Read automatic Smart version retention and conflict policy.",&["policy","status"],vec![Field::option("profile",String,"--profile")],false);
+    tool!("policy_config","Configure automatic Smart versions and stop, keep-both or replace conflict strategy.",&["policy","config"],vec![Field::option("profile",String,"--profile"),b("enable_versions","--enable-versions"),b("disable_versions","--disable-versions"),n("keep","--keep"),Field::option("conflicts",String,"--conflicts"),Field::option("include",Patterns,"--include"),Field::option("exclude",Patterns,"--exclude"),b("clear_include","--clear-include"),b("clear_exclude","--clear-exclude")],true);
+    tool!("policy_reset","Remove a profile policy override and inherit global version/conflict policy.",&["policy","reset"],vec![p()],true);
+    tool!("service_status","Inspect this RDrive home's private background supervisor and launchd status.",&["service","status"],vec![],false);
+    tool!("service_install","Install path-only private LaunchAgent configuration; starting is separate. Never stores credentials.",&["service","install"],vec![Field::option("ipc_root",Local,"--ipc-root"),Field::option("app",Local,"--app"),b("development_tcp","--development-tcp"),b("dry_run","--dry-run")],true);
+    tool!("service_start","Start only this RDrive home's installed supervisor.",&["service","start"],vec![b("dry_run","--dry-run")],true);
+    tool!("service_stop","Stop only this RDrive home's installed supervisor.",&["service","stop"],vec![b("dry_run","--dry-run")],true);
+    tool!("service_restart","Restart only this RDrive home's installed supervisor.",&["service","restart"],vec![b("dry_run","--dry-run")],true);
+    tool!("service_uninstall","Remove this RDrive home's supervisor configuration; user data is retained.",&["service","uninstall"],vec![b("dry_run","--dry-run")],true);
     tools
 }

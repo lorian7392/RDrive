@@ -238,7 +238,7 @@ def main():
             assert set((home / "tmp").iterdir()) == temporary_payloads, "oversized text left a temporary payload"
             resources = readonly.request("resources/list")["resources"]
             assert {"rdrive://status", "rdrive://profiles", "rdrive://domains", "rdrive://cache",
-                    "rdrive://index"} == {resource["uri"] for resource in resources}, resources
+                    "rdrive://index", "rdrive://filters", "rdrive://policies", "rdrive://service"} == {resource["uri"] for resource in resources}, resources
             for resource in resources:
                 response = readonly.request("resources/read", {"uri": resource["uri"]})
                 assert response["contents"][0]["uri"] == resource["uri"], response

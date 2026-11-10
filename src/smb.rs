@@ -2045,6 +2045,44 @@ impl Backend for Smb {
             .with_context(|| format!("remove SMB path {path}"))
     }
 
+    async fn remove_checked(&self,path:&str,expected:&Entry)->Result<()>{
+        let path=valid_path(path)?;
+        if path.is_empty()||expected.path!=path||expected.is_dir{bail!("unsupported: guarded SMB deletion requires a non-root file revision");}
+        require_strong_revision(expected)?;self.check_ancestors(&path,false).await?;
+        let file=self.open_protected(&path,true).await?;
+        let result=async{let actual=self.protected_entry(&path,&file).await?;if !actual.same_revision(expected){bail!("version_conflict: SMB delete source changed");}file.set_info(FileDispositionInformation::default()).await?;Ok(())}.await;
+        finish(result,file.close().await.map_err(anyhow::Error::from))
+    }
+
+    fn namespace_matches(&self,expected:&Entry,actual:&Entry)->bool{
+        if expected.is_dir&&actual.is_dir{
+            let identity=|entry:&Entry|entry.etag.as_deref().and_then(|token|token.strip_prefix("W/smb-meta:")).map(|rest|rest.split(':').take(2).collect::<Vec<_>>().join(":"));
+            identity(expected).is_some()&&identity(expected)==identity(actual)
+        }else{expected.same_revision(actual)}
+    }
+
+    async fn rename_checked(&self,from:&str,to:&str,expected:&Entry)->Result<Entry>{
+        let(from,to)=distinct_paths(from,to)?;
+        if expected.path!=from{bail!("invalid SMB move revision");}
+        self.check_ancestors(&from,false).await?;self.check_ancestors(&to,false).await?;
+        if !expected.is_dir{
+            require_strong_revision(expected)?;let file=self.open_protected(&from,true).await?;
+            let result=async{let actual=self.protected_entry(&from,&file).await?;if !actual.same_revision(expected){bail!("version_conflict: SMB move source changed");}self.rename_handle(&file,&to).await?;let mut moved=actual;moved.path=to;Ok(moved)}.await;
+            return finish(result,file.close().await.map_err(anyhow::Error::from));
+        }
+        let mut args=FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_read_attributes(true).with_delete(true));
+        args.options=CreateOptions::new().with_directory_file(true).with_open_reparse_point(true);
+        args.share_access=Some(ShareAccessFlags::new().with_read(true));
+        let resource=self.client.create_file(&self.unc(&from)?,&args).await?;let file=handle(&resource);
+        let result=async{
+            let before=namespace_metadata(&from,file).await?;
+            if !before.same_revision(expected){bail!("version_conflict: SMB directory move source changed");}
+            file.set_info(FileRenameInformation{replace_if_exists:false.into(),root_directory:0,file_name:self.full_path(&to)?.replace('/',"\\").into()}).await?;
+            namespace_metadata(&to,file).await
+        }.await;
+        finish(result,file.close().await.map_err(anyhow::Error::from))
+    }
+
     async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
         let (from, to) = distinct_paths(from, to)?;
         self.check_ancestors(&from, false).await?;
@@ -2113,6 +2151,12 @@ fn handle(resource: &Resource) -> &ResourceHandle {
         Resource::Directory(dir) => dir.handle(),
         Resource::Pipe(pipe) => pipe,
     }
+}
+
+async fn namespace_metadata(path:&str,file:&ResourceHandle)->Result<Entry>{
+    let info=file.query_info::<FileNetworkOpenInformation>().await?;reject_reparse(info.file_attributes)?;
+    let identity=stable_identity(file).await?;let mut result=entry(path,&info);
+    result.etag=Some(format!("W/smb-meta:{:016x}:{:032x}:{}:{}:{}",identity.volume_serial_number,identity.file_id,info.end_of_file,info.last_write_time.since_epoch().as_nanos(),info.change_time.since_epoch().as_nanos()));Ok(result)
 }
 
 fn finish<T>(result: Result<T>, closed: Result<()>) -> Result<T> {

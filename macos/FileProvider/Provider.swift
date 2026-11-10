@@ -201,6 +201,8 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                     contents newContents: URL?, options: NSFileProviderModifyItemOptions, request: NSFileProviderRequest,
                     completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
         work({ bridge, operation in
+            let previousParent = (try? bridge.item(["op": "item", "domain": self.domain.identifier.rawValue,
+                "id": wireID(item.itemIdentifier)], operation: operation)).map { ProviderItem($0).parentItemIdentifier }
             var message: [String: Any] = ["op": "modify", "domain": self.domain.identifier.rawValue,
                 "id": wireID(item.itemIdentifier), "base_content_version": try self.component(version.contentVersion),
                 "base_metadata_version": try self.component(version.metadataVersion)]
@@ -221,6 +223,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             let updated = ProviderItem(try bridge.item(message, operation: operation))
             if newContents != nil { try? NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue).acknowledgeLocalContent(updated.wire) }
             self.signal(updated.parentItemIdentifier)
+            if let previousParent = previousParent, previousParent != updated.parentItemIdentifier { self.signal(previousParent) }
             return updated
         }) { result in
             switch result { case .success(let item): completionHandler(item, [], false, nil); case .failure(let error): completionHandler(nil, changedFields, false, error) }

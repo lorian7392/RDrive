@@ -135,6 +135,15 @@ pub trait Backend: Send + Sync {
         bail!("server-side conditional deletion is unavailable; remote file was preserved")
     }
     async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()>;
+    /// Move exactly the guarded source to an absent destination. The source
+    /// revision must be checked by the server/on the same protected SMB handle.
+    /// A transport error may mean publication completed; callers journal intent.
+    async fn rename_checked(&self, _from:&str, _to:&str, _expected:&Entry)->Result<Entry> {
+        bail!("unsupported: server-enforced guarded rename is unavailable")
+    }
+    /// Reconcile a journalled move without adopting an unrelated replacement.
+    /// Directories also require a separately verified complete child manifest.
+    fn namespace_matches(&self,expected:&Entry,actual:&Entry)->bool{expected.same_revision(actual)}
     async fn copy(&self, from: &str, to: &str, overwrite: bool) -> Result<()>;
     async fn lock(&self, _path: &str, _seconds: u32) -> Result<String> {
         bail!("this backend does not support WebDAV locks")

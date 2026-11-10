@@ -1,0 +1,79 @@
+{
+  "binary": "target/release/rdrive",
+  "version": "rdrive 0.7.0",
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "checks": [
+    "root publishes before a blocked deep scan and concurrent SQLite-backed reads remain available",
+    "default background preindex discovers unopened children and deep descendants without content GET",
+    "refresh TTL avoids repeatedly listing a fresh directory despite repeated local queries",
+    "manual targeted refresh applies create/delete/modify atomically and preserves stable sibling identities",
+    "errored listings preserve known descendants; only a later successful empty scope removes them",
+    "depth limits hold while manual recursive refresh crosses its subtree once and does not follow future children",
+    "process restart reuses persisted SQLite metadata while the service is offline",
+    "atomic legacy migration retains receipts/pins/events and SQLite stays authoritative after legacy JSON corruption",
+    "backend binding changes and unsafe refresh paths fail closed without reusing another scope",
+    "10,100-row folder queries use the parent index despite an unrelated corrupt Record; SQL/RPC and JSON timings have no hard speed threshold"
+  ],
+  "passed": 10,
+  "metrics": {
+    "blocked_network_root_query_ms": 3.3216669980902225,
+    "index_status": {
+      "domains": [
+        {
+          "anchor": "11",
+          "database": "main/state/provider/658a3e8d64510f66bbe811380d78f20eca341518966804db136ecffddb4e0911.sqlite3",
+          "directories": 5,
+          "display_name": "indexed",
+          "domain": "indexed",
+          "files": 6,
+          "initialized": true,
+          "items": 11,
+          "pending": 0,
+          "repository": false,
+          "scanned": 6,
+          "schema_version": 2
+        }
+      ],
+      "policy": {
+        "active_refresh_secs": 30,
+        "enabled": true,
+        "prefetch_depth": null,
+        "refresh_secs": 300
+      },
+      "refresh_requires_provider_service": true
+    },
+    "folder_queries": {
+      "records": 10100,
+      "children_per_folder": 100,
+      "legacy_bytes": 9758881,
+      "method": "Warm actual SQLite child query plus Item JSON decoding versus json.loads of retained legacy bytes plus parent filtering; actual provider socket RPC measured separately. These are local fixture measurements, not a before/after Rust benchmark.",
+      "sqlite_query_decode": {
+        "samples": 30,
+        "median_ms": 0.827396,
+        "p95_ms": 0.845083,
+        "min_ms": 0.77925
+      },
+      "legacy_full_parse_scan": {
+        "samples": 30,
+        "median_ms": 34.1977495,
+        "p95_ms": 35.495458,
+        "min_ms": 33.475459
+      },
+      "provider_rpc": {
+        "samples": 30,
+        "median_ms": 13.523208499999999,
+        "p95_ms": 17.155541,
+        "min_ms": 4.065084
+      },
+      "query_plan": [
+        "SEARCH items USING INDEX items_parent_id (parent_id=?)"
+      ],
+      "observed_parse_to_sql_median_ratio": 41.33178006661864
+    }
+  },
+  "path_format": {
+    "binary": "repository-relative when inside the repository; otherwise absolute",
+    "index_database": "relative to the removed temporary fixture root"
+  },
+  "scope": "synthetic loopback WebDAV, temporary SQLite/legacy state, deterministic 10,100-row comparison; no real storage"
+}

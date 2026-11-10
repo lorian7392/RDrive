@@ -8,6 +8,9 @@ use std::{collections::BTreeMap,fs::{self,File},io::{Seek,SeekFrom},path::{Path,
 use tokio::{io::{AsyncBufReadExt,AsyncReadExt,AsyncWriteExt,BufReader},net::{UnixListener,TcpListener}};
 mod index;
 mod index_scheduler;
+mod namespace;
+mod resolution;
+pub use resolution::resolve_smart;
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct Domain {pub id:String,pub profile:String,pub remote:String,pub display_name:String,#[serde(default)]pub repository:bool,#[serde(default)]pub local_root:Option<PathBuf>,#[serde(default)]pub smart:bool}
@@ -16,7 +19,7 @@ pub struct Item {pub id:String,pub parent_id:String,pub name:String,pub kind:Str
 #[derive(Debug,Clone,Serialize,Deserialize)]
 struct Record {path:String,item:Item,entry:Option<Entry>,#[serde(default)]strong:Option<Entry>,#[serde(default)]client_id:Option<String>,#[serde(default)]metadata_known:bool,#[serde(default)]metadata_checked:i64}
 #[derive(Debug,Clone,Serialize,Deserialize)]
-struct Pending {fingerprint:String,#[serde(default)]metadata:Option<crate::metadata::MetadataRecord>,#[serde(default)]source_fingerprint:Option<String>,#[serde(default)]transaction:Option<String>,#[serde(default)]confirmed:Option<Entry>,#[serde(default)]response:Option<Value>,#[serde(default)]deletion_path:Option<String>,#[serde(default)]deletion_expected:Option<Entry>,#[serde(default)]metadata_base_fingerprint:Option<String>}
+struct Pending {fingerprint:String,#[serde(default)]metadata:Option<crate::metadata::MetadataRecord>,#[serde(default)]source_fingerprint:Option<String>,#[serde(default)]transaction:Option<String>,#[serde(default)]confirmed:Option<Entry>,#[serde(default)]response:Option<Value>,#[serde(default)]deletion_path:Option<String>,#[serde(default)]deletion_expected:Option<Entry>,#[serde(default)]metadata_base_fingerprint:Option<String>,#[serde(default)]namespace:Option<namespace::Plan>,#[serde(default)]version:Option<crate::operations::Version>}
 #[derive(Debug,Clone,Serialize,Deserialize)]
 struct NativeAttention {version:String,message:String}
 #[derive(Debug,Default,Serialize,Deserialize)]
@@ -24,7 +27,7 @@ struct NativeCached {binding:String,versions:BTreeMap<String,String>}
 #[derive(Debug,Clone,Default,Serialize,Deserialize)]
 struct ScanAttempt {last:i64,failures:u32,next_try:i64}
 #[derive(Debug,Clone,Default,Serialize,Deserialize)]
-struct Journal {#[serde(default)]binding:Option<String>,items:BTreeMap<String,Record>,anchor:u64,events:Vec<Event>,requests:BTreeMap<String,Pending>,#[serde(default)]pins:std::collections::BTreeSet<String>,#[serde(default)]pins_migrated:bool,#[serde(default)]native_errors:BTreeMap<String,NativeAttention>,#[serde(default)]smart_replays:BTreeMap<String,Request>,#[serde(default)]directory_scans:BTreeMap<String,i64>,#[serde(default)]directory_attempts:BTreeMap<String,ScanAttempt>,#[serde(default)]metadata_attempts:BTreeMap<String,ScanAttempt>,#[serde(default)]directory_turn:u64,#[serde(default)]completed_demands:BTreeMap<String,i64>}
+struct Journal {#[serde(default)]binding:Option<String>,items:BTreeMap<String,Record>,anchor:u64,events:Vec<Event>,requests:BTreeMap<String,Pending>,#[serde(default)]pins:std::collections::BTreeSet<String>,#[serde(default)]pins_migrated:bool,#[serde(default)]native_errors:BTreeMap<String,NativeAttention>,#[serde(default)]smart_replays:BTreeMap<String,Request>,#[serde(default)]directory_scans:BTreeMap<String,i64>,#[serde(default)]directory_attempts:BTreeMap<String,ScanAttempt>,#[serde(default)]metadata_attempts:BTreeMap<String,ScanAttempt>,#[serde(default)]directory_turn:u64,#[serde(default)]completed_demands:BTreeMap<String,i64>,#[serde(default)]filter_fingerprint:Option<String>}
 #[derive(Debug,Clone,Serialize,Deserialize)]struct Event {anchor:u64,item:Option<Item>,deleted:Option<String>}
 #[derive(Debug,Clone,Deserialize,Serialize)]
 pub struct Request {
@@ -85,9 +88,31 @@ pub fn add_domain(store:&Store,domain:Domain)->Result<()> {
     let mut all=domains(&store.home)?;if all.iter().any(|d|d.id==domain.id){bail!("provider domain already exists");}all.push(domain);state::atomic_json(&store.home.join("provider-domains.json"),&all)
 }
 pub fn remove_domain(store:&Store,id:&str)->Result<()> {let mut all=domains(&store.home)?;let n=all.len();all.retain(|d|d.id!=id);if all.len()==n{bail!("domain does not exist");}state::atomic_json(&store.home.join("provider-domains.json"),&all)}
+fn raw_capabilities(b:&dyn Backend,entry:&Entry)->Vec<String>{
+    let mut caps=vec!["read".into()];if entry.is_dir{caps.push("add".into());}else if b.capabilities().conditional_write{caps.push("write".into());}
+    if b.capabilities().protocol=="smb"||entry.etag.as_ref().is_some_and(|tag|!tag.starts_with("W/")&&tag.starts_with('"')){caps.extend(["rename","reparent","delete"].map(str::to_owned));}caps
+}
 fn root_item(d:&Domain)->Item{Item{id:"root".into(),parent_id:"root".into(),name:d.display_name.clone(),kind:"directory".into(),size:0,modified:None,content_version:"root".into(),metadata_version:"root".into(),pinned:false,capabilities:vec!["read".into(),"add".into()],tag_data_hex:None,extended_attributes:BTreeMap::new(),smart:d.smart,sync_state:Some("online".into()),sync_message:None,has_unsynced_changes:false,native_materialized:false}}
 fn relative(root:&str,path:&str)->Result<String>{if root.is_empty(){backend::normalize(path)}else{path.strip_prefix(&format!("{root}/")).map(str::to_owned).context("backend returned item outside provider root")}}
 fn remote(d:&Domain,path:&str)->Result<String>{backend::join(&d.remote,path)}
+fn require_mutation_path(store:&Store,d:&Domain,path:&str,directory:bool)->Result<()> {
+    if !crate::filtering::allowed(&store.config,&d.profile,path,directory)?{bail!("server_unreachable: synchronization filters exclude {path}; local mutation retained until the rules allow it");}Ok(())
+}
+fn require_mutation_paths(store:&Store,d:&Domain,j:&Journal,req:&Request)->Result<()> {
+    if !["create","modify","delete"].contains(&req.op.as_str()){return Ok(());}
+    if namespace::check_pending_filters(store,d,j,req)?{return Ok(());}
+    let record=req.id.as_ref().and_then(|id|j.items.get(id));
+    if let Some(record)=record {
+        require_mutation_path(store,d,&record.path,record.item.kind=="directory")?;
+        if record.item.kind=="directory"{for child in j.items.values().filter(|child|child.path.starts_with(&format!("{}/",record.path))){require_mutation_path(store,d,&child.path,child.item.kind=="directory")?;}}
+    }else if req.op=="delete"{if let Some(path)=req.request_id.as_ref().and_then(|id|j.requests.get(&format!("{}:{id}",state::key(&d.id)))).and_then(|p|p.deletion_path.as_ref()){require_mutation_path(store,d,path,false)?;}}
+    if req.op!="delete" {
+        let parent=req.parent_id.as_deref().or_else(||record.map(|r|r.item.parent_id.as_str())).unwrap_or("root");
+        let name=req.name.as_deref().or_else(||record.map(|r|r.item.name.as_str())).context("name required")?;
+        let target=child_path(j,parent,name)?;require_mutation_path(store,d,&target,req.kind.as_deref()==Some("directory")||record.is_some_and(|r|r.item.kind=="directory"))?;
+        if let Some(record)=record.filter(|r|r.item.kind=="directory"){for child in j.items.values().filter(|child|child.path.starts_with(&format!("{}/",record.path))){let suffix=child.path.strip_prefix(&format!("{}/",record.path)).unwrap();require_mutation_path(store,d,&backend::join(&target,suffix)?,child.item.kind=="directory")?;}}
+    }Ok(())
+}
 fn version(e:&Entry)->Result<String>{Ok(state::key(&serde_json::to_string(&(e.is_dir,e.size,&e.etag,if e.etag.is_none(){e.modified}else{None}))?))}
 fn keep_internal(path:&str)->bool{!path.split('/').any(|p|p.starts_with(".rdrive-")||p==".rdrive-repository")}
 fn metadata_version(path:&str,tags:&Option<String>,attributes:&BTreeMap<String,String>,pinned:bool)->Result<String>{Ok(state::key(&serde_json::to_string(&(path,tags,attributes,pinned))?))}
@@ -151,8 +176,9 @@ fn catalog_demands(store:&Store,d:&Domain,j:&Journal)->Result<Vec<CatalogDemand>
         else if j.items.get(&demand.id).is_some_and(|r|r.path==demand.path&&demand.metadata!=(r.item.kind=="directory")){demands.push(demand);}
     }Ok(demands)
 }
-fn next_directory(store:&Store,_d:&Domain,j:&Journal,demands:&[CatalogDemand])->Result<Option<String>> {
-    Ok(index_scheduler::next_directory(j,demands,&store.config.index,chrono::Utc::now().timestamp_millis()))
+fn next_directory(store:&Store,d:&Domain,j:&Journal,demands:&[CatalogDemand])->Result<Option<String>> {
+    let selector=crate::filtering::Selector::new(&store.config,&d.profile)?;
+    Ok(index_scheduler::next_directory_where(j,demands,&store.config.index,chrono::Utc::now().timestamp_millis(),|path,directory|selector.allowed(path,directory).unwrap_or(false)))
 }
 fn scope_parent(j:&Journal,id:&str)->Result<String>{if id=="root"{return Ok(String::new());}let record=j.items.get(id).context("no_such_item: directory is no longer known")?;if record.item.kind!="directory"{bail!("no_such_item: catalog scope is not a directory");}Ok(record.path.clone())}
 fn emit_namespace(store:&Store,d:&Domain,j:&mut Journal,old:&BTreeMap<String,Record>,mut next:BTreeMap<String,Record>)->Result<()> {
@@ -173,7 +199,7 @@ async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,
         let path=relative(&d.remote,&entry.path)?;if !keep_internal(&path){continue;}
         if entries.insert(path,entry).is_some(){bail!("duplicate provider child path");}
     }
-    let direct:Vec<_>=old.iter().filter(|(_,r)|r.item.parent_id==parent_id).map(|(id,r)|(id.clone(),r.clone())).collect();
+    let direct:Vec<_>=old.iter().filter(|(_,r)|r.path.rsplit_once('/').map(|(p,_)|p).unwrap_or("")==parent).map(|(id,r)|(id.clone(),r.clone())).collect();
     for (id,record) in &direct {
         let replacement=entries.get(&record.path);
         let gone=replacement.is_none();let directory_replaced=record.item.kind=="directory"&&replacement.is_some_and(|e|!e.is_dir);
@@ -187,7 +213,7 @@ async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,
         let strong=if entry.etag.as_ref().is_some_and(|etag|!etag.starts_with("W/")){Some(entry.clone())}else{previous.filter(|_|same).and_then(|r|r.strong.clone())};
         let tags=previous.and_then(|r|r.item.tag_data_hex.clone());
         let attributes=previous.map(|r|r.item.extended_attributes.clone()).unwrap_or_default();
-        let mut capabilities=vec!["read".into()];if entry.is_dir{capabilities.push("add".into());}else if b.capabilities().conditional_write{capabilities.push("write".into());}if b.capabilities().protocol=="webdav"&&!entry.is_dir{capabilities.push("delete".into());}
+        let capabilities=raw_capabilities(b,&entry);
         let item=Item{id:id.clone(),parent_id:parent_id.into(),name:path.rsplit('/').next().unwrap().into(),kind:if entry.is_dir{"directory"}else{"file"}.into(),size:entry.size,modified:entry.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|value|value.to_rfc3339()),content_version:version(&entry)?,metadata_version:metadata_version(&path,&tags,&attributes,false)?,pinned:false,capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
         next.insert(id,Record{path,item,entry:Some(entry),strong,client_id:previous.and_then(|r|r.client_id.clone()),metadata_known:previous.is_some_and(|r|r.metadata_known),metadata_checked:previous.filter(|_|same).map_or(0,|r|r.metadata_checked)});
     }
@@ -220,17 +246,18 @@ async fn enrich_metadata(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,id
     project_metadata(record,metadata.as_ref());
     let old=j.items.clone();emit_namespace(store,d,j,&old,next)
 }
-fn next_metadata(j:&Journal,demands:&[CatalogDemand])->Option<String>{
+fn next_metadata(store:&Store,d:&Domain,j:&Journal,demands:&[CatalogDemand])->Result<Option<String>>{
+    let selector=crate::filtering::Selector::new(&store.config,&d.profile)?;
     let now=chrono::Utc::now().timestamp_millis();
-    j.items.iter().filter(|(id,record)|record.item.kind=="file"&&record.strong.is_some()&&j.metadata_attempts.get(*id).is_none_or(|attempt|attempt.next_try<=now)).filter_map(|(id,record)|{
+    Ok(j.items.iter().filter(|(id,record)|record.item.kind=="file"&&selector.allowed(&record.path,false).unwrap_or(false)&&record.strong.is_some()&&j.metadata_attempts.get(*id).is_none_or(|attempt|attempt.next_try<=now)).filter_map(|(id,record)|{
         let request=demands.iter().find(|d|d.metadata&&d.id==*id).map(|d|d.requested).unwrap_or(0);
         let priority=if request>record.metadata_checked{0}else if record.metadata_known&&now.saturating_sub(record.metadata_checked)>=30_000{1}else{return None};
         Some(((priority,j.metadata_attempts.get(id).map_or(0,|attempt|attempt.last),record.metadata_checked),id.clone()))
-    }).min_by_key(|(priority,_)|*priority).map(|(_,id)|id)
+    }).min_by_key(|(priority,_)|*priority).map(|(_,id)|id))
 }
 fn request_parent(j:&Journal,d:&Domain,req:&Request)->Result<String>{
     if req.op=="create"{return Ok(req.parent_id.clone().unwrap_or_else(||"root".into()));}
-    if let Some(record)=req.id.as_ref().and_then(|id|j.items.get(id)){return Ok(record.item.parent_id.clone());}
+    if let Some(record)=req.id.as_ref().and_then(|id|j.items.get(id)){let parent=record.path.rsplit_once('/').map(|(p,_)|p).unwrap_or("");return Ok(if parent.is_empty(){"root".into()}else{j.items.values().find(|r|r.path==parent).context("no_such_item: source parent missing")?.item.id.clone()});}
     if req.op=="list"{return Ok(req.parent_id.clone().filter(|p|p!="working_set").unwrap_or_else(||"root".into()));}
     if req.op=="delete"{if let Some(key)=req.request_id.as_ref(){let key=format!("{}:{key}",state::key(&d.id));if let Some(path)=j.requests.get(&key).and_then(|p|p.deletion_path.as_ref()){
         let parent=path.rsplit_once('/').map(|(parent,_)|parent).unwrap_or("");if parent.is_empty(){return Ok("root".into());}if let Some(record)=j.items.values().find(|r|r.path==parent&&r.item.kind=="directory"){return Ok(record.item.id.clone());}
@@ -277,7 +304,7 @@ async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<O
             let mut tags=old.get(&id).and_then(|r|r.item.tag_data_hex.clone());
             let mut attributes=old.get(&id).map(|r|r.item.extended_attributes.clone()).unwrap_or_default();
             if !e.is_dir{if let Some(verified)=&strong{if let Some(meta)=crate::metadata_remote::load(b,&e.path,verified).await?{tags=meta.attributes.get("com.apple.metadata:_kMDItemUserTags").cloned();attributes=extended(&meta);}}}
-            let mut capabilities=vec!["read".into()];if e.is_dir{capabilities.push("add".into());}else if b.capabilities().conditional_write{capabilities.push("write".into());}if b.capabilities().protocol=="webdav"&&!e.is_dir{capabilities.push("delete".into());}
+            let capabilities=raw_capabilities(b,&e);
             let item=Item{id:id.clone(),parent_id,name:path.rsplit('/').next().unwrap().into(),kind:if e.is_dir{"directory"}else{"file"}.into(),size:e.size,modified:e.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|t|t.to_rfc3339()),content_version:version(&e)?,metadata_version:metadata_version(&path,&tags,&attributes,old.get(&id).is_some_and(|r|r.item.pinned))?,pinned:old.get(&id).is_some_and(|r|r.item.pinned),capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
             next.insert(id.clone(),Record{path,item,entry:Some(e),strong,client_id:old.get(&id).and_then(|r|r.client_id.clone()),metadata_known:old.get(&id).is_some_and(|r|r.metadata_known),metadata_checked:old.get(&id).map_or(0,|r|r.metadata_checked)});
         }
@@ -336,14 +363,22 @@ fn explicit_pin(j:&Journal,id:&str,records:&BTreeMap<String,Record>)->bool {
     loop {if j.pins.contains(current){return true;}if current=="root"||!seen.insert(current){return false;}current=match records.get(current){Some(record)=>&record.item.parent_id,None=>return false};}
 }
 fn apply_policies(store:&Store,d:&Domain,j:&Journal,records:&mut BTreeMap<String,Record>)->Result<()> {
+    let paths=records.iter().map(|(id,r)|(r.path.clone(),id.clone())).collect::<BTreeMap<_,_>>();
+    for record in records.values_mut(){record.item.name=record.path.rsplit('/').next().unwrap().into();let parent=record.path.rsplit_once('/').map(|(p,_)|p).unwrap_or("");record.item.parent_id=if parent.is_empty(){"root".into()}else{paths.get(parent).cloned().context("provider canonical parent missing")?};}
     let pins:BTreeMap<_,_>=records.keys().map(|id|(id.clone(),explicit_pin(j,id,records))).collect();
     let mutations=if d.smart {crate::smart::read_only(&store.home,&d.id,&journal_binding(&store.config,d)?)?}else{vec![]};
     let native=read_native_cached(&store.home,&store.config,d)?;
+    let deleted=mutations.iter().filter(|m|m.state.active()&&m.request["op"]=="delete").filter_map(|m|m.request["id"].as_str()).filter_map(|id|records.get(id).map(|r|r.path.clone())).collect::<Vec<_>>();
     for (id,record) in records {
         record.item.pinned=pins.get(id).copied().unwrap_or(false);record.item.smart=d.smart;record.item.native_materialized=native.get(id)==Some(&record.item.content_version);
         let pending=mutations.iter().rev().find(|m|m.state.active()&&(m.request["id"].as_str()==Some(id)||j.smart_replays.get(&m.id).and_then(|r|r.id.as_ref())==Some(id)));
-        record.item.has_unsynced_changes=pending.is_some();
-        let (state,message)=if let Some(m)=pending {use crate::smart::MutationState::*;let state=match m.state {Conflict=>"conflict",Failed=>"error",Running=>"syncing",_=>"queued"};(state,m.error.clone())}
+        let hidden=deleted.iter().any(|path|record.path==*path||record.path.starts_with(&format!("{path}/")));
+        if let Some(mutation)=pending.filter(|m|m.request["op"]=="modify"){
+            if let Some(name)=mutation.request["name"].as_str(){if !name.is_empty()&&!name.contains('/'){record.item.name=name.into();}}
+            if let Some(parent)=mutation.request["parent_id"].as_str(){record.item.parent_id=parent.into();}
+        }
+        record.item.has_unsynced_changes=pending.is_some()||hidden;
+        let (state,message)=if hidden {("queued_delete",pending.and_then(|m|m.error.clone()))}else if let Some(m)=pending {use crate::smart::MutationState::*;let state=match m.state {Conflict=>"conflict",Failed=>"error",Running=>"syncing",_=>"queued"};(state,m.error.clone())}
             else if let Some(error)=j.native_errors.get(id).filter(|e|e.version==record.item.content_version){("error",Some(error.message.clone()))}else if record.item.pinned {("pinned",None)}else if native.get(id)==Some(&record.item.content_version){("cached",None)}else {("online",None)};
         record.item.sync_state=Some(state.into());record.item.sync_message=message;
         let base=metadata_version(&record.path,&record.item.tag_data_hex,&record.item.extended_attributes,record.item.pinned)?;
@@ -364,8 +399,9 @@ fn is_smart_catalog(home:&Path,req:&Request)->bool {
 }
 fn update_overlay(store:&Store,d:&Domain)->Result<()> {
     let mut j=checked_journal(&store.home,&store.config,d)?;let old=j.items.clone();let mut next=std::mem::take(&mut j.items);apply_policies(store,d,&j,&mut next)?;
-    for (id,r) in &next {if old.get(id).is_none_or(|old|old.item!=r.item){push_event(&mut j,Some(r.item.clone()),None);}}
-    j.items=next;save_journal(store,&d.id,&j)
+    let filter=state::key(&serde_json::to_string(&store.config.filters)?);let changed=j.filter_fingerprint.as_ref()!=Some(&filter);
+    for (id,r) in &next {if changed||old.get(id).is_none_or(|old|old.item!=r.item){push_event(&mut j,Some(r.item.clone()),None);}}
+    j.filter_fingerprint=Some(filter);j.items=next;save_journal(store,&d.id,&j)
 }
 pub fn smart_summary(store:&Store)->Result<Value> {
     let mut result=vec![];for d in domains(&store.home)?.into_iter().filter(|d|d.smart){let queue=crate::smart::Queue::open(store,&d.id,&journal_binding(&store.config,&d)?)?;result.push(json!({"domain":d,"status":queue.status()?,"mutations":queue.list()}));}
@@ -404,6 +440,14 @@ pub fn index_refresh(home:&Path,domain_id:&str,relative_path:&str,recursive:bool
     state::atomic_json(&directory.join(format!("directory-{}.json",state::key(&format!("manual:{id}")))),&demand)?;
     Ok(json!({"queued":true,"domain":d.id,"remote":path,"recursive":recursive,"completed":false,"requires_provider_service":true}))
 }
+pub fn namespace_recovery(home:&Path,domain_id:&str)->Result<Value>{
+    let config:config::Config=state::read_json(&home.join("config.json"))?;let d=domains(home)?.into_iter().find(|d|d.id==domain_id).context("domain not found")?;
+    let j=checked_journal(home,&config,&d)?;Ok(json!({"domain":d.id,"recoveries":namespace::recovery(&j)}))
+}
+pub fn index_search(home:&Path,domain_id:&str,query:&str,scope:&str,kind:Option<&str>,limit:usize,offset:usize)->Result<Value>{
+    let config:config::Config=state::read_json(&home.join("config.json"))?;let d=domains(home)?.into_iter().find(|d|d.id==domain_id).context("domain not found")?;
+    index::search(home,&d,&journal_binding(&config,&d)?,&config,query,scope,kind,limit,offset)
+}
 fn stable_mutation(req:&Request,source:Option<&File>)->Result<Request> {
     let mut request=req.clone();request.auth_token=None;request.content_path=None;request.request_id=None;request.base_metadata_version=request.base_metadata_version.map(|v|metadata_base(&v).to_owned());
     let content=source.map(|file|crate::metadata::capture_file(file,&Default::default()).and_then(|m|Ok((m.content_sha256.clone(),m.fingerprint()?)))).transpose()?;
@@ -414,10 +458,11 @@ fn stable_mutation(req:&Request,source:Option<&File>)->Result<Request> {
 // the usual fresh scan and conditional write using that exact confirmed version.
 fn chained_request(store:&Store,d:&Domain,queue:&crate::smart::Queue,mutation:&crate::smart::Mutation)->Result<(Request,Option<Value>)>{
     let mut j=checked_journal(&store.home,&store.config,d)?;
-    let mut req:Request=if let Some(saved)=j.smart_replays.get(&mutation.id){saved.clone()}else{serde_json::from_value(mutation.request.clone())?};
+    let mut req:Request=if let Some(plan)=&mutation.resolution{serde_json::from_value(plan.request.clone())?}else if let Some(saved)=j.smart_replays.get(&mutation.id){saved.clone()}else{serde_json::from_value(mutation.request.clone())?};
     let key=if req.op=="create"{format!("create:{}",req.client_item_id.as_deref().context("create identity missing")?)}else{req.request_id.clone().context("request identity missing")?};
     let key=format!("{}:{key}",state::key(&d.id));
     if let Some(response)=j.requests.get(&key).and_then(|p|p.response.clone()){return Ok((req,Some(response)));}
+    if mutation.resolution.is_some(){j.smart_replays.insert(mutation.id.clone(),req.clone());save_journal(store,&d.id,&j)?;return Ok((req,None));}
     if j.smart_replays.contains_key(&mutation.id){return Ok((req,None));}
     let previous=queue.list().into_iter().filter(|m|m.sequence<mutation.sequence&&m.state==crate::smart::MutationState::Done).collect::<Vec<_>>();
     if req.op=="modify" {
@@ -475,12 +520,12 @@ async fn replay(home:&Path,staging:&Path,fd:&File,d:&Domain,queue:&mut crate::sm
         let content=if receipt.is_none(){lease.as_ref().map(|lease|staging_output_file(staging,fd,lease.file())).transpose()?}else{None};Ok((req,receipt,content))
     })();
     let (mut req,receipt,content)=match prepared{Ok(result)=>result,Err(error)=>{queue.fail(&mutation.id,smart_failure(&error),&format!("{error:#}"))?;return Err(error);}};
-    if let Some(receipt)=receipt{queue.complete(&mutation.id,receipt.clone())?;release_confirmed_payload(home,d,queue,mutation);return Ok(receipt);}req.content_path=content.clone();
+    if let Some(receipt)=receipt{let receipt=resolution::response_with_resolution(mutation,receipt);queue.complete(&mutation.id,receipt.clone())?;release_confirmed_payload(home,d,queue,mutation);let _=resolution::finish_resolution(home,d,mutation).await;return Ok(receipt);}req.content_path=content.clone();
     let result=tokio::time::timeout(std::time::Duration::from_secs(30),online_process(home,staging,fd,req,crate::transfer::global())).await;
     if let Some(content)=content {let _=fs::remove_file(content);}
     match result {
-        Ok(Ok(response))=>{queue.complete(&mutation.id,response.clone())?;release_confirmed_payload(home,d,queue,mutation);Ok(response)},
-        other=>{let error=match other {Ok(Err(e))=>e,Err(_)=>anyhow::anyhow!("server_unreachable: Smart upload timed out; local edit retained"),_=>unreachable!()};queue.fail(&mutation.id,smart_failure(&error),&format!("{error:#}"))?;Err(error)},
+        Ok(Ok(response))=>{let response=resolution::response_with_resolution(mutation,response);queue.complete(&mutation.id,response.clone())?;release_confirmed_payload(home,d,queue,mutation);let _=resolution::finish_resolution(home,d,mutation).await;Ok(response)},
+        other=>{let error=match other {Ok(Err(e))=>e,Err(_)=>anyhow::anyhow!("server_unreachable: Smart upload timed out; local edit retained"),_=>unreachable!()};queue.fail(&mutation.id,smart_failure(&error),&format!("{error:#}"))?;if let Err(planning_error)=resolution::auto_resolve(home,d,queue,mutation).await{queue.set_error(&mutation.id,&format!("automatic conflict preparation failed: {planning_error:#}; local edit retained"))?;}Err(error)},
     }
 }
 pub async fn process(home:&Path,staging:&Path,fd:&File,req:Request,context:crate::transfer::TransferContext)->Result<Value> {
@@ -504,8 +549,10 @@ pub async fn process(home:&Path,staging:&Path,fd:&File,req:Request,context:crate
         return Ok(payload);
     }
     if ["create","modify","delete"].contains(&req.op.as_str()) {
-        let source=req.content_path.as_ref().map(|p|staging_file(staging,fd,p)).transpose()?;let normalized=stable_mutation(&req,source.as_ref())?;
-        let store=Store::open(home.to_path_buf())?;let mut queue=crate::smart::Queue::open(&store,&d.id,&journal_binding(&store.config,&d)?)?;
+        let source=req.content_path.as_ref().map(|p|staging_file(staging,fd,p)).transpose()?;
+        let store=Store::open(home.to_path_buf())?;let mut intent=req.clone();
+        if intent.op=="modify"{let journal=checked_journal(home,&store.config,&d)?;if let Some(record)=intent.id.as_ref().and_then(|id|journal.items.get(id)){if intent.name.is_none(){intent.name=Some(record.item.name.clone());}if intent.parent_id.is_none(){intent.parent_id=Some(record.item.parent_id.clone());}}}
+        let normalized=stable_mutation(&intent,source.as_ref())?;let mut queue=crate::smart::Queue::open(&store,&d.id,&journal_binding(&store.config,&d)?)?;
         let mutation=queue.enqueue(serde_json::to_value(normalized)?,source.as_ref())?;
         update_overlay(&store,&d)?;
         let predecessor=queue.list().iter().any(|m|m.sequence<mutation.sequence&&m.state.active()&&((m.request["op"]!="create"&&m.request["id"]==mutation.request["id"])||(m.request["op"]=="create"&&mutation.request["op"]=="create"&&!mutation.request["smart_origin_id"].is_null()&&m.request["smart_origin_id"]==mutation.request["smart_origin_id"])));drop(store);
@@ -516,7 +563,9 @@ pub async fn process(home:&Path,staging:&Path,fd:&File,req:Request,context:crate
     // CLI-cached copies, only return a verified, account- and revision-bound FD.
     if req.op=="fetch" {
         let config:config::Config=state::read_json(&home.join("config.json"))?;
-        if crate::smart::read_only(home,&d.id,&journal_binding(&config,&d)?)?.iter().any(|m|m.state.active()&&m.request["id"].as_str()==req.id.as_deref()){
+        let binding=journal_binding(&config,&d)?;
+        if let Some(id)=&req.id{if let Some(record)=index::lookup(home,&d.id,&binding,id)?{if !crate::filtering::allowed(&config,&d.profile,&record.path,record.item.kind=="directory")?{bail!("no_such_item: file is excluded by synchronization filters");}}}
+        if crate::smart::read_only(home,&d.id,&binding)?.iter().any(|m|m.state.active()&&m.request["id"].as_str()==req.id.as_deref()){
             bail!("server_unreachable: a retained local edit is awaiting synchronization; the system local copy is protected");
         }
     }
@@ -579,7 +628,7 @@ async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBa
             continue;
         }
         let demands=catalog_demands(&store,&d,&j)?;let directory=next_directory(&store,&d,&j,&demands)?;
-        let metadata=next_metadata(&j,&demands);
+        let metadata=next_metadata(&store,&d,&j,&demands)?;
         if directory.is_none()&&metadata.is_none(){continue;}
         if let Some(id)=&directory{begin_scan(&mut j.directory_attempts,id);j.directory_turn=j.directory_turn.saturating_add(1);save_journal(&store,&d.id,&j)?;}
         let connected=tokio::time::timeout(timeout,background_backend(backends,&d,&profile,&binding)).await;
@@ -593,7 +642,7 @@ async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBa
         }
         // Namespace is already durably published before optional sidecar work.
         // At most one requested/known binding is enriched per pass.
-        if let Some(id)=next_metadata(&j,&demands){
+        if let Some(id)=next_metadata(&store,&d,&j,&demands)?{
             begin_scan(&mut j.metadata_attempts,&id);save_journal(&store,&d.id,&j)?;
             let success=matches!(tokio::time::timeout(timeout,enrich_metadata(&store,b.as_ref(),&d,&mut j,&id)).await,Ok(Ok(())));
             finish_scan(&mut j.metadata_attempts,&id,success);save_journal(&store,&d.id,&j)?;
@@ -653,7 +702,7 @@ fn quick(home:&Path,req:&Request)->Result<Value>{
     let record=index::lookup(home,&d.id,&binding,id)?.context("no_such_item: item not enumerated")?;
     let db:crate::state::Database=state::read_json(&home.join("state.json"))?;
     let path=remote(&d,&record.path)?;let cached=db.cache.get(&Store::cache_key(&d.profile,&path));
-    let state=if record.item.sync_state.as_deref().is_some_and(|s|["queued","conflict","error","syncing"].contains(&s)){record.item.sync_state.as_deref().unwrap()}else if db.jobs.iter().any(|x|x.profile==d.profile&&x.remote==path&&["pending","running","interrupted"].contains(&x.status.as_str())){"syncing"}else if record.item.pinned{"pinned"}else if read_native_cached(home,&config,&d)?.get(id)==Some(&record.item.content_version)||cached.is_some_and(|c|home.join("cache").join(&c.object).is_file()){"cached"}else{"online"};
+    let state=if record.item.sync_state.as_deref().is_some_and(|s|["queued","queued_delete","conflict","error","syncing"].contains(&s)){record.item.sync_state.as_deref().unwrap()}else if db.jobs.iter().any(|x|x.profile==d.profile&&x.remote==path&&["pending","running","interrupted"].contains(&x.status.as_str())){"syncing"}else if record.item.pinned{"pinned"}else if read_native_cached(home,&config,&d)?.get(id)==Some(&record.item.content_version)||cached.is_some_and(|c|home.join("cache").join(&c.object).is_file()){"cached"}else{"online"};
     Ok(json!({"state":state,"item":record.item,"smart":d.smart,"message":record.item.sync_message.as_deref().unwrap_or("状态来自本地索引，未探测网络")}))
 }
 fn local_native_error(home:&Path,req:&Request)->Result<Value>{
@@ -682,8 +731,13 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
     if req.op=="native_error"{return local_native_error(home,&req);}
     let store=Store::open(home.to_path_buf())?;let d=domains(home)?.into_iter().find(|d|d.id==req.domain).context("no_such_item: domain missing")?;
     let profile=store.config.profiles.get(&d.profile).context("not_authenticated: domain profile missing")?.clone();
-    let mut j=checked_journal(home,&store.config,&d)?;let b=crate::factory::connect(&profile,&d.profile,context).await?;
+    let mut j=checked_journal(home,&store.config,&d)?;require_mutation_paths(&store,&d,&j,&req)?;let b=crate::factory::connect(&profile,&d.profile,context.clone()).await?;
+    if !d.repository&&(namespace::requested(&j,&req)||namespace::pending(&j,&d,&req)){
+        if !namespace::pending(&j,&d,&req){refresh_request(&store,b.as_ref(),&d,&mut j,&req,None).await?;}
+        return namespace::process(store,b.as_ref(),&d,&mut j,staging,staging_fd,&req,context).await;
+    }
     let pinned_snapshot=refresh_request(&store,b.as_ref(),&d,&mut j,&req,None).await?;
+    require_mutation_paths(&store,&d,&j,&req)?;
     let id=req.id.as_deref().unwrap_or("root");
     match req.op.as_str(){
         "item"|"list"|"changes"=>return catalog(&d,&j,&req),
@@ -760,7 +814,8 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
     let existing=if req.op=="create"{None}else{Some(j.items.get(id).context("no_such_item")?.clone())};
     if let Some(record)=&existing {if j.requests.get(&key).is_none_or(|p|p.confirmed.is_none()&&p.transaction.is_none()){check_base(&req,&record.item)?;}}
     let target=if req.op=="create"{child_path(&j,req.parent_id.as_deref().unwrap_or("root"),req.name.as_deref().context("name required")?)?}else{let record=existing.as_ref().unwrap();if req.name.is_some()||req.parent_id.is_some(){child_path(&j,req.parent_id.as_deref().unwrap_or(&record.item.parent_id),req.name.as_deref().unwrap_or(&record.item.name))?}else{record.path.clone()}};
-    if !j.requests.contains_key(&key){let deletion=existing.as_ref().filter(|_|!d.repository&&req.op=="delete");j.requests.insert(key.clone(),Pending{fingerprint,metadata:metadata.clone(),source_fingerprint,transaction:None,confirmed:None,response:None,deletion_path:deletion.map(|r|r.path.clone()),deletion_expected:deletion.and_then(|r|r.entry.clone()),metadata_base_fingerprint:None});save_journal(&store,&d.id,&j)?;}
+    require_mutation_path(&store,&d,&target,req.kind.as_deref()==Some("directory")||existing.as_ref().is_some_and(|r|r.item.kind=="directory"))?;
+    if !j.requests.contains_key(&key){let deletion=existing.as_ref().filter(|_|!d.repository&&req.op=="delete");j.requests.insert(key.clone(),Pending{fingerprint,metadata:metadata.clone(),source_fingerprint,transaction:None,confirmed:None,response:None,deletion_path:deletion.map(|r|r.path.clone()),deletion_expected:deletion.and_then(|r|r.entry.clone()),metadata_base_fingerprint:None,namespace:None,version:None});save_journal(&store,&d.id,&j)?;}
     let mut response_id=existing.as_ref().map(|r|r.item.id.clone());
     let mut committed_target:Option<Value>=None;
     if d.repository {
@@ -783,7 +838,7 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
         };
         let committed=repository::commit(&store,b.as_ref(),&tx_id).await?;if req.op!="delete"{let entry=committed.commit.entries.get(&target).context("committed item missing")?;response_id=Some(entry.id.clone());committed_target=Some(serde_json::to_value(entry)?);}
     }else {
-        if req.op=="delete" {let record=existing.as_ref().unwrap();let e=record.entry.as_ref().context("item revision missing")?;if record.item.kind=="directory"{bail!("unsupported: directory deletion requires managed repository mode");}b.remove_checked(&remote(&d,&record.path)?,e).await?;}
+        if req.op=="delete" {let record=existing.as_ref().unwrap();if record.item.kind=="directory"{bail!("unsupported: directory deletion requires recoverable namespace mode");}let path=remote(&d,&record.path)?;let observed=b.stat_metadata(&path).await?.context("no_such_item")?;if !record.entry.as_ref().is_some_and(|cached|cached.same_revision(&observed)){bail!("version_conflict: delete source metadata changed");}let expected=if let Some(strong)=&record.strong{strong.clone()}else{b.stat(&path).await?.context("no_such_item")?};j.requests.get_mut(&key).unwrap().deletion_expected=Some(expected.clone());save_journal(&store,&d.id,&j)?;b.remove_checked(&path,&expected).await?;}
         else if req.op=="create"&&req.kind.as_deref()==Some("directory"){if j.items.values().any(|r|r.path==target){bail!("version_conflict: directory already exists");}b.mkdir(&remote(&d,&target)?).await?;}
         else {
             let dest=remote(&d,&target)?;
@@ -792,6 +847,7 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
             let entry=if let Some(confirmed)=confirmed {let observed=b.stat(&dest).await?.context("version_conflict: confirmed content disappeared")?;if !observed.same_revision(&confirmed){bail!("version_conflict: target changed after confirmed upload");}observed}
             else if let Some(source)=&source {
                 let condition=if let Some(record)=&existing{WriteCondition::Match(record.strong.clone().context("unsupported: fetch this file before editing to establish its content guard")?)}else{WriteCondition::CreateNew};
+                if let WriteCondition::Match(expected)=&condition{if j.requests.get(&key).and_then(|p|p.version.as_ref()).is_none(){let archived=if let Some(planned)=resolution::planned_version(&store,&d,&req)?{if planned.path!=dest||!planned.original.same_revision(expected){bail!("version_conflict: saved replacement version does not match the guarded target");}Some(planned)}else{crate::policies::prepare_version(&store,b.as_ref(),&d.profile,&dest,expected,&key,false).await?};j.requests.get_mut(&key).unwrap().version=archived;save_journal(&store,&d.id,&j)?;}}
                 b.upload(source,&dest,condition).await?
             }else if let Some(old)=&existing {old.strong.clone().context("unsupported: fetch this file before editing metadata")?}
             else{let empty=store.home.join("provider").join(format!("empty-{}",state::key(&key)));state::atomic_write(&empty,b"")?;b.upload(&empty,&dest,WriteCondition::CreateNew).await?};
@@ -847,7 +903,8 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
         }
     }
     let response=if req.op=="delete"{json!({})}else{let record=j.items.get_mut(response_id.as_deref().context("created item not enumerated")?).context("updated item missing")?;if req.op=="create"{record.client_id=req.client_item_id.clone();}let mut item=record.item.clone();if d.smart{item.has_unsynced_changes=false;item.native_materialized=false;item.sync_state=Some(if item.pinned{"pinned"}else{"online"}.into());item.sync_message=None;let base=metadata_version(&record.path,&item.tag_data_hex,&item.extended_attributes,item.pinned)?;item.metadata_version=format!("{base}:{}",&state::key(&serde_json::to_string(&(&item.sync_state,&item.sync_message,false,false))?)[..32]);}json!({"item":item})};
-    j.requests.get_mut(&key).unwrap().response=Some(response.clone());save_journal(&store,&d.id,&j)?;Ok(response)
+    j.requests.get_mut(&key).unwrap().response=Some(response.clone());save_journal(&store,&d.id,&j)?;
+    if !d.repository{if let Some(version)=j.requests.get(&key).and_then(|p|p.version.as_ref()){if let Err(error)=crate::policies::finish_version(&store,b.as_ref(),&d.profile,&remote(&d,&target)?,version).await{eprintln!("version retention deferred: {error:#}");}}}Ok(response)
 }
 fn error(error:anyhow::Error)->Value {let text=format!("{error:#}");let code=if text.contains("cache capacity")||text.contains("cache budget")||text.contains("insufficient_quota"){"insufficient_quota"}else if text.contains("version_conflict")||text.contains("revision")||text.contains("conflict"){"version_conflict"}else if text.contains("sync_anchor_expired"){"sync_anchor_expired"}else if text.contains("no_such_item")||text.contains("missing"){"no_such_item"}else if text.contains("credential")||text.contains("authentication")||text.contains("password"){"not_authenticated"}else if text.contains("unsupported"){"unsupported"}else{"server_unreachable"};json!({"ok":false,"error":{"code":code,"message":text}})}
 fn success(payload:Value)->Value{let mut value=payload.as_object().cloned().unwrap_or_default();value.insert("ok".into(),Value::Bool(true));Value::Object(value)}
@@ -951,7 +1008,7 @@ async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S
     let domain=Domain{id:"bound".into(),profile:"profile".into(),remote:"original".into(),display_name:"Bound".into(),repository:false,smart:false,local_root:Some(visible.clone())};add_domain(&store,domain.clone()).unwrap();
     let mut journal=checked_journal(&home,&store.config,&domain).unwrap();let mut item=root_item(&domain);item.id="stable-item".into();item.name="document".into();item.kind="file".into();
     journal.items.insert(item.id.clone(),Record{path:"document".into(),item,entry:None,strong:None,client_id:None,metadata_known:false,metadata_checked:0});
-    journal.requests.insert("old-success".into(),Pending{fingerprint:"request".into(),metadata:None,source_fingerprint:None,transaction:None,confirmed:None,response:Some(json!({"item":"old-backend-success"})),deletion_path:None,deletion_expected:None,metadata_base_fingerprint:None});save_journal(&store,&domain.id,&journal).unwrap();
+    journal.requests.insert("old-success".into(),Pending{fingerprint:"request".into(),metadata:None,source_fingerprint:None,transaction:None,confirmed:None,response:Some(json!({"item":"old-backend-success"})),deletion_path:None,deletion_expected:None,metadata_base_fingerprint:None,namespace:None,version:None});save_journal(&store,&domain.id,&journal).unwrap();
     let original_binding=journal.binding.clone().unwrap();
     let before=serde_json::to_value(&journal).unwrap();
     let status:Request=serde_json::from_value(json!({"v":1,"op":"status","domain":"bound","id":"stable-item"})).unwrap();assert!(quick(&home,&status).is_ok());

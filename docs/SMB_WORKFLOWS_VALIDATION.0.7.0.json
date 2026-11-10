@@ -1,0 +1,27 @@
+{
+  "binary": "target/release/rdrive",
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "version": "rdrive 0.7.0",
+  "mode": "full",
+  "passed": 10,
+  "checks": [
+    "encrypted SMB3 connection and truthful capabilities",
+    "multi-chunk upload/list/stat/download, publication and byte equality",
+    "copy and rename preserve existing destinations",
+    "explicit replacements publish complete files by rename",
+    "directory copy, file remove and explicit recursive remove",
+    "traversal, ADS, backslash and recursive self-copy rejected",
+    "new-file push sync and pull sync establish verified baselines",
+    "protected sync replacement retains recovery files and completed receipts stay out of sync",
+    "CLI resumable upload/download flags preserve complete content",
+    "managed SMB snapshot publication, content and xattrs, immutable replay and competing homes"
+  ],
+  "server": "SERVER Version 4.21.9; IMAGE alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f",
+  "scope": "temporary synthetic encrypted authenticated loopback Samba only; no real storage",
+  "duration_seconds": 38.005,
+  "cleanup": "fixture completed its finally block and force-removed its unique test container",
+  "limitations": [
+    "Server-transparent POSIX symlinks cannot be identified by the client; server follow-symlinks=no policy is separately verified in the full workflow.",
+    "Directory logical deletion retains remote recovery contents and does not reclaim server space."
+  ]
+}

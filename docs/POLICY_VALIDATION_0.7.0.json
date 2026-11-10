@@ -1,0 +1,20 @@
+{
+  "checks": [
+    "Smart overwrites archived prior revisions and retained exactly the configured two newest backups",
+    "version filename filters and per-profile disable override left excluded files and old history unchanged",
+    "automatic keep-both published one deterministic CreateNew copy and reused its receipt after restart",
+    "replace archived the observed remote version, refused another external edit and required a new explicit decision",
+    "remote resolution cancelled publication while retaining an exportable original local snapshot",
+    "SIGKILL after backup publication reused the same durable version slot before replaying the guarded edit",
+    "automatic retention protected another writer's unconfirmed backup while limiting completed history",
+    "failed backup preparation neither replaced the remote file nor pruned valid history and retained the local edit",
+    "replace refused to discard rename intent and keep-both recovered the compound edit body without changing either namespace target",
+    "source and generated conflict-name filters prevented publication or backup transfer while retaining an exportable edit"
+  ],
+  "count": 10,
+  "binary": "target/release/rdrive",
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "validation_scope": "Authenticated disposable loopback DAV; no real cloud, mount or native domain",
+  "cleanup": "Owned broker stopped, temporary server closed and disposable state removed",
+  "passed": 10
+}

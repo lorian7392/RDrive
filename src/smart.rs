@@ -6,7 +6,7 @@ use crate::{
     metadata::{self, MetadataRecord},
     state::{self, Store},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -103,6 +103,10 @@ pub struct Mutation {
     /// Filled only by complete(), after the caller confirms remote publication.
     pub response: Option<Value>,
     pub superseded_by: Option<String>,
+    /// Immutable replay decision after a conflict. A retry reuses this exact
+    /// request and guard; automatic policy never rebases it again.
+    #[serde(default)]
+    pub resolution: Option<crate::policies::ResolutionPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +396,7 @@ impl Queue {
             error: None,
             response: None,
             superseded_by: None,
+            resolution: None,
         };
         let mut next = self.index.clone();
         next.next_sequence = next
@@ -492,6 +497,20 @@ impl Queue {
         })
     }
 
+    /// Preserve a failed automatic preparation diagnostic without changing its
+    /// stopped state or scheduling an unconditional network retry.
+    pub fn set_error(&mut self, id: &str, message: &str) -> Result<Mutation> {
+        if !matches!(
+            self.get(id)?.state,
+            MutationState::Conflict | MutationState::Failed
+        ) {
+            bail!("attention detail requires stopped Smart work");
+        }
+        self.update(id, |mutation| {
+            mutation.error = Some(message.chars().take(4096).collect())
+        })
+    }
+
     /// Call only with the successful response of a remotely confirmed replay.
     /// Local enqueue, cached reads and snapshot creation must never call this.
     pub fn complete(&mut self, id: &str, response: Value) -> Result<Mutation> {
@@ -526,6 +545,81 @@ impl Queue {
         }
         let _verified = self.snapshot(id)?;
         self.update(id, |mutation| {
+            mutation.state = MutationState::Pending;
+            mutation.error = None;
+            mutation.response = None;
+        })
+    }
+
+    pub fn plan_resolution(
+        &mut self,
+        id: &str,
+        strategy: crate::policies::ConflictStrategy,
+        request: Value,
+        target_path: String,
+        version: Option<crate::operations::Version>,
+        repository_snapshot: Option<String>,
+        explicit: bool,
+    ) -> Result<Mutation> {
+        use crate::policies::{ConflictStrategy, ResolutionPlan};
+        let current = self.get(id)?;
+        if !matches!(
+            current.state,
+            MutationState::Conflict | MutationState::Failed
+        ) {
+            bail!("resolution requires a stopped conflict or failure; retry an interrupted receipt first");
+        }
+        if current.resolution.is_some() && !explicit {
+            bail!("automatic conflict resolution was already attempted; new external changes require an explicit decision");
+        }
+        if strategy == ConflictStrategy::Stop {
+            bail!("choose keep-both, replace or remote for an explicit resolution");
+        }
+        if !matches!(current.request["op"].as_str(), Some("create" | "modify"))
+            || self.snapshot(id)?.is_none()
+        {
+            bail!("conflict resolution requires retained file contents");
+        }
+        let request = sanitize_request(request, &self.index.domain)?;
+        if (strategy == ConflictStrategy::KeepBoth && request["op"] != "create")
+            || (strategy == ConflictStrategy::Replace && request["op"] != "modify")
+            || target_path.is_empty()
+            || backend::normalize(&target_path)? != target_path
+        {
+            bail!("invalid conflict resolution target");
+        }
+        if strategy == ConflictStrategy::Replace
+            && version.is_none()
+            && repository_snapshot.is_none()
+        {
+            bail!("replace requires a confirmed prior-version snapshot");
+        }
+        if repository_snapshot
+            .as_deref()
+            .is_some_and(|id| !valid_hash(id))
+        {
+            bail!("invalid prior repository snapshot");
+        }
+        let fingerprint = resolution_fingerprint(
+            id,
+            &current.fingerprint,
+            strategy,
+            &request,
+            &target_path,
+            &version,
+            &repository_snapshot,
+        )?;
+        let plan = ResolutionPlan {
+            strategy,
+            request,
+            target_path,
+            version,
+            repository_snapshot,
+            fingerprint,
+            created: state::now(),
+        };
+        self.update(id, |mutation| {
+            mutation.resolution = Some(plan);
             mutation.state = MutationState::Pending;
             mutation.error = None;
             mutation.response = None;
@@ -719,6 +813,9 @@ fn mutation_fingerprint(request: &Value, source: Option<&SnapshotInfo>) -> Resul
     Ok(state::key(&serde_json::to_string(&(identity, snapshot))?))
 }
 fn safely_supersedes(new: &Mutation, old: &Mutation) -> bool {
+    if old.resolution.is_some() {
+        return false;
+    }
     if new.request["op"] == "create" && old.request["op"] == "create" {
         let origin = |request: &Value| {
             request
@@ -819,6 +916,41 @@ fn validate_index(index: &Index, domain: &str, binding: &str) -> Result<()> {
         {
             bail!("invalid Smart mutation state or fingerprint");
         }
+        if let Some(plan) = &mutation.resolution {
+            let request = sanitize_request(plan.request.clone(), domain)?;
+            if request != plan.request
+                || plan.strategy == crate::policies::ConflictStrategy::Stop
+                || !matches!(clean["op"].as_str(), Some("create" | "modify"))
+                || mutation.snapshot.is_none()
+                || plan.target_path.is_empty()
+                || backend::normalize(&plan.target_path)? != plan.target_path
+                || plan.fingerprint
+                    != resolution_fingerprint(
+                        id,
+                        &mutation.fingerprint,
+                        plan.strategy,
+                        &plan.request,
+                        &plan.target_path,
+                        &plan.version,
+                        &plan.repository_snapshot,
+                    )?
+            {
+                bail!("invalid persisted Smart resolution plan");
+            }
+            if plan.strategy == crate::policies::ConflictStrategy::Replace
+                && plan.version.is_none()
+                && plan.repository_snapshot.is_none()
+            {
+                bail!("replace plan lost its prior-version snapshot");
+            }
+            if plan
+                .repository_snapshot
+                .as_deref()
+                .is_some_and(|id| !valid_hash(id))
+            {
+                bail!("invalid persisted prior repository snapshot");
+            }
+        }
         if let Some(replacement) = &mutation.superseded_by {
             if replacement == id
                 || index
@@ -831,6 +963,25 @@ fn validate_index(index: &Index, domain: &str, binding: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+fn resolution_fingerprint(
+    id: &str,
+    original: &str,
+    strategy: crate::policies::ConflictStrategy,
+    request: &Value,
+    target: &str,
+    version: &Option<crate::operations::Version>,
+    repository_snapshot: &Option<String>,
+) -> Result<String> {
+    Ok(state::key(&serde_json::to_string(&(
+        id,
+        original,
+        strategy,
+        request,
+        target,
+        version,
+        repository_snapshot,
+    ))?))
 }
 fn save_index(path: &Path, index: &Index) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index)?;
@@ -1022,4 +1173,97 @@ fn capture_snapshot(root: &Path, source: &File, info: &SnapshotInfo) -> Result<(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use crate::policies::ConflictStrategy;
+    use serde_json::json;
+    #[test]
+    fn resolution_is_durable_and_does_not_change_original_intent_or_retry_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"local conflicting edit").unwrap();
+        let mut queue = Queue::open(&store, "domain", &"a".repeat(64)).unwrap();
+        let original = json!({"v":1,"op":"modify","domain":"domain","id":"item","request_id":"original","base_content_version":"c0","base_metadata_version":"m0"});
+        let mutation = queue
+            .enqueue(original.clone(), Some(&File::open(source).unwrap()))
+            .unwrap();
+        queue.start(&mutation.id).unwrap();
+        queue
+            .fail(&mutation.id, FailureKind::Conflict, "external edit")
+            .unwrap();
+        let request = json!({"v":1,"op":"create","domain":"domain","client_item_id":"conflict-copy","name":"copy.txt","parent_id":"root","kind":"file"});
+        queue
+            .plan_resolution(
+                &mutation.id,
+                ConflictStrategy::KeepBoth,
+                request.clone(),
+                "copy.txt".into(),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        drop(queue);
+        let mut queue = Queue::open(&store, "domain", &"a".repeat(64)).unwrap();
+        let planned = queue.get(&mutation.id).unwrap();
+        assert_eq!(planned.request, original);
+        assert_eq!(planned.resolution.as_ref().unwrap().request, request);
+        assert_eq!(
+            fs::read(queue.snapshot(&mutation.id).unwrap().unwrap().path()).unwrap(),
+            b"local conflicting edit"
+        );
+        queue.start(&mutation.id).unwrap();
+        queue
+            .fail(&mutation.id, FailureKind::Conflict, "another external edit")
+            .unwrap();
+        assert!(queue
+            .plan_resolution(
+                &mutation.id,
+                ConflictStrategy::KeepBoth,
+                request.clone(),
+                "copy.txt".into(),
+                None,
+                None,
+                false
+            )
+            .is_err());
+        queue.retry(&mutation.id).unwrap();
+        assert_eq!(
+            queue.get(&mutation.id).unwrap().resolution.unwrap().request,
+            request
+        );
+    }
+    #[test]
+    fn replace_requires_backup_and_cancel_retains_original_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"recover me").unwrap();
+        let mut queue = Queue::open(&store, "domain", &"b".repeat(64)).unwrap();
+        let request = json!({"v":1,"op":"modify","domain":"domain","id":"item","request_id":"original","base_content_version":"c0","base_metadata_version":"m0"});
+        let m = queue
+            .enqueue(request.clone(), Some(&File::open(source).unwrap()))
+            .unwrap();
+        queue.start(&m.id).unwrap();
+        queue
+            .fail(&m.id, FailureKind::Conflict, "conflict")
+            .unwrap();
+        assert!(queue
+            .plan_resolution(
+                &m.id,
+                ConflictStrategy::Replace,
+                request,
+                "item.txt".into(),
+                None,
+                None,
+                true
+            )
+            .is_err());
+        assert_eq!(queue.cancel(&m.id).unwrap().state, MutationState::Cancelled);
+        assert!(queue.snapshot(&m.id).unwrap().is_some());
+    }
 }

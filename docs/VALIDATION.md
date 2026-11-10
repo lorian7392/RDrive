@@ -1,19 +1,27 @@
-# RDrive 0.6.0 验证记录
+# RDrive 0.7.0 验证记录
 
-日期：2026-11-10。新增权威 SQLite 目录索引、后台元数据预建、按目录的增量刷新，以及 CLI / MCP 控制；版本与最终 release SHA-256 记录在下方结构化报告中。
+日期：2026-11-10。完成 Smart 文件及目录操作、过滤规则、用户后台常驻、版本/冲突策略和离线索引搜索。最终发布程序 SHA-256：`1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163`。所有下述发布程序工作流报告均核对同一校验和，测试前后产品源文件哈希保持不变。
 
-167 项 Rust 检查通过，4 项专用环境检查维持忽略状态。其中新增 9 项 SQLite 存储及迁移测试、17 项目录调度测试；旧有 WebDAV、同步、元数据、缓存、恢复和参数检查继续通过。详见 [CORE_VALIDATION_0.6.0.json](CORE_VALIDATION_0.6.0.json)。
+## 检查结果
 
-最终发布程序通过 50 组独立工作流：
+**186 项 Rust 检查通过，0 失败，4 项专用环境检查维持忽略状态。** 分组为 library 142、CLI 2、HTTP cache 1、mount API 3、Smart journal 8、WebDAV 30。新增覆盖文件过滤与连接覆盖、搜索分页/字面查询/离线移动投影、schema 1→2 迁移、版本与持久决定、服务生命周期和路径失效恢复。详见 [CORE_VALIDATION_0.7.0.json](CORE_VALIDATION_0.7.0.json)。
 
-- 目录索引 10 组：[INDEX_VALIDATION.json](INDEX_VALIDATION.json)。覆盖未浏览目录自动预建、慢请求期间读取本地目录、正文零下载、TTL、局部变更、失败保留、深度及一次性递归刷新、重启与旧 JSON 迁移，以及索引查询计划。
-- Smart 15 组：[SMART_VALIDATION_0.6.0.json](SMART_VALIDATION_0.6.0.json)。使用关闭一般预建的配置继续验证按需行为，包含离线编辑、重复回执、连续保存、冲突、配额和递归离线策略。
-- MCP 14 组：[MCP_VALIDATION_0.6.0.json](MCP_VALIDATION_0.6.0.json)。运行时提供 62 个工具、24 个只读工具和 5 个资源，新增索引策略持久化与刷新请求完整调用。
-- 并发回执及真实进程崩溃 7 组：[PROVIDER_RECEIPTS_VALIDATION.0.6.0.json](PROVIDER_RECEIPTS_VALIDATION.0.6.0.json)。保留独立客户端修改、丢失响应、SIGKILL 后重放与版本归属保护。
-- 加密 SMB 4 组：[SMB_PROVIDER_VALIDATION_0.6.0.json](SMB_PROVIDER_VALIDATION_0.6.0.json)。普通和 Smart 各 2 组，验证 SQLite 中的强修订及确认回执、连续正文/属性修改、外部修改后的拒绝覆盖；临时 Samba 容器已清理。
+最终发布程序通过 **100 组实际工作流**：
 
-10,100 条本机合成索引、每目录 100 项、30 次采样中，SQLite 子目录查询与项目解码中位数约 0.84 ms，实际目录 RPC 中位数约 12.89 ms。后台远端深目录被阻塞时，根目录 RPC 约 2.20 ms。查询计划明确使用 items_parent_id。保留 JSON 的 Python 全量解析筛选对照约 33.51 ms，仅用于说明测试方法，不作为 Rust 旧版/新版倍数或真实云盘速度声明。
+- [Smart 文件与目录操作 12 组](NAMESPACE_VALIDATION.0.7.0.json)：重命名及移动保持 ID、正文/标签复合保存、目录后代及固定策略、已有及竞态目标不覆盖、新后代竞态恢复、可恢复目录删除、HTTP 中断与离线投影跨重启、排除后暂停已排队操作、停止排除目录扫描与下载、MOVE 后 SIGKILL 丢失响应重放，以及托管快照新增排除后代的再校验。
+- [版本与冲突 10 组](POLICY_VALIDATION_0.7.0.json)：确认后保留数量、按名称及连接选择、KeepBoth 创建及重启回执、Replace 遇第二次外部修改停止、接受远端时保留本地导出、归档响应丢失后的实际 SIGKILL 恢复、其他写入者未确认备份保护、归档失败不覆盖/裁剪、复合命名冲突保护，以及原路径/冲突文件名过滤。
+- [后台服务 11 组](SERVICE_VALIDATION_0.7.0.json)：私有安装与无副作用预览、重复启动拒绝、桥接进程崩溃重启、正常停止、真实独立用户 LaunchAgent 启动、监督进程 SIGKILL 后 KeepAlive 恢复、重启及卸载、终端凭据不被默默持久化，以及旧程序路径移走后的安全停止/修复/卸载。服务单位测试还覆盖禁止遗留旧 LaunchAgent 路径。
+- [离线搜索及规则/MCP 3 组](SEARCH_VALIDATION_0.7.0.json)：FTS 子串、短中文、字面 `%`/`_`、类型/范围/分页、规则立即应用且保留原索引、MCP 数组清空和写入隔离；所有查询不发远端请求。
+- [目录索引 10 组](INDEX_VALIDATION_0.7.0.json)：后台预建、元数据零正文下载、增量刷新、失败保留、深度/手动递归控制、离线重启、旧 JSON 回执/固定/变化保留及权威 SQLite、10,100 条索引的父目录查询计划。计时仅为本机合成样本，不代表真实云盘速度或旧版/新版 Rust 性能倍数。
+- [Smart 原有流程 15 组](SMART_VALIDATION_0.7.0.json)：按需占位、离线编辑、连续保存、冲突保留、缓存配额与递归固定策略。
+- [MCP 14 组](MCP_VALIDATION_0.7.0.json)：78 个工具、其中 30 个只读、8 个资源；包含真实传输、超时/取消、授权路径、严格参数、同步、版本和托管事务。
+- [并发回执与实际崩溃 7 组](PROVIDER_RECEIPTS_VALIDATION.0.7.0.json)：外部修改不能被误认为本客户端成功，删除回执丢失及 SIGKILL 后不再次删除替换文件，正文/元数据的安全重放。
+- 加密 Samba 共 18 组：[普通 Provider 4 组](SMB_PROVIDER_RAW_VALIDATION.0.7.0.json)、[Smart Provider 4 组](SMB_PROVIDER_SMART_VALIDATION.0.7.0.json)、[完整 CLI 10 组](SMB_WORKFLOWS_VALIDATION.0.7.0.json)。包含受保护的文件/目录移动、后代 ID 与标签属性保留、文件删除重放保护、目录恢复备份、同步覆盖、断点续传和托管并发提交。固定 Samba 4.21.9 测试容器已清理。
 
-三个配套 Skill 格式检查、Python 脚本编译检查和 Git 差异检查通过。所有新增操作测试使用临时本机服务、状态和文件，未重启或迁移真实账户的后台服务，未进行真实云盘写入；macOS File Provider 激活和实际 Finder 展示未作为 0.6 的再次实测声明。原生构建脚本已更新为 0.6.0/build8，已运行的原生包需要按升级步骤另行切换。
+## 原生及实际使用边界
 
-使用及升级见 [目录索引说明](DIRECTORY_INDEXING.md)。旧 JSON 在迁移后仅为历史副本，不能与旧版本后台服务并行写同一状态目录。历史版本证据保留在 [VALIDATION_0.5.0.md](VALIDATION_0.5.0.md) 和更早的版本记录中。
+[原生构建报告](NATIVE_BUILD_VALIDATION_0.7.0.json)：macOS 伴随 App 与三个扩展编译成功，使用最终同一 CLI，版本 0.7.0/build9，ad-hoc 签名验证通过。构建发生在独立临时目录，**未安装、注册或激活，没有把 Finder 新功能视为已经实机界面验证**。现有真实账户、Stash、运行中的桥接服务及挂载未作切换或写入测试。正式分发仍需开发者签名与公证。
+
+目录逻辑删除保留服务器上的恢复内容，不释放空间；本版不自动清空这些备份。普通目录的多个请求不构成多文件原子事务。WebDAV 重命名依赖服务器正确执行强版本条件和禁止覆盖；缺少可靠保护时停止。自动文件版本按路径保存，重命名后旧路径历史保留；尚未确认的备份可能使保留数量临时超限。自动 Replace 不丢弃复合重命名意图，需人工处理命名或用 KeepBoth 恢复正文。
+
+三个 Skill 格式、所有 Python 脚本语法与 Git 差异检查通过。说明与升级步骤见 [Smart 文件操作与管理](SMART_OPERATIONS.md)。历史验证保存在 [0.6](VALIDATION_0.6.0.md) 和更早版本中；保留原数据库，升级前先停止使用同一状态目录的旧版后台程序，不让旧版本写已升级的状态。

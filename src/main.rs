@@ -200,6 +200,12 @@ enum Command {
     Smart {#[command(subcommand)]command:SmartCommand},
     /// Configure background metadata indexing and request scoped refreshes.
     Index {#[command(subcommand)]command:IndexCommand},
+    /// Smart inclusion/exclusion rules; never deletes excluded remote files.
+    Filter { #[command(subcommand)] command: FilterCommand },
+    /// Automatic version retention and conflict resolution policy.
+    Policy { #[command(subcommand)] command: PolicyCommand },
+    /// Install and control the per-user background supervisor.
+    Service { #[command(subcommand)] command: ServiceCommand },
     /// Capture, apply or synchronize selected user extended attributes/Finder tags.
     Metadata {#[command(subcommand)]command:MetadataCommand},
     /// Save, inspect, restore and prune custom remote file versions.
@@ -310,6 +316,10 @@ enum SmartCommand {
     Retry { domain:String, mutation:Option<String> },
     /// Cancel pending work while preserving its independent local snapshot.
     Cancel { domain:String, mutation:String },
+    /// Resolve a conflict using a durable decision; remote retains a local recovery copy.
+    Resolve { domain:String, mutation:String, #[arg(long,value_parser=["keep-both","replace","remote"])] strategy:String },
+    /// List retained remote namespace recovery backups (space is retained).
+    Recovery { domain:String },
     /// Export a retained local edit to a separate real file for recovery.
     Export { domain:String, mutation:String, local:PathBuf, #[arg(long)]overwrite:bool },
     /// Discard only a completed/cancelled/superseded recovery snapshot.
@@ -319,6 +329,10 @@ enum SmartCommand {
 }
 #[derive(Subcommand)]
 enum IndexCommand {
+    /// Search cached file names/paths locally; works without network access.
+    Search { domain:String, query:String, #[arg(long,default_value="")] scope:String,
+        #[arg(long,value_parser=["file","directory"])] kind:Option<String>,
+        #[arg(long,default_value_t=100)] page_size:usize, #[arg(long,default_value_t=0)] offset:usize },
     /// Inspect local index progress without waiting for a network operation.
     Status { domain: Option<String> },
     /// Persist background crawl and refresh policy. None of these options downloads files.
@@ -332,6 +346,37 @@ enum IndexCommand {
     },
     /// Queue a metadata refresh; provider serve performs it asynchronously.
     Refresh { domain:String, #[arg(default_value="")]remote:String, #[arg(long)]recursive:bool },
+}
+#[derive(Subcommand)]
+enum FilterCommand {
+    Status { #[arg(long)] profile:Option<String> },
+    /// Replace supplied rule lists; omitted lists stay unchanged.
+    Config { #[arg(long)] profile:Option<String>, #[arg(long,conflicts_with="include_temporary")] exclude_temporary:bool,
+        #[arg(long,conflicts_with="exclude_temporary")] include_temporary:bool,
+        #[arg(long)] include:Vec<String>, #[arg(long)] exclude:Vec<String>,
+        #[arg(long,conflicts_with="include")] clear_include:bool, #[arg(long,conflicts_with="exclude")] clear_exclude:bool },
+    /// Remove a profile override and inherit global rules.
+    Reset { profile:String },
+    Test { profile:String, remote:String, #[arg(long)] directory:bool },
+}
+#[derive(Subcommand)]
+enum PolicyCommand {
+    Status { #[arg(long)] profile:Option<String> },
+    Config { #[arg(long)] profile:Option<String>, #[arg(long,conflicts_with="disable_versions")] enable_versions:bool,
+        #[arg(long,conflicts_with="enable_versions")] disable_versions:bool, #[arg(long)] keep:Option<usize>,
+        #[arg(long,value_parser=["stop","keep-both","replace"])] conflicts:Option<String>,
+        #[arg(long)] include:Vec<String>, #[arg(long)] exclude:Vec<String>,
+        #[arg(long,conflicts_with="include")] clear_include:bool, #[arg(long,conflicts_with="exclude")] clear_exclude:bool },
+    Reset { profile:String },
+}
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Install { #[arg(long)] ipc_root:Option<PathBuf>, #[arg(long)] app:Option<PathBuf>,
+        #[arg(long)] development_tcp:bool, #[arg(long)] launch_agents_dir:Option<PathBuf>, #[arg(long)] dry_run:bool },
+    Start { #[arg(long)] dry_run:bool }, Stop { #[arg(long)] dry_run:bool },
+    Restart { #[arg(long)] dry_run:bool }, Uninstall { #[arg(long)] dry_run:bool }, Status,
+    /// Foreground supervisor used by the LaunchAgent. Stop with Ctrl-C.
+    Run,
 }
 #[derive(Subcommand)]enum MetadataCommand {
     Capture{local:PathBuf},
@@ -540,7 +585,57 @@ async fn do_sync(
 async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
     let json = cli.json;
     match &cli.command {
-        Command::Mcp { .. } => unreachable!(),
+        Command::Mcp { .. } | Command::Service { .. } => unreachable!(),
+        Command::Filter { command } => match command {
+            FilterCommand::Status {profile} => {
+                if let Some(name)=profile { self_profile(store,name)?; }
+                emit(json,&serde_json::json!({"rules":store.config.filters,"profile":profile,"override":profile.as_ref().and_then(|p|store.config.filters.profiles.get(p))}))?;
+            },
+            FilterCommand::Test {profile,remote,directory} => {
+                self_profile(store,profile)?;
+                emit(json,&serde_json::json!({"allowed":rdrive::filtering::allowed(&store.config,profile,&path(remote)?,*directory)?}))?;
+            },
+            FilterCommand::Reset {profile} => { self_profile(store,profile)?;store.config.filters.profiles.remove(profile);store.save_config()?;emit(json,&store.config.filters)?; },
+            FilterCommand::Config {profile,exclude_temporary,include_temporary,include,exclude,clear_include,clear_exclude} => {
+                let mut rules=store.config.filters.clone();
+                let temporary=if *exclude_temporary {Some(true)}else if *include_temporary {Some(false)}else{None};
+                if let Some(name)=profile {
+                    self_profile(store,name)?;
+                    let local=rules.profiles.entry(name.clone()).or_default();
+                    if temporary.is_some(){local.temporary_files=temporary;}
+                    if !include.is_empty()||*clear_include{local.include=Some(include.clone());}
+                    if !exclude.is_empty()||*clear_exclude{local.exclude=Some(exclude.clone());}
+                }else{
+                    if let Some(value)=temporary{rules.temporary_files=value;}
+                    if !include.is_empty()||*clear_include{rules.include=include.clone();}
+                    if !exclude.is_empty()||*clear_exclude{rules.exclude=exclude.clone();}
+                }
+                rules.validate()?;store.config.filters=rules;store.save_config()?;emit(json,&store.config.filters)?;
+            },
+        },
+        Command::Policy {command} => match command {
+            PolicyCommand::Status{profile} => {
+                if let Some(name)=profile{self_profile(store,name)?;emit(json,&store.config.policies.effective(name))?;}
+                else{emit(json,&store.config.policies)?;}
+            },
+            PolicyCommand::Reset{profile} => {self_profile(store,profile)?;store.config.policies.profiles.remove(profile);store.save_config()?;emit(json,&store.config.policies)?;},
+            PolicyCommand::Config{profile,enable_versions,disable_versions,keep,conflicts,include,exclude,clear_include,clear_exclude} => {
+                let mut policies=store.config.policies.clone();
+                if let Some(name)=profile{self_profile(store,name)?;}
+                let mut versions=profile.as_deref().map(|p|policies.effective(p).versions).unwrap_or_else(||policies.versions.clone());
+                if *enable_versions{versions.enabled=true;}if *disable_versions{versions.enabled=false;}
+                if let Some(n)=keep{versions.keep=*n;}
+                if !include.is_empty()||*clear_include{versions.include=include.clone();}
+                if !exclude.is_empty()||*clear_exclude{versions.exclude=exclude.clone();}
+                let strategy=conflicts.as_ref().map(|s|s.parse::<rdrive::policies::ConflictStrategy>()).transpose()?;
+                if let Some(name)=profile{
+                    let local=policies.profiles.entry(name.clone()).or_default();
+                    if *enable_versions||*disable_versions||keep.is_some()||!include.is_empty()||!exclude.is_empty()||*clear_include||*clear_exclude{local.versions=Some(versions);}
+                    if strategy.is_some(){local.conflicts=strategy;}
+                }else{policies.versions=versions;if let Some(strategy)=strategy{policies.conflicts=strategy;}}
+                policies.validate()?;store.config.policies=policies;store.save_config()?;emit(json,&store.config.policies)?;
+            },
+        },
         Command::Index { command } => match command {
             IndexCommand::Config { enable, disable, depth, all, refresh_seconds, active_refresh_seconds } => {
                 let mut policy=store.config.index.clone();
@@ -555,7 +650,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 store.save_config()?;
                 emit(json,&store.config.index)?;
             },
-            IndexCommand::Status { .. } | IndexCommand::Refresh { .. } => unreachable!(),
+            IndexCommand::Status { .. } | IndexCommand::Refresh { .. } | IndexCommand::Search { .. } => unreachable!(),
         },
         Command::Repo{command}=>match command {
             RepoCommand::Init{profile:name,root}=>{let b=connect(store,name).await?;emit(json,&rdrive::repository::init(store,b.as_ref(),root).await?)?;},
@@ -602,6 +697,8 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 }else{None};
                 emit(json,&serde_json::json!({"configured_domain":domain,"native_registration":registration,"provider_service_started":false,"cache":rdrive::cache::status(store)?,"next_step":"Run provider serve with the companion's shared IPC socket and staging paths; register/enable its File Provider domain to show on-demand files in Finder."}))?;
             },
+            SmartCommand::Resolve{..}=>unreachable!(),
+            SmartCommand::Recovery{domain}=>emit(json,&rdrive::provider::namespace_recovery(&store.home,domain)?)?,
             SmartCommand::Status=>emit(json,&rdrive::provider::smart_summary(store)?)?,
             SmartCommand::List{domain}=>{
                 let mut result=Vec::new();for configured in rdrive::provider::domains(&store.home)?.into_iter().filter(|configured|configured.smart&&domain.as_ref().is_none_or(|name|name==&configured.id)){
@@ -1165,6 +1262,20 @@ async fn main() {
 async fn run(cli: &Cli) -> Result<()> {
     let home = cli.home.clone().unwrap_or_else(config::default_home);
     match &cli.command {
+        Command::Service {command} => {
+            use rdrive::service::{self,ServiceAction};
+            let value=match command {
+                ServiceCommand::Run=>return service::run(&home).await,
+                ServiceCommand::Status=>service::status(&home)?,
+                ServiceCommand::Install{ipc_root,app,development_tcp,launch_agents_dir,dry_run}=>service::install(&service::ServiceOptions{home:home.clone(),executable:std::env::current_exe()?,ipc_root:ipc_root.clone().unwrap_or_else(||home.join("service/ipc")),app:app.clone(),development_tcp:*development_tcp,launch_agents_dir:launch_agents_dir.clone()},*dry_run)?,
+                ServiceCommand::Start{dry_run}=>service::action(&home,ServiceAction::Start,*dry_run)?,
+                ServiceCommand::Stop{dry_run}=>service::action(&home,ServiceAction::Stop,*dry_run)?,
+                ServiceCommand::Restart{dry_run}=>service::action(&home,ServiceAction::Restart,*dry_run)?,
+                ServiceCommand::Uninstall{dry_run}=>service::action(&home,ServiceAction::Uninstall,*dry_run)?,
+            };return emit(cli.json,&value);
+        },
+        Command::Smart {command:SmartCommand::Resolve{domain,mutation,strategy}}=>return emit(cli.json,&rdrive::provider::resolve_smart(&home,domain,mutation,strategy).await?),
+        Command::Index {command:IndexCommand::Search{domain,query,scope,kind,page_size,offset}}=>return emit(cli.json,&rdrive::provider::index_search(&home,domain,query,scope,kind.as_deref(),*page_size,*offset)?),
         Command::Index { command:IndexCommand::Status { domain } } => {
             return emit(cli.json,&rdrive::provider::index_status(&home,domain.as_deref())?);
         },
@@ -1324,3 +1435,5 @@ mod cli_tests {
         assert!(matches!(cli.command, Command::Cat { max_bytes: None, .. }));
     }
 }
+
+fn self_profile(store:&Store,name:&str)->Result<()> { profile(store,name).map(|_|()) }

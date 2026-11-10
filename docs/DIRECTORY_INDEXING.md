@@ -55,3 +55,7 @@ python3 tests/index_workflows.py ./target/release/rdrive
 验证使用临时状态和本机合成 WebDAV，包括自动预建、正文零下载、慢扫描时读取目录、增量变化、失败保留、深度配置、递归刷新、迁移恢复与索引查询计划。性能数据的样本和计时方法随验证报告记录；本机目录查询耗时不代表真实云盘首次列举速度。
 
 SQLite 的读写隔离与事务行为见[官方 WAL 说明](https://sqlite.org/wal.html)及[事务说明](https://sqlite.org/lang_transaction.html)。
+
+## 0.7 离线索引搜索
+
+`index search DOMAIN QUERY --scope PATH --kind file --page-size 100 --offset 0` 查询本地文件名/路径，不遍历服务器。三字符及以上走 FTS5 trigram，短查询走转义的 SQLite LIKE；不搜索正文。结果应用当前过滤规则，范围为已索引数据，离线也可用。数据库 schema 2 在事务中添加派生搜索行，首次打开旧 schema 1 时自动迁移，保留所有控制及恢复状态。详见 [Smart 操作](SMART_OPERATIONS.md)。

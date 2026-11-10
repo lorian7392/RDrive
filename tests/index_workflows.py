@@ -427,7 +427,11 @@ def run(binary, output=None):
             wait(lambda: provider_database(migration.home, migration.domain).exists(), "legacy migration")
             migrated = read_provider_journal(migration.home, migration.domain)
             assert migrated["binding"] == legacy["binding"]
-            assert migrated["requests"] == legacy["requests"]
+            assert set(migrated["requests"]) == set(legacy["requests"])
+            for identity, receipt in legacy["requests"].items():
+                actual=migrated["requests"][identity]
+                assert all(actual.get(key)==value for key,value in receipt.items())
+                assert all(value is None for key,value in actual.items() if key not in receipt), "migration changed retained receipt semantics"
             assert set(migrated["pins"]) == set(legacy["pins"])
             assert any(event["deleted"] == "legacy-deleted" for event in migrated["events"])
             assert legacy_path.read_bytes() == legacy_bytes, "migration modified its retained legacy evidence"

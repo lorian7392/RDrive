@@ -1,6 +1,6 @@
 # Smart Synchronization
 
-RDrive 0.6 的 Smart 模式使用 macOS File Provider 管理占位文件、已下载内容和离线修改，通过 Rust 桥接服务连接 WebDAV 或 SMB。目录保存在 SQLite 索引中，后台逐层预建并增量刷新。普通 `rdrive mount` 使用系统网络文件系统，不会自动转换成 Smart 模式，也不受 RDrive 清洁缓存上限管理。
+RDrive 0.7 的 Smart 模式使用 macOS File Provider 管理占位文件、已下载内容和离线修改，通过 Rust 桥接服务连接 WebDAV 或 SMB。目录保存在 SQLite 索引中，后台逐层预建并增量刷新。普通 `rdrive mount` 使用系统网络文件系统，不会自动转换成 Smart 模式，也不受 RDrive 清洁缓存上限管理。
 
 ## 启用
 
@@ -40,7 +40,7 @@ rdrive provider native -- --watch-domains
 - Keep Offline 对文件夹及其后代生效，新发现的后代继承策略。取消父文件夹的固定不会取消对子项目单独设置的固定策略。
 - 普通下载内容可在空间不足时回收，固定保留、正在读取或未上传修改受到保护。允许自动回收是解除固定策略，不会承诺立即清空内容。
 - 本地修改先保存独立、校验过的不可变快照。桥接服务自动尝试上传；进程中断后可重新载入。仅在服务器确认完成后返回成功回执，系统还会保留未成功上传的本地修改。
-- 并发远端修改触发冲突，保留本地快照。不会通过重试自动强制覆盖远端。可导出后另存一个远端文件，或者根据业务需要人工合并。
+- 并发远端修改默认停止并保留本地快照。可显式选择保留两份、归档后受保护替换或接受远端；自动策略需另外配置，详见下方管理说明。
 
 ```sh
 rdrive smart status
@@ -78,3 +78,5 @@ rdrive cache config --max-bytes 5368709120
 自动化结果见 [SMART_VALIDATION.json](SMART_VALIDATION.json)，真实 Finder / File Provider 结果见 [MACOS_INTEGRATION.md](MACOS_INTEGRATION.md)。并发回执及删除崩溃恢复另见 [PROVIDER_RECEIPTS_VALIDATION.json](PROVIDER_RECEIPTS_VALIDATION.json)。这些流程使用本机合成服务，不更改真实云盘内容。
 
 普通 WebDAV/SMB 中，文件内容和独立属性记录分步提交，无法保证二者同时对其他客户端可见。需要多个文件、文件内容与元数据一起原子发布时，使用托管仓库模式；服务器确认和版本条件仍依赖服务端正确实现。
+
+文件/目录重命名、移动、可恢复删除、过滤、后台常驻、版本及冲突策略见 [Smart 文件操作与管理](SMART_OPERATIONS.md)。

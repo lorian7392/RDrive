@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x5244_4958; // RDIX
 
 pub(super) fn path(home: &Path, domain: &str) -> PathBuf {
@@ -95,13 +95,61 @@ fn open(db: &Path, writable: bool) -> Result<Connection> {
     .context("cannot open provider SQLite index; existing state was preserved")?;
     connection.busy_timeout(Duration::from_secs(3))?;
     connection.pragma_update(None, "trusted_schema", false)?;
+    // Opening a v1 database for a read performs its one-time derived-index
+    // migration through the same private writer lock used by load/save.
     if !writable {
+        let old: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if old == 1 {
+            drop(connection);
+            let domain = db
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .context("invalid index name")?;
+            let lock_path = parent.join(format!("{domain}.sqlite3.lock"));
+            let lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)?;
+            private_file(&lock_path)?;
+            lock.lock()?;
+            drop(open(db, true)?);
+            drop(lock);
+            return open(db, false);
+        }
         connection.pragma_update(None, "query_only", true)?;
     }
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let application: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    if version != SCHEMA_VERSION || application != APPLICATION_ID {
+    if version == 1 && application == APPLICATION_ID && writable {
+        // Upgrade derived search rows atomically; receipts and retained edits are
+        // untouched. A crash before commit leaves the old schema fully usable.
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let migration = (|| -> Result<()> {
+            create_search(&connection)?;
+            connection.execute("INSERT INTO search_docs(id,name,path,kind) SELECT id,json_extract(item_json,'$.name'),path,json_extract(item_json,'$.kind') FROM items", [])?;
+            connection.execute(
+                "INSERT INTO search_fts(rowid,name,path) SELECT rowid,name,path FROM search_docs",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE meta SET schema_version=?1 WHERE id=1",
+                [SCHEMA_VERSION],
+            )?;
+            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            Ok(())
+        })();
+        match migration {
+            Ok(()) => connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+    } else if version != SCHEMA_VERSION || application != APPLICATION_ID {
         bail!("unsupported provider index schema; existing state was preserved");
     }
     if writable {
@@ -109,6 +157,103 @@ fn open(db: &Path, writable: bool) -> Result<Connection> {
     }
     check_files(db)?;
     Ok(connection)
+}
+
+fn create_search(connection: &Connection) -> Result<()> {
+    connection.execute_batch("CREATE TABLE search_docs(rowid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL);
+        CREATE INDEX search_docs_path ON search_docs(path);
+        CREATE VIRTUAL TABLE search_fts USING fts5(name,path,content='search_docs',content_rowid='rowid',tokenize='trigram');")?;
+    Ok(())
+}
+
+// Namespace operations retain canonical paths for guarded replay. Search and
+// Finder filters use the local name/parent projection, including descendants.
+fn projected_paths(journal: &Journal) -> Result<BTreeMap<String, String>> {
+    fn visit(
+        id: &str,
+        journal: &Journal,
+        done: &mut BTreeMap<String, String>,
+        stack: &mut BTreeSet<String>,
+    ) -> Result<String> {
+        if let Some(path) = done.get(id) {
+            return Ok(path.clone());
+        }
+        if !stack.insert(id.into()) {
+            bail!("corrupt provider parent cycle");
+        }
+        let record = journal
+            .items
+            .get(id)
+            .context("provider projection item missing")?;
+        let parent = &record.item.parent_id;
+        let canonical_parent = record.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let path = if parent == "root"
+            && (canonical_parent.is_empty() || record.item.has_unsynced_changes)
+        {
+            record.item.name.clone()
+        } else if journal.items.contains_key(parent) {
+            crate::backend::join(&visit(parent, journal, done, stack)?, &record.item.name)?
+        } else {
+            record.path.clone()
+        };
+        stack.remove(id);
+        done.insert(id.into(), path.clone());
+        Ok(path)
+    }
+    let mut done = BTreeMap::new();
+    let mut stack = BTreeSet::new();
+    for id in journal.items.keys() {
+        visit(id, journal, &mut done, &mut stack)?;
+    }
+    Ok(done)
+}
+
+fn sync_search(transaction: &Transaction<'_>, journal: &Journal) -> Result<()> {
+    let projected = projected_paths(journal)?;
+    let mut old = transaction.prepare("SELECT rowid,id,name,path,kind FROM search_docs")?;
+    let rows = old
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(old);
+    let mut unchanged = BTreeSet::new();
+    for (rowid, id, name, path, kind) in rows {
+        if journal.items.get(&id).is_some_and(|record| {
+            record.item.name == name
+                && projected.get(&id) == Some(&path)
+                && record.item.kind == kind
+        }) {
+            unchanged.insert(id);
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO search_fts(search_fts,rowid,name,path) VALUES('delete',?1,?2,?3)",
+            params![rowid, name, path],
+        )?;
+        transaction.execute("DELETE FROM search_docs WHERE rowid=?1", [rowid])?;
+    }
+    for (id, record) in &journal.items {
+        if unchanged.contains(id) {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO search_docs(id,name,path,kind) VALUES(?1,?2,?3,?4)",
+            params![id, record.item.name, projected[id], record.item.kind],
+        )?;
+        let rowid = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO search_fts(rowid,name,path) VALUES(?1,?2,?3)",
+            params![rowid, record.item.name, projected[id]],
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_binding(connection: &Connection, domain: &str, binding: &str) -> Result<(u64, String)> {
@@ -264,6 +409,7 @@ fn write_snapshot(
     transaction.execute("DELETE FROM directory_scans WHERE NOT EXISTS(SELECT 1 FROM keep_scans WHERE keep_scans.id=directory_scans.id)", [])?;
     transaction
         .execute_batch("DROP TABLE keep_items; DROP TABLE keep_events; DROP TABLE keep_scans;")?;
+    sync_search(transaction, journal)?;
     Ok(())
 }
 
@@ -292,6 +438,7 @@ fn initialize(home: &Path, domain: &str, binding: &str, journal: &Journal) -> Re
             CREATE INDEX items_parent_id ON items(parent_id,id);
             CREATE TABLE events(anchor INTEGER PRIMARY KEY,item_json TEXT,deleted TEXT);
             CREATE TABLE directory_scans(id TEXT PRIMARY KEY,scanned_at INTEGER NOT NULL) WITHOUT ROWID;")?;
+        create_search(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         write_snapshot(&transaction, domain, binding, journal)?;
@@ -436,6 +583,12 @@ pub(super) fn query(
     let mut connection = open(&db, false)?;
     let transaction = connection.transaction()?;
     let (anchor, pins) = validate_binding(&transaction, &domain.id, binding)?;
+    let config: crate::config::Config = state::read_json(&home.join("config.json"))?;
+    let selector = crate::filtering::Selector::new(&config, &domain.profile)?;
+    let visible = |item: &Item, path: &str| -> Result<bool> {
+        Ok(item.sync_state.as_deref() != Some("queued_delete")
+            && (!domain.smart || selector.allowed(path, item.kind == "directory")?))
+    };
     let response = match request.op.as_str() {
         "item" => {
             let id = request.id.as_deref().unwrap_or("root");
@@ -447,14 +600,17 @@ pub(super) fn query(
                 root.sync_state = Some(if root.pinned { "pinned" } else { "online" }.into());
                 root
             } else {
-                let bytes: String = transaction
-                    .query_row("SELECT item_json FROM items WHERE id=?1", [id], |row| {
-                        row.get(0)
+                let (bytes,path): (String,String) = transaction
+                    .query_row("SELECT i.item_json,d.path FROM items i JOIN search_docs d ON d.id=i.id WHERE i.id=?1", [id], |row| {
+                        Ok((row.get(0)?,row.get(1)?))
                     })
                     .optional()?
                     .context("no_such_item")?;
                 let item: Item =
                     serde_json::from_str(&bytes).context("corrupt provider item projection")?;
+                if !visible(&item, &path)? {
+                    bail!("no_such_item");
+                }
                 if item.id != id {
                     bail!("corrupt provider item identity");
                 }
@@ -465,9 +621,9 @@ pub(super) fn query(
         "list" => {
             let parent = request.parent_id.as_deref().unwrap_or("root");
             let sql = if parent == "working_set" {
-                "SELECT item_json FROM items ORDER BY id"
+                "SELECT i.item_json,d.path FROM items i JOIN search_docs d ON d.id=i.id ORDER BY i.id"
             } else {
-                "SELECT item_json FROM items WHERE parent_id=?1 ORDER BY id"
+                "SELECT i.item_json,d.path FROM items i JOIN search_docs d ON d.id=i.id WHERE i.parent_id=?1 ORDER BY i.id"
             };
             let mut statement = transaction.prepare(sql)?;
             let mut rows = if parent == "working_set" {
@@ -478,10 +634,12 @@ pub(super) fn query(
             let mut items = vec![];
             while let Some(row) = rows.next()? {
                 let bytes: String = row.get(0)?;
-                items.push(
-                    serde_json::from_str::<Item>(&bytes)
-                        .context("corrupt provider item projection")?,
-                );
+                let item: Item =
+                    serde_json::from_str(&bytes).context("corrupt provider item projection")?;
+                let path: String = row.get(1)?;
+                if visible(&item, &path)? {
+                    items.push(item);
+                }
             }
             json!({"items":items,"anchor":anchor.to_string(),"smart":domain.smart})
         }
@@ -508,8 +666,29 @@ pub(super) fn query(
                 while let Some(row) = rows.next()? {
                     if let Some(bytes) = row.get::<_, Option<String>>(0)? {
                         let item: Item = serde_json::from_str(&bytes)?;
-                        deleted.remove(&item.id);
-                        items.insert(item.id.clone(), item);
+                        let path: Option<String> = if item.id == "root" {
+                            Some(String::new())
+                        } else {
+                            transaction
+                                .query_row(
+                                    "SELECT path FROM search_docs WHERE id=?1",
+                                    [&item.id],
+                                    |row| row.get(0),
+                                )
+                                .optional()?
+                        };
+                        if path
+                            .as_deref()
+                            .map(|path| visible(&item, path))
+                            .transpose()?
+                            .unwrap_or(false)
+                        {
+                            deleted.remove(&item.id);
+                            items.insert(item.id.clone(), item);
+                        } else {
+                            items.remove(&item.id);
+                            deleted.insert(item.id.clone());
+                        }
                     }
                     if let Some(id) = row.get::<_, Option<String>>(1)? {
                         items.remove(&id);
@@ -874,6 +1053,9 @@ mod tests {
         let first = record(&domain, "a", "root", "a");
         let mut latest = first.item.clone();
         latest.size = 4;
+        let mut current = record(&domain, "a", "root", "a");
+        current.item = latest.clone();
+        journal.items.insert("a".into(), current);
         journal.pins.insert("root".into());
         journal.anchor = 8;
         journal.events = vec![
@@ -1068,4 +1250,248 @@ mod tests {
             .unwrap()
             .is_some());
     }
+    #[test]
+    fn local_search_handles_unicode_literal_syntax_filters_pages_and_incremental_paths() {
+        let (_temporary, home, domain, mut journal) = fixture();
+        for (id, path) in [
+            ("a", "docs/年度报告.txt"),
+            ("b", "docs/report-one.txt"),
+            ("c", "docs/report-two.txt"),
+            ("d", "secret/report.txt"),
+            ("e", "a%_literal.txt"),
+        ] {
+            journal
+                .items
+                .insert(id.into(), record(&domain, id, "root", path));
+        }
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let mut config = crate::config::Config::default();
+        config.filters.exclude = vec!["secret/".into()];
+        let result = search(&home, &domain, "bound", &config, "report", "", None, 1, 0).unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+        assert_eq!(result["more"], true);
+        assert_eq!(result["engine"], "fts5-trigram");
+        let page = search(&home, &domain, "bound", &config, "report", "", None, 1, 1).unwrap();
+        assert_ne!(result["items"][0]["path"], page["items"][0]["path"]);
+        assert_eq!(page["more"], false);
+        assert_eq!(
+            search(
+                &home,
+                &domain,
+                "bound",
+                &config,
+                "报告",
+                "docs",
+                Some("file"),
+                10,
+                0
+            )
+            .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            search(&home, &domain, "bound", &config, "%_", "", None, 10, 0).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            search(&home, &domain, "bound", &config, "OR *", "", None, 10, 0).unwrap()["items"],
+            json!([])
+        );
+        journal.items.remove("b");
+        journal.items.get_mut("c").unwrap().path = "docs/renamed.txt".into();
+        journal.items.get_mut("c").unwrap().item.name = "renamed.txt".into();
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        assert_eq!(
+            search(&home, &domain, "bound", &config, "report", "", None, 10, 0).unwrap()["items"],
+            json!([])
+        );
+        assert_eq!(
+            search(&home, &domain, "bound", &config, "renamed", "docs", None, 10, 0).unwrap()
+                ["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(search(&home, &domain, "bound", &config, "x", "", None, 0, 0).is_err());
+        assert!(search(&home, &domain, "wrong", &config, "x", "", None, 1, 0).is_err());
+    }
+    #[test]
+    fn search_tracks_pending_reparent_and_descendants_without_rewriting_remote_paths() {
+        let (_temporary, home, domain, mut journal) = fixture();
+        let mut folder = record(&domain, "folder", "root", "original");
+        folder.item.kind = "directory".into();
+        folder.item.name = "renamed".into();
+        folder.item.has_unsynced_changes = true;
+        folder.item.sync_state = Some("queued".into());
+        journal.items.insert("folder".into(), folder);
+        journal.items.insert(
+            "child".into(),
+            record(&domain, "child", "folder", "original/child.txt"),
+        );
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let found = search(
+            &home,
+            &domain,
+            "bound",
+            &crate::config::Config::default(),
+            "child",
+            "renamed",
+            None,
+            10,
+            0,
+        )
+        .unwrap();
+        assert_eq!(found["items"][0]["path"], "renamed/child.txt");
+        assert_eq!(
+            lookup(&home, &domain.id, "bound", "child")
+                .unwrap()
+                .unwrap()
+                .path,
+            "original/child.txt"
+        );
+        assert!(search(
+            &home,
+            &domain,
+            "bound",
+            &crate::config::Config::default(),
+            "child",
+            "original",
+            None,
+            10,
+            0
+        )
+        .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn schema_one_upgrade_preserves_canonical_records_receipts_events_and_pins() {
+        let (_temporary, home, domain, mut journal) = fixture();
+        journal.items.insert(
+            "a".into(),
+            record(&domain, "a", "root", "old/searchable.txt"),
+        );
+        journal.pins.insert("a".into());
+        journal.anchor = 9;
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let db = path(&home, &domain.id);
+        let conn = open(&db, true).unwrap();
+        conn.execute_batch("DROP TABLE search_fts; DROP TABLE search_docs; UPDATE meta SET schema_version=1; PRAGMA user_version=1;").unwrap();
+        drop(conn);
+        let expected = serde_json::to_value(&journal).unwrap();
+        // The first reader performs the atomic one-time upgrade.
+        let result = search(
+            &home,
+            &domain,
+            "bound",
+            &crate::config::Config::default(),
+            "searchable",
+            "",
+            None,
+            10,
+            0,
+        )
+        .unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+        let loaded = load(&home, &domain.id, "bound", &home.join("missing.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+        assert_eq!(
+            open(&db, false)
+                .unwrap()
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            2
+        );
+    }
+}
+
+/// Offline local name/path substring search. Result pages never contact storage.
+pub(super) fn search(
+    home: &Path,
+    domain: &Domain,
+    binding: &str,
+    config: &crate::config::Config,
+    query: &str,
+    scope: &str,
+    kind: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Value> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > 512 || query.chars().any(char::is_control) {
+        bail!("search requires 1 to 512 printable characters");
+    }
+    if limit == 0 || limit > 1000 || offset > 1_000_000 {
+        bail!("search limit must be 1..1000 and offset at most 1000000");
+    }
+    if kind.is_some_and(|kind| !["file", "directory"].contains(&kind)) {
+        bail!("kind must be file or directory");
+    }
+    let scope = crate::backend::normalize(scope)?;
+    let selector = crate::filtering::Selector::new(config, &domain.profile)?;
+    let db = path(home, &domain.id);
+    if !present(&db)? {
+        return Ok(
+            json!({"domain":domain.id,"query":query,"items":[],"initialized":false,"offline":true,"more":false,"offset":offset}),
+        );
+    }
+    let mut connection = open(&db, false)?;
+    let transaction = connection.transaction()?;
+    let (anchor, _) = validate_binding(&transaction, &domain.id, binding)?;
+    let trigram = query.chars().count() >= 3;
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = if trigram {
+        format!("\"{}\"", query.replace('"', "\"\""))
+    } else {
+        format!("%{escaped}%")
+    };
+    let predicate = if trigram {
+        "d.rowid IN (SELECT rowid FROM search_fts WHERE search_fts MATCH ?1)"
+    } else {
+        "(d.name LIKE ?1 ESCAPE '\\' OR d.path LIKE ?1 ESCAPE '\\')"
+    };
+    let sql=format!("SELECT i.id,i.parent_id,i.path,i.record_json,d.path FROM search_docs d JOIN items i ON i.id=d.id WHERE {predicate} AND (?2='' OR d.path=?2 OR substr(d.path,1,length(?2)+1)=?2||'/') AND (?3 IS NULL OR d.kind=?3) ORDER BY d.path COLLATE NOCASE,d.id");
+    let mut statement = transaction.prepare(&sql)?;
+    let mut rows = statement.query(params![pattern, scope, kind])?;
+    let mut items = vec![];
+    let mut visible = 0usize;
+    let mut more = false;
+    while let Some(row) = rows.next()? {
+        let record = checked_record(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)?;
+        let display_path: String = row.get(4)?;
+        if record.item.sync_state.as_deref() == Some("queued_delete")
+            || (domain.smart
+                && !selector.allowed(&display_path, record.item.kind == "directory")?)
+        {
+            continue;
+        }
+        if visible < offset {
+            visible += 1;
+            continue;
+        }
+        if items.len() == limit {
+            more = true;
+            break;
+        }
+        items.push(json!({"path":display_path,"item":record.item}));
+    }
+    drop(rows);
+    drop(statement);
+    transaction.commit()?;
+    Ok(
+        json!({"domain":domain.id,"query":query,"scope":scope,"items":items,"initialized":true,"offline":true,"engine":if trigram {"fts5-trigram"}else{"sqlite-like"},"anchor":anchor.to_string(),"offset":offset,"more":more,"next_offset":if more {Some(offset+limit)}else{None}}),
+    )
 }

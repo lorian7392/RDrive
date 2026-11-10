@@ -55,7 +55,7 @@ def main():
         flags += ["-D", "RDRIVE_DEVELOPMENT"]
     module_cache = output / "module-cache"
     flags += ["-module-cache-path", module_cache]
-    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "8", "CFBundleShortVersionString": "0.6.0",
+    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "9", "CFBundleShortVersionString": "0.7.0",
             "LSMinimumSystemVersion": "13.0", "RDriveAppGroup": app_group}
     if development_root:
         base.pop("RDriveAppGroup")
@@ -138,7 +138,7 @@ def main():
         shutil.rmtree(final_app)
     app.rename(final_app)
     build_root.rmdir()
-    report = {"app": str(final_app), "version": "0.6.0", "bundle_build": "8", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
+    report = {"app": str(final_app), "version": "0.7.0", "bundle_build": "9", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
               "app_group": None if development_root else app_group, "development_ipc_root": str(development_root) if development_root else None,
               "distribution_ready": options.identity != "-" and development_root is None, "installed": False, "activated": False,
               "signing_status": "ad-hoc review build; no Developer Team identity" if options.identity == "-" else "signed with requested identity"}

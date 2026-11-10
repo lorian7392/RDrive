@@ -1,6 +1,6 @@
 # MCP 与 AI 操作技能
 
-RDrive 0.5 起在原有 CLI 上提供本地 MCP stdio 服务；0.6 增加目录索引控制。每个工具通过独立子进程调用同一个 RDrive 可执行文件，复用原有 WebDAV、SMB、缓存、同步基线和事务实现；服务等待请求期间不持有状态目录锁。后台索引的启动与升级步骤见[目录索引说明](DIRECTORY_INDEXING.md)。
+RDrive 0.5 起在原有 CLI 上提供本地 MCP stdio 服务；0.6 增加目录索引控制，0.7 增加离线搜索、过滤、版本/冲突和用户后台服务控制。每个工具通过独立子进程调用同一个 RDrive 可执行文件，复用原有 WebDAV、SMB、缓存、同步基线和事务实现；服务等待请求期间不持有状态目录锁。后台索引的启动与升级步骤见[目录索引说明](DIRECTORY_INDEXING.md)。
 
 ## 启动
 
@@ -41,7 +41,7 @@ JSON 输出供使用 `mcpServers` 配置结构的客户端使用；TOML 输出�
 
 ## 工具与资源
 
-共 62 个工具，默认只开放其中 24 个查询工具。所有工具以 `rdrive_` 开头。权威参数定义来自 `rdrive mcp tools --allow-write`，不接受额外或类型错误的字段。
+共 78 个工具，默认只开放其中 30 个查询工具。所有工具以 `rdrive_` 开头。权威参数定义来自 `rdrive mcp tools --allow-write`，不接受额外或类型错误的字段。
 
 - 连接与查询：`profiles`、`status`、`info`、`list`、`stat`、`read_text`、`url`、`history`。
 - 文件传输和远端修改：`download`、`upload`、`mkdir`、`copy`、`move`、`remove`。覆盖、递归删除、断点续传沿用 CLI 的显式参数和协议能力。
@@ -82,3 +82,5 @@ python3 tests/mcp_workflows.py ./target/debug/rdrive
 ```
 
 MCP 黑盒工作流使用临时状态目录和本机认证 WebDAV 测试服务，不使用真实云盘文件。既有 SMB、同步和崩溃恢复验证仍见 [验证记录](VALIDATION.md)；新增 MCP 测试不应被解释为对所有真实服务器或客户端的兼容性认证。
+
+0.7 新增 `rdrive_index_search`、`rdrive_filter_status/test/config/reset`、`rdrive_policy_status/config/reset`、`rdrive_smart_resolve/recovery`、`rdrive_service_status/install/start/stop/restart/uninstall`。搜索只读本地索引；过滤数组映射到重复 glob 参数。新增资源 `rdrive://filters`、`rdrive://policies`、`rdrive://service`，资源总数为 8。后台配置、服务控制和冲突决定均属写操作，保留默认写入隔离。使用说明见 [Smart 管理](SMART_OPERATIONS.md)。

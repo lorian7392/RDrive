@@ -132,11 +132,22 @@ pub(super) fn completed_manual_demands(
 /// Two normal priority turns alternate with a fair refresh turn and a crawl
 /// turn, so repeated browsing/failures cannot consume all background work.
 /// The caller increments `directory_turn` when it records an actual attempt.
+#[cfg(test)]
 pub(super) fn next_directory(
     j: &Journal,
     demands: &[CatalogDemand],
     policy: &IndexPolicy,
     now: i64,
+) -> Option<String> {
+    next_directory_where(j, demands, policy, now, |_, _| true)
+}
+
+pub(super) fn next_directory_where(
+    j: &Journal,
+    demands: &[CatalogDemand],
+    policy: &IndexPolicy,
+    now: i64,
+    allowed: impl Fn(&str, bool) -> bool,
 ) -> Option<String> {
     let demands = demands
         .iter()
@@ -159,8 +170,10 @@ pub(super) fn next_directory(
         .items
         .iter()
         .filter_map(|(id, record)| {
-            (record.item.kind == "file" && explicit_pin(j, id, &j.items))
-                .then_some(record.item.parent_id.as_str())
+            (record.item.kind == "file"
+                && allowed(&record.path, false)
+                && explicit_pin(j, id, &j.items))
+            .then_some(record.item.parent_id.as_str())
         })
         .collect();
 
@@ -171,6 +184,9 @@ pub(super) fn next_directory(
     }));
     let mut candidates = Vec::new();
     for (id, path) in directories {
+        if id != "root" && !allowed(path, true) {
+            continue;
+        }
         if j.directory_attempts
             .get(id)
             .is_some_and(|attempt| attempt.next_try > now)

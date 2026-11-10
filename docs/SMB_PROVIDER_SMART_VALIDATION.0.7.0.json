@@ -1,0 +1,21 @@
+{
+  "binary": "target/release/rdrive",
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "version": "rdrive 0.7.0",
+  "mode": "smart",
+  "passed": 4,
+  "checks": [
+    "encrypted SMB3 connection and truthful capabilities",
+    "SMB guarded file/directory rename retains IDs, child IDs, portable tags and attributes",
+    "SMB guarded file deletion preserves replacements on replay and directory deletion retains recoverable contents",
+    "Smart SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch"
+  ],
+  "server": "SERVER Version 4.21.9; IMAGE alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f",
+  "scope": "temporary synthetic encrypted authenticated loopback Samba only; no real storage",
+  "duration_seconds": 27.267,
+  "cleanup": "fixture completed its finally block and force-removed its unique test container",
+  "limitations": [
+    "Server-transparent POSIX symlinks cannot be identified by the client; server follow-symlinks=no policy is separately verified in the full workflow.",
+    "Directory logical deletion retains remote recovery contents and does not reclaim server space."
+  ]
+}

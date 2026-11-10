@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 
-from index_workflows import read_provider_journal
+from index_workflows import read_provider_journal, wait
 
 
 def native_xattr(path, name, value=None):
@@ -219,6 +219,47 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                         final = success(op="modify", id=tagged["id"], request_id=uuid.uuid4().hex, content_path=stage(final_body), base_content_version=tagged["content_version"], base_metadata_version=tagged["metadata_version"])["item"]
                         assert final["id"] == created["id"] and final.get("tag_data_hex") == updated_tags and final.get("extended_attributes") == updated_attributes
                         verify_strong(final)
+                        def bases(item):
+                            return dict(id=item["id"], request_id=uuid.uuid4().hex,
+                                        base_content_version=item["content_version"], base_metadata_version=item["metadata_version"])
+
+                        def fresh_root_item(identifier):
+                            if smart:
+                                before = read_provider_journal(home, domain)["directory_scans"].get("root", 0)
+                                cli("index", "refresh", domain)
+                                wait(lambda: read_provider_journal(home, domain)["directory_scans"].get("root", 0) > before, "SMB source-parent refresh", 30)
+                            else:
+                                success(op="list", parent_id="root")
+                            return success(op="item", id=identifier)["item"]
+
+                        namespace_file = success(op="create", parent_id="root", name="ns-file.txt", kind="file", client_item_id="smb-ns-file", content_path=stage(b"SMB namespace body"), tag_data_hex=tags, extended_attributes=attributes)["item"]
+                        renamed = success(op="modify", name="ns-renamed.txt", **bases(namespace_file))["item"]
+                        assert renamed["id"] == namespace_file["id"] and renamed["tag_data_hex"] == tags and renamed["extended_attributes"] == attributes
+                        assert (share / "provider-own-write/ns-renamed.txt").read_bytes() == b"SMB namespace body"
+                        assert not (share / "provider-own-write/ns-file.txt").exists()
+                        namespace_directory = success(op="create", parent_id="root", name="ns-directory", kind="directory", client_item_id="smb-ns-directory")["item"]
+                        namespace_child = success(op="create", parent_id=namespace_directory["id"], name="child.txt", kind="file", client_item_id="smb-ns-child", content_path=stage(b"SMB nested namespace body"))["item"]
+                        namespace_directory = fresh_root_item(namespace_directory["id"])
+                        moved_directory = success(op="modify", name="ns-moved-directory", **bases(namespace_directory))["item"]
+                        assert moved_directory["id"] == namespace_directory["id"]
+                        children = success(op="list", parent_id=moved_directory["id"])["items"]
+                        assert len(children) == 1 and children[0]["id"] == namespace_child["id"]
+                        assert (share / "provider-own-write/ns-moved-directory/child.txt").read_bytes() == b"SMB nested namespace body"
+                        passed_test("SMB guarded file/directory rename retains IDs, child IDs, portable tags and attributes")
+
+                        delete_request = dict(op="delete", **bases(renamed))
+                        success(**delete_request)
+                        deleted_path = share / "provider-own-write/ns-renamed.txt"
+                        assert not deleted_path.exists()
+                        deleted_path.write_bytes(b"external replacement after completed delete")
+                        success(**delete_request)
+                        assert deleted_path.read_bytes() == b"external replacement after completed delete"
+                        moved_directory = success(op="item", id=moved_directory["id"])["item"]
+                        deleted_directory = success(op="delete", recursive=True, **bases(moved_directory))
+                        assert deleted_directory["recoverable"] and not deleted_directory["space_reclaimed"]
+                        assert not (share / "provider-own-write/ns-moved-directory").exists()
+                        assert (share / "provider-own-write" / deleted_directory["recovery_path"] / "child.txt").read_bytes() == b"SMB nested namespace body"
+                        passed_test("SMB guarded file deletion preserves replacements on replay and directory deletion retains recoverable contents")
                         target = share / "provider-own-write/file.txt"
                         assert target.read_bytes() == final_body
                         external = b"E" * len(final_body)

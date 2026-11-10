@@ -207,6 +207,8 @@ impl Store {
         }
         let config: Config = read_json(&home.join("config.json"))?;
         config.index.validate()?;
+        config.filters.validate()?;
+        config.policies.validate()?;
         for p in config.profiles.values() {
             crate::config::validate_profile(p)?;
         }

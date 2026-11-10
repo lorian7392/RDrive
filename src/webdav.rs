@@ -557,6 +557,25 @@ impl Backend for WebDav {
     async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
         self.copy_or_move("MOVE", from, to, overwrite).await
     }
+
+    async fn rename_checked(&self,from:&str,to:&str,expected:&Entry)->Result<Entry>{
+        let from=normalize(from)?;let to=normalize(to)?;
+        if from.is_empty()||to.is_empty()||from==to||to.starts_with(&format!("{from}/"))||expected.path!=from{bail!("invalid guarded WebDAV move");}
+        let etag=expected.etag.as_deref().filter(|tag|strong_etag(tag)).context("unsupported: guarded WebDAV move requires a strong source ETag")?;
+        let source=self.url(&from)?;
+        // RFC4918 tagged If applies to the SOURCE resource, while Overwrite:F
+        // makes destination creation atomic. If-Match alone can be evaluated
+        // against the wrong resource by MOVE implementations.
+        let mut condition=format!("<{}> ([{}]",source,etag);
+        {let locks=self.owned_locks.lock().map_err(|_|anyhow!("lock state unavailable"))?;
+        if let Some(token)=locks.get(&from).or(self.lock_token.as_ref()){condition.push_str(&format!(" <{token}>"));}}
+        condition.push(')');
+        let response=send(self.request(method("MOVE"),&from,false)?.header("Destination",self.url(&to)?.as_str()).header("Overwrite","F").header("Depth","infinity").header("If",HeaderValue::from_str(&condition)?)).await?;
+        if !matches!(response.status().as_u16(),200|201|204){return Err(status_error("guarded MOVE",response.status()));}
+        let actual=self.stat(&to).await?.context("version_conflict: moved WebDAV target disappeared")?;
+        if !actual.same_revision(expected){bail!("version_conflict: target revision changed during guarded WebDAV move");}
+        Ok(actual)
+    }
     async fn copy(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
         self.copy_or_move("COPY", from, to, overwrite).await
     }

@@ -100,7 +100,11 @@ pub async fn cache_file(
 }
 
 pub fn cache_get(
-    store: &mut Store, profile: &str, remote: &str, destination: &Path, overwrite: bool,
+    store: &mut Store,
+    profile: &str,
+    remote: &str,
+    destination: &Path,
+    overwrite: bool,
 ) -> Result<CacheItem> {
     crate::cache::get(store, profile, remote, destination, overwrite)
 }
@@ -240,7 +244,7 @@ pub async fn run_job(store: &mut Store, backend: &dyn Backend, id: &str) -> Resu
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     pub id: String,
     pub path: String,
@@ -252,7 +256,13 @@ pub fn version_root(remote: &str) -> String {
     format!(".rdrive-versions/{}", state::key(remote))
 }
 
-pub async fn archive(store:&Store,backend:&dyn Backend,remote:&str)->Result<Option<Version>> {archive_at(&store.home,backend,remote).await}
+pub async fn archive(
+    store: &Store,
+    backend: &dyn Backend,
+    remote: &str,
+) -> Result<Option<Version>> {
+    archive_at(&store.home, backend, remote).await
+}
 
 pub async fn archive_at(
     home: &Path,
@@ -274,9 +284,7 @@ pub async fn archive_at(
     backend::mkdir_all(backend, &root).await?;
     // Store a checked, independent snapshot rather than racing a portable COPY
     // against edits to its source. Transfers remain streamed through disk.
-    let content_temp = home
-        .join("tmp")
-        .join(uuid::Uuid::new_v4().to_string());
+    let content_temp = home.join("tmp").join(uuid::Uuid::new_v4().to_string());
     let snapshot_revision = verified_download(backend, remote, &content_temp).await?;
     if !snapshot_revision.same_revision(&original) {
         let _ = fs::remove_file(&content_temp);
@@ -299,9 +307,7 @@ pub async fn archive_at(
         original,
         sha256,
     };
-    let temp = home
-        .join("tmp")
-        .join(uuid::Uuid::new_v4().to_string());
+    let temp = home.join("tmp").join(uuid::Uuid::new_v4().to_string());
     state::atomic_json(&temp, &version)?;
     let result = backend
         .upload(
@@ -313,6 +319,122 @@ pub async fn archive_at(
     let _ = fs::remove_file(temp);
     result?;
     Ok(Some(version))
+}
+
+/// Idempotent policy backup of one exact revision. A persisted resolution can
+/// retry this identity after a lost response without creating another version.
+pub async fn archive_expected_at(
+    home: &Path,
+    backend: &dyn Backend,
+    remote: &str,
+    expected: &Entry,
+    id: &str,
+) -> Result<Version> {
+    if backend::normalize(remote)? != remote
+        || expected.path != remote
+        || expected.is_dir
+        || id.is_empty()
+        || backend::normalize(id)? != id
+        || id.contains('/')
+        || id.chars().any(char::is_control)
+    {
+        bail!("invalid guarded version snapshot identity");
+    }
+    let root = format!("{}/{id}", version_root(remote));
+    let manifest = format!("{root}/manifest.json");
+    let content = format!("{root}/content");
+    let temporary = home.join("tmp").join(uuid::Uuid::new_v4().to_string());
+    let result = async {
+        if backend.stat(&manifest).await?.is_some() {
+            verified_download_limited(backend, &manifest, &temporary, Some(1024 * 1024)).await?;
+            let saved: Version = serde_json::from_slice(&fs::read(&temporary)?)?;
+            if saved.path != remote || saved.id != id || !saved.original.same_revision(expected) {
+                bail!("version_conflict: saved policy version belongs to another revision");
+            }
+            let _ = fs::remove_file(&temporary);
+            verified_download_limited(backend, &content, &temporary, Some(expected.size)).await?;
+            if fs::metadata(&temporary)?.len() != expected.size
+                || state::fingerprint(&temporary)? != saved.sha256
+            {
+                bail!("version snapshot checksum mismatch; original files were preserved");
+            }
+            return Ok(saved);
+        }
+        let before = backend
+            .stat(remote)
+            .await?
+            .context("version_conflict: version source disappeared")?;
+        if !before.same_revision(expected) {
+            bail!("version_conflict: version source changed before backup");
+        }
+        backend
+            .download_checked(remote, &temporary, expected)
+            .await?;
+        let after = backend
+            .stat(remote)
+            .await?
+            .context("version_conflict: version source disappeared during backup")?;
+        if !after.same_revision(expected) || fs::metadata(&temporary)?.len() != expected.size {
+            bail!("version_conflict: source changed while creating prior revision");
+        }
+        let sha256 = state::fingerprint(&temporary)?;
+        if backend
+            .content_sha256(expected)
+            .is_some_and(|hash| hash != sha256)
+        {
+            bail!("version source checksum differs from its guarded revision");
+        }
+        backend::mkdir_all(backend, &root).await?;
+        if backend.stat(&content).await?.is_some() {
+            let prior = home.join("tmp").join(uuid::Uuid::new_v4().to_string());
+            let checked = async {
+                verified_download_limited(backend, &content, &prior, Some(expected.size)).await?;
+                if fs::metadata(&prior)?.len() != expected.size
+                    || state::fingerprint(&prior)? != sha256
+                {
+                    bail!("version_conflict: policy backup slot contains different bytes");
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            let _ = fs::remove_file(prior);
+            checked?;
+        } else {
+            backend
+                .upload(&temporary, &content, WriteCondition::CreateNew)
+                .await?;
+            let checked = home.join("tmp").join(uuid::Uuid::new_v4().to_string());
+            let verified = async {
+                verified_download_limited(backend, &content, &checked, Some(expected.size)).await?;
+                if fs::metadata(&checked)?.len() != expected.size
+                    || state::fingerprint(&checked)? != sha256
+                {
+                    bail!(
+                        "version backup checksum mismatch; destructive replacement was not started"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            let _ = fs::remove_file(checked);
+            verified?;
+        }
+        let saved = Version {
+            id: id.into(),
+            path: remote.into(),
+            saved: state::now(),
+            original: expected.clone(),
+            sha256,
+        };
+        state::atomic_json(&temporary, &saved)?;
+        backend
+            .upload(&temporary, &manifest, WriteCondition::CreateNew)
+            .await?;
+        Ok(saved)
+    }
+    .await;
+    let _ = fs::remove_file(temporary);
+    result
 }
 
 pub async fn versions(store: &Store, backend: &dyn Backend, remote: &str) -> Result<Vec<Version>> {
@@ -347,7 +469,7 @@ pub async fn versions(store: &Store, backend: &dyn Backend, remote: &str) -> Res
         }
         result.push(v);
     }
-    result.sort_by(|a, b| b.id.cmp(&a.id));
+    result.sort_by(|a, b| b.saved.cmp(&a.saved).then_with(|| b.id.cmp(&a.id)));
     Ok(result)
 }
 

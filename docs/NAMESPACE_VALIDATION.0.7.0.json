@@ -1,0 +1,25 @@
+{
+  "binary": "target/release/rdrive",
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "version": "rdrive 0.7.0",
+  "passed": 12,
+  "checks": [
+    "guarded file rename/reparent keeps the item ID, tags, pin and content",
+    "a combined rename/content/metadata request completes its durable follow-up under the same ID",
+    "directory moves preserve descendant IDs and inherited pins while updating all canonical paths",
+    "occupied destinations are never overwritten and both original files remain",
+    "a destination created after planning wins the server no-overwrite guard",
+    "a new nested child racing directory deletion causes safe restore/conflict without recursive DELETE",
+    "recursive deletion removes the visible subtree and retains a durable recoverable tombstone",
+    "queued moves survive restart and real HTTP outage, preserve their projection and replay on reconnect",
+    "new exclusion rules suspend queued file deletion and whole-directory move/delete, survive restart, and replay safely after rules clear",
+    "excluded directories and files keep canonical rows while background traversal and cached-content fetch stop",
+    "managed recursive deletion rechecks the fresh manifest and protects an excluded child added after enqueue",
+    "SIGKILL after server MOVE reconciles the original identity without repeating MOVE or touching a replacement"
+  ],
+  "scope": "temporary synthetic authenticated loopback DAV only; no real storage",
+  "limitations": [
+    "Deleted directories are retained in remote recovery tombstones; storage is not immediately reclaimed.",
+    "DAV guarded moves require strong source ETags and compliant tagged If / Overwrite enforcement."
+  ]
+}

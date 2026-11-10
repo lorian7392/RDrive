@@ -162,7 +162,10 @@ fn resources() -> Value {
         {"uri":"rdrive://profiles","name":"Connection profiles","mimeType":"application/json"},
         {"uri":"rdrive://domains","name":"Finder domains","mimeType":"application/json"},
         {"uri":"rdrive://cache","name":"Clean-cache budget","mimeType":"application/json"},
-        {"uri":"rdrive://index","name":"Directory index progress","mimeType":"application/json"}
+        {"uri":"rdrive://index","name":"Directory index progress","mimeType":"application/json"},
+        {"uri":"rdrive://filters","name":"Smart filters","mimeType":"application/json"},
+        {"uri":"rdrive://policies","name":"Smart version and conflict policies","mimeType":"application/json"},
+        {"uri":"rdrive://service","name":"Background supervisor status","mimeType":"application/json"}
     ]})
 }
 fn resource_tool(uri: &str) -> Option<&'static str> {
@@ -172,6 +175,9 @@ fn resource_tool(uri: &str) -> Option<&'static str> {
         "rdrive://domains" => Some("rdrive_domains"),
         "rdrive://cache" => Some("rdrive_cache_status"),
         "rdrive://index" => Some("rdrive_index_status"),
+        "rdrive://filters" => Some("rdrive_filter_status"),
+        "rdrive://policies" => Some("rdrive_policy_status"),
+        "rdrive://service" => Some("rdrive_service_status"),
         _ => None,
     }
 }
@@ -587,6 +593,15 @@ mod tests {
             .is_err());
         assert!(cache.validate(&json!({"max_bytes":5.5})).is_err());
         assert!(cache.validate(&json!({"max_bytes":0})).is_ok());
+        let filter=catalog.iter().find(|t|t.name=="rdrive_filter_config").unwrap();
+        let args=json!({"include":["*.txt","docs/**/*.md"],"exclude":[]});
+        assert!(filter.validate(&args).is_ok());
+        assert_eq!(filter.argv(&args),["filter","config","--include","*.txt","--include","docs/**/*.md","--clear-exclude"]);
+        for args in [json!({"exclude":["../escape"]}),json!({"include":["--home"]}),json!({"include":"*.txt"}),json!({"include":[],"clear_include":true})] {
+            assert!(filter.validate(&args).is_err());
+        }
+        let resolve=catalog.iter().find(|t|t.name=="rdrive_smart_resolve").unwrap();
+        assert!(resolve.validate(&json!({"domain":"d","mutation":"m"})).is_err());
     }
     #[test]
     fn local_roots_reject_symlinks_traversal_and_state() {

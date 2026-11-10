@@ -40,6 +40,10 @@ pub struct Config {
     pub cache: CachePolicy,
     #[serde(default)]
     pub index: IndexPolicy,
+    #[serde(default)]
+    pub filters: crate::filtering::FilterConfig,
+    #[serde(default)]
+    pub policies: crate::policies::PolicyConfig,
 }
 
 /// Background namespace metadata only; this does not pin or download content.

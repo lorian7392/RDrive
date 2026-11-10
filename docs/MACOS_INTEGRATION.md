@@ -401,3 +401,7 @@ The 0.4.1/build7 bundle re-embeds the final Rust CLI. Native Swift behavior is u
 The user's real 123pan connection was restored and its original native WebDAV volume retained. The additional Smart domain displayed 23 root items, a browsed child directory, Online only labels, dataless cloud buttons and the five custom actions in actual Finder. The final release broker and foreground native watcher remain running as requested. Cache capacity is 5 GiB; no real remote mutation test was performed. Live connection reports and all credentials remain in ignored private runtime state and are excluded from artifacts.
 
 The synthetic cleanup report above describes the completed 0.4 test fixtures. It does not mean this newly requested real domain or its services should be removed. The separate FinderSync badge limitation remains unchanged.
+
+## 0.7 构建验证
+
+0.7.0/build9 已在隔离目录编译并通过 ad-hoc 签名检查，嵌入同一份最终 CLI。未注册或激活该包，现有 Finder 实例仍使用原已安装版本。新命名操作的桥接协议测试通过不等同于 Finder 实机回调验证。详见 [0.7 验证](VALIDATION_0.7.0.md)及[Smart 操作与服务管理](SMART_OPERATIONS.md)。

@@ -1,0 +1,19 @@
+{
+  "app": "/private/tmp/rdrive-native-0.7.0-w1nu1l4a/build/RDrive.app",
+  "version": "0.7.0",
+  "bundle_build": "9",
+  "sdk": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+  "architecture": "arm64",
+  "identity": "-",
+  "team_id": null,
+  "app_group": null,
+  "development_ipc_root": "/private/tmp/rdrive-native-0.7.0-w1nu1l4a/ipc",
+  "distribution_ready": false,
+  "installed": false,
+  "activated": false,
+  "signing_status": "ad-hoc review build; no Developer Team identity",
+  "source_cli_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "embedded_cli_sha256": "423b36941ec2a2516a146c0a015b5383479bebe80e4a8cea6284672d6919bc7b",
+  "cli_version": "rdrive 0.7.0",
+  "scope": "Compiled and ad-hoc codesign-verified in an isolated temporary directory; not installed, registered, activated or tested through Finder UI."
+}

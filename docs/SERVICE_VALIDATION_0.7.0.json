@@ -1,0 +1,21 @@
+{
+  "binary_sha256": "1a469cda80f289c05b8772ca5d7854edc37217043a65354be9613ca5244bd163",
+  "checks": [
+    "install dry-run renders a fixed-argv KeepAlive LaunchAgent without creating service files or persisting credentials",
+    "installation is private, idempotent, isolated from the default LaunchAgents directory, and all mutations have dry-run plans",
+    "foreground supervisor restores configured Smart domains and rejects duplicate owners without disturbing the running broker",
+    "a killed broker restarts with backoff and retains SQLite namespace while background indexing resumes",
+    "credential diagnostics distinguish caller and resident environment while configuration, plist, status and logs contain no password values",
+    "stop gracefully terminates only owned children and preserves persistent Smart state",
+    "real per-user launchd starts only the isolated temporary label; terminal credentials are not silently inherited",
+    "launchd KeepAlive recovers a killed supervisor and explicit restart restores the managed process tree",
+    "uninstall bootouts only the owned temporary label and preserves cached catalog and retained user data",
+    "a moved service executable remains inspectable and stoppable; restart fails without disrupting its owner and reinstall repairs the old path",
+    "an installation whose old executable was removed can be uninstalled while preserving indexed user data"
+  ],
+  "passed": 11,
+  "launchd_exercised": true,
+  "cleanup_verified": true,
+  "elapsed_seconds": 16.46,
+  "scope": "Temporary synthetic WebDAV profile, private service and IPC directories, and a unique temporary LaunchAgent; real mount and existing services unchanged."
+}
