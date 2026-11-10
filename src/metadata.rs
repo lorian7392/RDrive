@@ -990,6 +990,36 @@ mod io_tests {
         assert!(apply_with_io(&large,&desired,&MetadataPolicy::default(),&journal).unwrap_err().to_string().contains("existing selected metadata"));assert!(!journal.exists());
     }
     #[test]
+    fn capture_reports_protected_and_unselected_attributes_without_copying_them() {
+        let fake = FakeFile {
+            attributes: RefCell::new(BTreeMap::from([
+                ("com.apple.quarantine".into(), b"protected value".to_vec()),
+                ("user.hidden".into(), b"unselected value".to_vec()),
+                ("user.keep".into(), vec![0, 255]),
+            ])),
+            ..Default::default()
+        };
+        let before = fake.attributes.borrow().clone();
+        let policy = MetadataPolicy { include: vec!["user.keep".into()] };
+        let captured = capture_with_io(&fake, &policy).unwrap();
+        assert_eq!(captured.attributes, BTreeMap::from([("user.keep".into(), "00ff".into())]));
+        assert_eq!(captured.excluded, vec![
+            ExcludedAttribute {
+                name: "com.apple.quarantine".into(),
+                reason: "security, resource, or system metadata is never copied".into(),
+            },
+            ExcludedAttribute {
+                name: "user.hidden".into(),
+                reason: "not selected by metadata policy".into(),
+            },
+        ]);
+        assert_eq!(*fake.attributes.borrow(), before);
+        assert_eq!(fake.writes.get(), 0);
+        let mut without_exclusions = captured.clone();
+        without_exclusions.excluded.clear();
+        assert_eq!(captured.fingerprint().unwrap(), without_exclusions.fingerprint().unwrap());
+    }
+    #[test]
     fn failed_attribute_updates_remove_only_completed_rollback_journals() {
         for (writes,flushes,retained,expected) in [(vec![1],vec![],false,"rollback completed"),(vec![1,2],vec![],true,"rollback incomplete"),(vec![1],vec![1],true,"rollback could not be flushed")] {
             let temp=directory();let journal=temp.path().join("journal");let mut fake=file();fake.failed_writes=writes.into_iter().collect();fake.failed_flushes=flushes.into_iter().collect();

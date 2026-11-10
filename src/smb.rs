@@ -3635,6 +3635,15 @@ mod tests {
         driver.information.lock().unwrap().push_back(Ok(information(3, true)));
         assert!(client.delete_one(&target, false).await.unwrap_err().to_string().contains("reparse"));
         assert!(real.stat(&target).await?.unwrap().same_revision(&expected));
+        // Samba may report NAME_NOT_FOUND for CLOSE after an acknowledged
+        // directory deletion. Accept that response only when an independent
+        // lookup confirms that the directory really is gone.
+        let removed = backend::join(root, "missing-close-after-delete")?;
+        real.mkdir(&removed).await?;
+        driver.resource_closes.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(0xC0000034)));
+        client.delete_one(&removed, true).await.context("confirmed directory deletion tolerates a missing CLOSE response")?;
+        assert!(real.stat(&removed).await?.is_none(), "a successful directory deletion must remove the actual server path");
+        assert!(driver.resource_closes.lock().unwrap().is_empty(), "the synthetic CLOSE response was not consumed");
         let recreated = backend::join(root, "recreated-after-delete")?; real.mkdir(&recreated).await?;
         *driver.recreate_after_close.lock().unwrap() = Some((real.client.current().await?, real.unc(&recreated)?));
         driver.resource_closes.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(0xC0000034)));

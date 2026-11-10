@@ -1209,6 +1209,52 @@ mod tests {
             "72656d6f7465"
         );
     }
+    #[tokio::test]
+    async fn metadata_sync_reports_local_exclusions_for_shared_and_local_only_files() {
+        for remote_present in [true, false] {
+            let (_guard, root, file) = fixture();
+            let backend = Memory::new();
+            if !remote_present {
+                backend.nodes.lock().unwrap().remove("file");
+            }
+            let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+            metadata::apply(
+                &file,
+                &changed(&original, "keep local metadata"),
+                &MetadataPolicy::default(),
+            ).unwrap();
+            let before = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+            let remote_before = backend.nodes.lock().unwrap().iter()
+                .map(|(path, node)| (path.clone(), (node.bytes.clone(), node.revision)))
+                .collect::<BTreeMap<_, _>>();
+            let baseline = root.join("baseline.json");
+            let report = sync_with_policy(
+                &backend,
+                &root.join("local"),
+                "",
+                &baseline,
+                &SyncOptions { apply: false, direction: crate::sync::Direction::Both },
+                &MetadataPolicy { include: vec!["user.other".into()] },
+            ).await.unwrap();
+            assert!(report.warnings.iter().any(|warning| warning ==
+                "file: metadata user.rdrive.tag excluded: not selected by metadata policy"),
+                "missing local exclusion warning: {:?}", report.warnings);
+            assert_eq!(report.warnings.iter().any(|warning|
+                warning == "file: metadata deferred until content exists on both sides"),
+                !remote_present);
+            assert!(report.actions.is_empty());
+            assert!(report.conflicts.is_empty());
+            assert!(!report.applied);
+            assert!(!report.baseline_updated);
+            assert!(!baseline.exists());
+            assert_eq!(fs::read(&file).unwrap(), b"content");
+            assert_eq!(metadata::capture(&file, &MetadataPolicy::default()).unwrap(), before);
+            let remote_after = backend.nodes.lock().unwrap().iter()
+                .map(|(path, node)| (path.clone(), (node.bytes.clone(), node.revision)))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(remote_after, remote_before);
+        }
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_sources_are_rejected_before_any_metadata_publication() {
