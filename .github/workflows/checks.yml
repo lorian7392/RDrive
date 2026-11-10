@@ -1,0 +1,137 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      COVERAGE_FILE: target/coverage/python.coverage
+      RDRIVE_TEST_BINARY: ${{ github.workspace }}/target/coverage/rust-macos/build/debug/rdrive
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/coverage/post-export-%p-%m.profraw
+    steps:
+      - uses: actions/checkout@v4
+      - name: Freeze application source identities
+        run: python3 tests/source_manifest.py --output target/coverage/source-manifest.json
+      - name: Set up Rust
+        run: rustup toolchain install 1.90.0 --profile minimal --component llvm-tools-preview
+      - name: Select Rust
+        run: rustup override set 1.90.0
+      - name: Install pinned Rust coverage tool
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Collect Rust tests and isolated DAV/IPC coverage
+        run: python3 tests/run_rust_coverage.py --output-dir target/coverage/rust-macos --workflows dav
+      - name: Coverage scope parser
+        run: cargo test --locked --manifest-path tools/coverage-scope/Cargo.toml
+      - name: Python and documentation contracts
+        run: |
+          mkdir -p target/coverage
+          python3 -m venv target/coverage-venv
+          target/coverage-venv/bin/python -m pip install coverage==7.17.2
+          target/coverage-venv/bin/python -m coverage run --branch --include='*/macos/build.py,*/scripts/*.py' -m unittest discover -s tests -p 'test_*.py' -v
+          target/coverage-venv/bin/python -m coverage json -o target/coverage/python.json
+          target/coverage-venv/bin/python -m coverage report --fail-under=100
+          python3 scripts/generate-cli-docs.py --binary "$RDRIVE_TEST_BINARY" --check
+          python3 scripts/generate-cli-docs.py --binary "$RDRIVE_TEST_BINARY" --mcp --check
+      - name: Native SDK and mock boundary tests
+        run: python3 macos/tests/run.py --coverage --output-dir target/native-tests-coverage
+      - name: Verify application inputs stayed frozen
+        run: python3 tests/source_manifest.py --output target/coverage/source-manifest.json --check
+      - name: Preserve measured reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-coverage-${{ github.sha }}
+          path: |
+            target/coverage/python.json
+            target/coverage/source-manifest.json
+            target/coverage/rust-macos/manifest.json
+            target/coverage/rust-macos/coverage.lcov
+            target/coverage/rust-macos/test-spans.json
+            target/coverage/rust-macos/*.json
+            target/coverage/rust-macos/logs/
+            target/native-tests-coverage/coverage*.json
+            target/native-tests-coverage/coverage.lcov
+            target/validation/*.json
+          if-no-files-found: error
+
+  smb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: rustup toolchain install 1.90.0 --profile minimal --component llvm-tools-preview
+      - name: Select Rust and install pinned coverage tool
+        run: |
+          rustup override set 1.90.0
+          cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Collect Rust tests and disposable Samba coverage
+        run: python3 tests/run_rust_coverage.py --output-dir target/coverage/rust-linux --workflows smb --test-suite portable-smb
+      - name: Preserve measured reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-coverage-${{ github.sha }}
+          path: |
+            target/coverage/rust-linux/manifest.json
+            target/coverage/rust-linux/coverage.lcov
+            target/coverage/rust-linux/test-spans.json
+            target/coverage/rust-linux/*.json
+            target/coverage/rust-linux/logs/
+          if-no-files-found: error
+
+  production-coverage:
+    needs: [macos, smb]
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-coverage-${{ github.sha }}
+          path: target
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-coverage-${{ github.sha }}
+          path: target/coverage/rust-linux
+      - name: Verify source identities and combine actual Rust line hits
+        run: |
+          python3 tests/merge_rust_coverage.py \
+            --input-dir target/coverage/rust-macos \
+            --input-dir target/coverage/rust-linux \
+            --output target/coverage/rust.lcov
+      - name: Require 100 percent for each production language
+        run: |
+          python3 tests/report_coverage.py \
+            --rust-lcov target/coverage/rust.lcov \
+            --rust-test-spans target/coverage/rust-macos/test-spans.json \
+            --swift-lcov target/native-tests-coverage/coverage.lcov \
+            --python-json target/coverage/python.json \
+            --source-manifest target/coverage/rust-macos/manifest.json \
+            --source-manifest target/coverage/rust-linux/manifest.json \
+            --source-manifest target/native-tests-coverage/coverage-manifest.json \
+            --source-manifest target/coverage/source-manifest.json \
+            --output target/coverage/production.json
+      - name: Preserve combined gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-coverage-${{ github.sha }}
+          path: |
+            target/coverage/production.json
+            target/coverage/rust.lcov
+            target/coverage/rust.manifest.json
+          if-no-files-found: error

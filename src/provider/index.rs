@@ -125,30 +125,9 @@ fn open(db: &Path, writable: bool) -> Result<Connection> {
     let application: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     if version == 1 && application == APPLICATION_ID && writable {
-        // Upgrade derived search rows atomically; receipts and retained edits are
-        // untouched. A crash before commit leaves the old schema fully usable.
-        connection.execute_batch("BEGIN IMMEDIATE")?;
-        let migration = (|| -> Result<()> {
-            create_search(&connection)?;
-            connection.execute("INSERT INTO search_docs(id,name,path,kind) SELECT id,json_extract(item_json,'$.name'),path,json_extract(item_json,'$.kind') FROM items", [])?;
-            connection.execute(
-                "INSERT INTO search_fts(rowid,name,path) SELECT rowid,name,path FROM search_docs",
-                [],
-            )?;
-            connection.execute(
-                "UPDATE meta SET schema_version=?1 WHERE id=1",
-                [SCHEMA_VERSION],
-            )?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            Ok(())
-        })();
-        match migration {
-            Ok(()) => connection.execute_batch("COMMIT")?,
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        }
+        // Derived search rows migrate in one transaction; fault injection uses
+        // the same rollback path as an interrupted SQLite write.
+        migrate_search_with(&connection, migration_step)?;
     } else if version != SCHEMA_VERSION || application != APPLICATION_ID {
         bail!("unsupported provider index schema; existing state was preserved");
     }
@@ -157,6 +136,30 @@ fn open(db: &Path, writable: bool) -> Result<Connection> {
     }
     check_files(db)?;
     Ok(connection)
+}
+
+#[derive(Clone,Copy)]
+enum MigrationStep { Tables, Documents, Search, Version }
+fn migration_step(connection: &Connection, step: MigrationStep) -> Result<()> {
+    match step {
+        MigrationStep::Tables => create_search(connection)?,
+        MigrationStep::Documents => { connection.execute("INSERT INTO search_docs(id,name,path,kind) SELECT id,json_extract(item_json,'$.name'),path,json_extract(item_json,'$.kind') FROM items", [])?; }
+        MigrationStep::Search => { connection.execute("INSERT INTO search_fts(rowid,name,path) SELECT rowid,name,path FROM search_docs", [])?; }
+        MigrationStep::Version => {
+            connection.execute("UPDATE meta SET schema_version=?1 WHERE id=1",[SCHEMA_VERSION])?;
+            connection.pragma_update(None,"user_version",SCHEMA_VERSION)?;
+        }
+    }
+    Ok(())
+}
+fn migrate_search_with(connection:&Connection,mut step:impl FnMut(&Connection,MigrationStep)->Result<()>) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let migration=(|| -> Result<()> {for operation in [MigrationStep::Tables,MigrationStep::Documents,MigrationStep::Search,MigrationStep::Version] {step(connection,operation)?;}Ok(())})();
+    match migration {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {let _=connection.execute_batch("ROLLBACK");return Err(error);}
+    }
+    Ok(())
 }
 
 fn create_search(connection: &Connection) -> Result<()> {
@@ -413,7 +416,13 @@ fn write_snapshot(
     Ok(())
 }
 
+fn open_new_database(path:&Path)->Result<Connection> {
+    Ok(Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX)?)
+}
 fn initialize(home: &Path, domain: &str, binding: &str, journal: &Journal) -> Result<()> {
+    initialize_with(home,domain,binding,journal,open_new_database)
+}
+fn initialize_with(home:&Path,domain:&str,binding:&str,journal:&Journal,open_new:impl FnOnce(&Path)->Result<Connection>)->Result<()> {
     let directory = directory(home)?;
     let destination = path(home, domain);
     let temporary = directory.join(format!(".rdrive-index-{}.sqlite3", uuid::Uuid::new_v4()));
@@ -424,12 +433,7 @@ fn initialize(home: &Path, domain: &str, binding: &str, journal: &Journal) -> Re
         .mode(0o600)
         .open(&temporary)?;
     let result = (|| -> Result<()> {
-        let mut connection = Connection::open_with_flags(
-            &temporary,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let mut connection = open_new(&temporary)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let transaction = connection.transaction()?;
@@ -1494,4 +1498,120 @@ pub(super) fn search(
     Ok(
         json!({"domain":domain.id,"query":query,"scope":scope,"items":items,"initialized":true,"offline":true,"engine":if trigram {"fts5-trigram"}else{"sqlite-like"},"anchor":anchor.to_string(),"offset":offset,"more":more,"next_offset":if more {Some(offset+limit)}else{None}}),
     )
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    fn setup() -> (tempfile::TempDir,PathBuf,Domain,Journal) {
+        let temp=tempfile::tempdir().unwrap();let home=temp.path().join("state"); super::super::private(&home).unwrap(); directory(&home).unwrap();
+        let domain=Domain{id:"coverage".into(),profile:"p".into(),remote:String::new(),display_name:"Coverage".into(),repository:false,local_root:None,smart:true};
+        let journal=Journal{binding:Some("bound".into()),pins_migrated:true,..Default::default()};(temp,home,domain,journal)
+    }
+    #[test]
+    fn missing_indexes_and_search_validation_are_explicitly_offline() {
+        let (_temp,home,domain,journal)=setup(); let config=crate::config::Config::default();
+        assert!(directory_scan(&home,&domain.id,"bound","root").unwrap().is_none());
+        let result=search(&home,&domain,"bound",&config,"query","",None,10,0).unwrap();assert_eq!(result["initialized"],false);assert_eq!(result["offline"],true);
+        for query in ["","\n",&"x".repeat(513)] { assert!(search(&home,&domain,"bound",&config,query,"",None,10,0).is_err()); }
+        assert!(search(&home,&domain,"bound",&config,"query","",Some("unknown"),10,0).is_err());
+        save(&home,&domain.id,"bound",&journal).unwrap();
+        assert!(initialize(&home,&domain.id,"bound",&journal).is_err());
+        assert_eq!(fs::read_dir(home.join("provider")).unwrap().filter_map(|entry|entry.ok()).filter(|entry|entry.file_name().to_string_lossy().starts_with(".rdrive-index-")).count(),0);
+        let mut wrong=journal;wrong.binding=Some("changed".into());assert!(save(&home,&domain.id,"bound",&wrong).is_err());
+        let mut connection=open(&path(&home,&domain.id),true).unwrap(); let transaction=connection.transaction().unwrap();
+        transaction.execute("UPDATE meta SET schema_version=999 WHERE id=1",[]).unwrap();transaction.commit().unwrap();
+        assert!(status(&home,&domain.id,"bound").is_err());
+    }
+    #[test]
+    fn failed_v1_search_migration_rolls_back_schema_and_retains_original_rows() {
+        let (_temp,home,domain,journal)=setup();save(&home,&domain.id,"bound",&journal).unwrap();let db=path(&home,&domain.id);
+        let connection=open(&db,true).unwrap();
+        connection.execute_batch("DROP TABLE search_fts; DROP TABLE search_docs; PRAGMA user_version=1; UPDATE meta SET schema_version=1; ALTER TABLE items RENAME TO retained_items;").unwrap();drop(connection);
+        assert!(open(&db,false).is_err());
+        let raw=Connection::open(&db).unwrap();
+        assert_eq!(raw.pragma_query_value::<i64,_>(None,"user_version",|row|row.get(0)).unwrap(),1);
+        assert_eq!(raw.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_master WHERE name='search_docs'",[],|row|row.get(0)).unwrap(),0);
+        assert_eq!(raw.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_master WHERE name='retained_items'",[],|row|row.get(0)).unwrap(),1);
+    }
+    #[test]
+    fn catalog_rejects_corrupt_projections_and_hides_pending_deletes() {
+        let (_temp,home,domain,mut journal)=setup();
+        let mut item=super::super::root_item(&domain);item.id="file".into();item.name="file".into();item.kind="file".into();item.sync_state=Some("queued_delete".into());
+        let record=Record{path:"file".into(),item:item.clone(),entry:None,strong:None,client_id:None,metadata_known:false,metadata_checked:0};
+        assert!(checked_record("wrong".into(),"root".into(),"file".into(),serde_json::to_string(&record).unwrap()).is_err());
+        journal.items.insert("file".into(),record);journal.anchor=2;journal.events=vec![Event{anchor:1,item:Some(super::super::root_item(&domain)),deleted:None},Event{anchor:2,item:Some(item),deleted:None}];save(&home,&domain.id,"bound",&journal).unwrap();
+        let req=|op:&str|serde_json::from_value::<Request>(json!({"v":1,"op":op,"id":"file","anchor":"0"})).unwrap();
+        assert!(query(&home,&domain,"bound",&req("item")).is_err());
+        let changes=query(&home,&domain,"bound",&req("changes")).unwrap().unwrap();assert_eq!(changes["deleted"],json!(["file"]));assert_eq!(changes["items"][0]["id"],"root");
+        assert!(query(&home,&domain,"bound",&req("unknown")).is_err());
+        let connection=open(&path(&home,&domain.id),true).unwrap();
+        let mut wrong=journal.items["file"].item.clone();wrong.id="wrong".into();wrong.sync_state=Some("online".into());
+        connection.execute("UPDATE items SET item_json=?1 WHERE id='file'",[serde_json::to_string(&wrong).unwrap()]).unwrap();drop(connection);
+        assert!(query(&home,&domain,"bound",&req("item")).unwrap_err().to_string().contains("identity"));
+        let connection=open(&path(&home,&domain.id),true).unwrap();connection.execute("UPDATE meta SET control_json='{}' WHERE id=1",[]).unwrap();drop(connection);
+        assert!(load(&home,&domain.id,"bound",&home.join("absent.json")).is_err());
+    }
+    #[test]
+    fn relational_projection_guards_reject_cycles_events_and_mismatched_control() {
+        let (_temp,home,domain,mut journal)=setup();let mut item=super::super::root_item(&domain);item.id="file".into();item.name="file".into();item.kind="file".into();
+        let record=Record{path:"file".into(),item,entry:None,strong:None,client_id:None,metadata_known:false,metadata_checked:0};
+        save(&home,&domain.id,"bound",&journal).unwrap();
+        let mut malformed=record.clone();malformed.item.parent_id="file".into();journal.items.insert("file".into(),malformed);assert!(projected_paths(&journal).unwrap_err().to_string().contains("cycle"));journal.items.clear();
+        let mut malformed=record.clone();malformed.item.id.clear();journal.items.insert(String::new(),malformed);assert!(save(&home,&domain.id,"bound",&journal).is_err());journal.items.clear();
+        journal.events.push(Event{anchor:1,item:Some(record.item.clone()),deleted:None});assert!(save(&home,&domain.id,"bound",&journal).is_err());journal.events.clear();
+        journal.items.insert("file".into(),record);save(&home,&domain.id,"bound",&journal).unwrap();
+        let connection=open(&path(&home,&domain.id),true).unwrap();let wrong=Journal::default();connection.execute("UPDATE meta SET control_json=?1 WHERE id=1",[serde_json::to_string(&wrong).unwrap()]).unwrap();
+        assert!(load(&home,&domain.id,"bound",&home.join("absent")).unwrap_err().to_string().contains("control projection"));
+        connection.execute("UPDATE items SET item_json='{' WHERE id='file'",[]).unwrap();assert!(status(&home,&domain.id,"bound").is_err());drop(connection);
+        use std::os::unix::fs::PermissionsExt;fs::set_permissions(&home,fs::Permissions::from_mode(0o000)).unwrap();let result=present(&home.join("provider/index"));fs::set_permissions(&home,fs::Permissions::from_mode(0o700)).unwrap();assert!(result.is_err());
+    }
+
+    #[test]
+    fn each_failed_derived_index_migration_stage_rolls_back_schema_version_and_search_rows() {
+        for failed in 0..4 {
+            let (_temp,home,domain,journal)=setup();save(&home,&domain.id,"bound",&journal).unwrap();let connection=open(&path(&home,&domain.id),true).unwrap();connection.execute_batch("DROP TABLE search_fts; DROP TABLE search_docs; PRAGMA user_version=1; UPDATE meta SET schema_version=1;").unwrap();
+            let mut calls=0;let result=migrate_search_with(&connection,|connection,operation|{let current=calls;calls+=1;if current==failed {bail!("synthetic SQLite write failure");}migration_step(connection,operation)});assert!(result.is_err());
+            assert_eq!(connection.pragma_query_value::<i64,_>(None,"user_version",|row|row.get(0)).unwrap(),1);assert_eq!(connection.query_row::<i64,_,_>("SELECT schema_version FROM meta WHERE id=1",[],|row|row.get(0)).unwrap(),1);assert_eq!(connection.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_master WHERE name='search_docs'",[],|row|row.get(0)).unwrap(),0);
+        }
+    }
+    #[test]
+    fn database_open_failure_cleans_staging_without_publishing_an_incomplete_index() {
+        let (_temp,home,domain,journal)=setup();assert!(initialize_with(&home,&domain.id,"bound",&journal,|_|Err(anyhow::anyhow!("synthetic database open failure"))).is_err());assert!(!path(&home,&domain.id).exists());assert_eq!(fs::read_dir(home.join("provider")).unwrap().count(),0);assert!(open_new_database(&home.join("missing/database")).is_err());
+        let connection=Connection::open_in_memory().unwrap();for operation in [MigrationStep::Documents,MigrationStep::Search,MigrationStep::Version] {assert!(migration_step(&connection,operation).is_err());}
+    }
+
+    #[test]
+    fn event_write_failure_rolls_back_the_entire_catalog_snapshot() {
+        let (_temp, home, domain, mut journal) = setup();
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let baseline = serde_json::to_value(&journal).unwrap();
+        let db = path(&home, &domain.id);
+        let connection = open(&db, true).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'fixture event write failure'); END;").unwrap();
+        drop(connection);
+
+        let mut item = super::super::root_item(&domain);
+        item.id = "file".into();
+        item.name = "file".into();
+        item.kind = "file".into();
+        journal.items.insert(item.id.clone(), Record {
+            path: "file".into(), item: item.clone(), entry: None, strong: None,
+            client_id: None, metadata_known: false, metadata_checked: 0,
+        });
+        journal.anchor = 1;
+        journal.events.push(Event { anchor: 1, item: Some(item), deleted: None });
+        let error = save(&home, &domain.id, "bound", &journal).unwrap_err();
+        assert!(error.to_string().contains("fixture event write failure"));
+        let retained = load(&home, &domain.id, "bound", &home.join("absent.json")).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(retained).unwrap(), baseline);
+        let connection = open(&db, true).unwrap();
+        assert_eq!(connection.query_row::<i64, _, _>("SELECT count(*) FROM events", [], |row| row.get(0)).unwrap(), 0);
+        assert_eq!(connection.query_row::<i64, _, _>("SELECT count(*) FROM items", [], |row| row.get(0)).unwrap(), 0);
+        connection.execute_batch("DROP TRIGGER reject_event").unwrap();
+        drop(connection);
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        assert_eq!(load(&home, &domain.id, "bound", &home.join("absent.json")).unwrap().unwrap().anchor, 1);
+    }
+
 }

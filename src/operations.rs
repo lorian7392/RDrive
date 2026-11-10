@@ -180,6 +180,11 @@ pub fn enqueue_with_resume(
 }
 
 pub async fn run_job(store: &mut Store, backend: &dyn Backend, id: &str) -> Result<Entry> {
+    run_job_with_event(store, backend, id, Store::event).await
+}
+
+type EventSink = fn(&mut Store, &str, &str, &str, &str) -> Result<()>;
+async fn run_job_with_event(store: &mut Store, backend: &dyn Backend, id: &str, event: EventSink) -> Result<Entry> {
     let index = store
         .db
         .jobs
@@ -227,7 +232,7 @@ pub async fn run_job(store: &mut Store, backend: &dyn Backend, id: &str) -> Resu
             store.db.jobs[index].status = "done".into();
             store.save()?;
             fs::remove_file(source)?;
-            store.event(
+            event(store,
                 "upload",
                 &job.profile,
                 &job.remote,
@@ -241,6 +246,47 @@ pub async fn run_job(store: &mut Store, backend: &dyn Backend, id: &str) -> Resu
             store.save()?;
             Err(e.context(format!("upload preserved in queue job {id}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use crate::{backend::Capabilities, config::{Profile, Protocol}};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ConfirmedUpload(AtomicUsize);
+    #[async_trait]
+    impl Backend for ConfirmedUpload {
+        fn capabilities(&self) -> Capabilities { Capabilities { protocol: "test", conditional_write: true, server_copy: false, locking: false, notes: vec![] } }
+        async fn upload(&self, local: &Path, remote: &str, _: WriteCondition) -> Result<Entry> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Entry { path: remote.into(), is_dir: false, size: fs::metadata(local)?.len(), etag: Some("confirmed".into()), modified: None })
+        }
+        async fn stat(&self, _: &str) -> Result<Option<Entry>> { bail!("unused") }
+        async fn list(&self, _: &str) -> Result<Vec<Entry>> { bail!("unused") }
+        async fn download(&self, _: &str, _: &Path) -> Result<()> { bail!("unused") }
+        async fn mkdir(&self, _: &str) -> Result<()> { bail!("unused") }
+        async fn remove(&self, _: &str, _: bool) -> Result<()> { bail!("unused") }
+        async fn rename(&self, _: &str, _: &str, _: bool) -> Result<()> { bail!("unused") }
+        async fn copy(&self, _: &str, _: &str, _: bool) -> Result<()> { bail!("unused") }
+    }
+    #[tokio::test]
+    async fn history_failure_after_confirmed_upload_keeps_the_completed_receipt() {
+        let temp = tempfile::tempdir().unwrap(); let mut store = Store::open(temp.path().join("state")).unwrap();
+        store.config.profiles.insert("test".into(), Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: None, password_env: None, allow_http: false, timeout_secs: 10, smb_encryption: true, nextcloud_upload_url: None });
+        let source = temp.path().join("source"); fs::write(&source, b"payload").unwrap();
+        let job = enqueue(&mut store, "test", &source, "remote", false, None, false).unwrap(); let backend = ConfirmedUpload(0.into());
+        let failure = run_job_with_event(&mut store, &backend, &job.id, |_, operation, profile, path, _| {
+            assert_eq!((operation, profile, path), ("upload", "test", "remote")); bail!("synthetic audit write failure")
+        }).await.unwrap_err();
+        assert!(failure.to_string().contains("audit write failure"));
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+        assert_eq!(store.db.jobs[0].status, "done");
+        assert!(!store.home.join("spool").join(&job.snapshot).exists());
+        assert!(run_job(&mut store, &backend, &job.id).await.unwrap_err().to_string().contains("already done"));
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1, "an audit failure cannot replay a completed upload");
+        let home = store.home.clone(); drop(store); assert_eq!(Store::open(home).unwrap().db.jobs[0].status, "done");
     }
 }
 

@@ -212,6 +212,14 @@ impl TransferContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_registry_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.shared.jobs.lock().unwrap();
+            panic!("synthetic poisoned registry");
+        }));
+    }
+
     pub fn start(
         &self,
         operation: &str,
@@ -479,6 +487,12 @@ impl Shared {
     }
 
     fn emit(&self, event: &str, job: Option<&Arc<Job>>, force: bool) {
+        if self.output != ProgressOutput::Off {
+            self.emit_to(event, job, force, &mut std::io::stderr().lock());
+        }
+    }
+
+    fn emit_to(&self, event: &str, job: Option<&Arc<Job>>, force: bool, stderr: &mut dyn Write) {
         if self.output == ProgressOutput::Off {
             return;
         }
@@ -491,7 +505,6 @@ impl Shared {
         *last = Instant::now();
         let mut aggregate = self.snapshot();
         let job = job.map(|job| job.snapshot());
-        let mut stderr = std::io::stderr().lock();
         if self.output == ProgressOutput::Json || !self.tty {
             aggregate.jobs.retain(|candidate| {
                 candidate.state == "running"
@@ -599,8 +612,129 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn exhaust_context_ids(context: &TransferContext) {
+    context.shared.next_id.store(u64::MAX, Ordering::Relaxed);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_and_json_progress_are_observable_and_control_characters_are_sanitized() {
+        let mut context = TransferContext::new(None, ProgressOutput::Auto).unwrap();
+        Arc::get_mut(&mut context.shared).unwrap().tty = true;
+        let job = context.scoped("a\nb\x1b").start("download", "path", Some(20), 0).unwrap();
+        job.record(10).unwrap();
+        let mut output = Vec::new();
+        context.shared.emit_to("progress", Some(&job.handle.job), true, &mut output);
+        let value = String::from_utf8(output).unwrap();
+        assert!(value.contains("50.0%") && value.contains("[========        ]"), "{value}");
+        assert!(value.contains("a?b?") && value.contains("ETA"));
+        let unknown = context.start("upload", "unknown", None, 0).unwrap();
+        let mut output = Vec::new();
+        context.shared.emit_to("progress", None, true, &mut output);
+        assert!(String::from_utf8(output).unwrap().contains("--%"));
+        let empty = context.start("upload", "zero", Some(0), 0).unwrap();
+        empty.finish();
+        unknown.fail("synthetic transport error");
+        job.finish();
+        let mut output = Vec::new();
+        context.shared.emit_to("progress", None, true, &mut output);
+        assert!(output.is_empty(), "completed jobs must not occupy the progress line");
+        let context = TransferContext::new(None, ProgressOutput::Json).unwrap();
+        let first = context.start("get", "finished", Some(1), 0).unwrap();
+        first.record(1).unwrap(); first.finish();
+        let second = context.start("get", "current", None, 0).unwrap();
+        let mut output = Vec::new();
+        context.shared.emit_to("progress", Some(&second.handle.job), true, &mut output);
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["event"], "progress");
+        assert_eq!(value["aggregate"]["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["aggregate"]["jobs"][0]["path"], "current");
+    }
+
+    #[test]
+    fn registry_bounds_completed_jobs_and_rejects_id_and_declared_size_overflow() {
+        let context = TransferContext::default();
+        for _ in 0..2050 { context.start("get", "x", Some(0), 0).unwrap().finish(); }
+        assert_eq!(context.shared.jobs.lock().unwrap().len(), 2048);
+        context.shared.next_id.store(u64::MAX, Ordering::Relaxed);
+        assert!(context.start("get", "x", None, 0).err().unwrap().to_string().contains("too many"));
+        context.shared.next_id.store(1, Ordering::Relaxed);
+        context.shared.declared.store(u64::MAX, Ordering::Relaxed);
+        assert!(context.start("get", "x", Some(1), 0).err().unwrap().to_string().contains("overflow"));
+        assert!(context.start("get", "x", Some(1), 2).is_err());
+        assert!(TransferContext::new(Some(0), ProgressOutput::Off).is_err());
+    }
+
+    #[test]
+    fn finished_transfer_and_poisoned_registry_fail_without_panic() {
+        let context = TransferContext::default();
+        let transfer = context.start("get", "x", Some(1), 0).unwrap();
+        transfer.record(2).unwrap(); transfer.finish(); transfer.finish();
+        assert_eq!(context.snapshot().total, Some(2));
+        assert!(transfer.record(1).is_err());
+        let job = context.start("get", "overflow", None, 0).unwrap();
+        job.handle.job.transferred.store(u64::MAX, Ordering::Relaxed);
+        assert!(job.record(1).is_err());
+        context.poison_registry_for_test();
+        assert!(context.start("get", "x", None, 0).err().unwrap().to_string().contains("registry"));
+        assert!(context.snapshot().jobs.is_empty());
+    }
+
+    #[test]
+    fn disabled_or_poisoned_progress_output_never_writes() {
+        let context = TransferContext::default(); let mut output = Vec::new();
+        context.shared.emit_to("progress", None, true, &mut output);
+        assert!(output.is_empty());
+        let context = TransferContext::new(None, ProgressOutput::Json).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = context.shared.render.lock().unwrap(); panic!("synthetic progress lock failure");
+        }));
+        context.shared.emit_to("progress", None, true, &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reporter_stops_when_context_and_handles_are_released() {
+        let context = TransferContext::new(None, ProgressOutput::Json).unwrap();
+        let transfer = context.start("get", "reporter", None, 0).unwrap();
+        let reporter = context.reporter();
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        transfer.finish(); drop(transfer); drop(context);
+        tokio::time::timeout(Duration::from_secs(1), reporter).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn metered_stream_counts_payload_and_reports_transport_failure_without_source_text() {
+        let context = TransferContext::default();
+        let transfer = context.start("stream", "ok", Some(3), 0).unwrap();
+        let input = futures_util::stream::iter([Ok::<_, &str>(b"abc".to_vec())]);
+        let chunks = meter_stream(input, transfer.clone()).collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1); assert_eq!(chunks[0].as_ref().unwrap(), b"abc");
+        assert_eq!(transfer.snapshot().transferred, 3); transfer.finish();
+        let failed = context.start("stream", "failed", None, 0).unwrap();
+        let input = futures_util::stream::iter([Err::<Vec<u8>, _>("private error text")]);
+        let chunks = meter_stream(input, failed.clone()).collect::<Vec<_>>().await;
+        assert_eq!(chunks[0].as_ref().unwrap_err().to_string(), "transport stream interrupted");
+        assert_eq!(failed.snapshot().state, "failed");
+        assert_eq!(failed.snapshot().transferred, 0);
+    }
+
+    #[test]
+    fn global_installation_is_process_local_and_rejects_replacement() {
+        const MARKER: &str = "RDRIVE_TRANSFER_GLOBAL_TEST_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transfer::tests::global_installation_is_process_local_and_rejects_replacement"])
+                .env(MARKER, "1").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        install_global(TransferContext::default()).unwrap();
+        assert!(install_global(TransferContext::default()).is_err());
+        assert_eq!(global().snapshot().active_jobs, 0);
+    }
     #[tokio::test]
     async fn shared_limiter_caps_parallel_jobs_instead_of_each_client_separately() {
         let context = TransferContext::new(Some(20_000), ProgressOutput::Off).unwrap();

@@ -66,22 +66,36 @@ trait System {
     fn detach(&self, path: &Path, force: bool) -> Result<bool>;
 }
 
-struct Native;
+struct Native {
+    command_status: fn(&mut Command) -> Result<bool>,
+}
+impl Default for Native {
+    fn default() -> Self {
+        Self {
+            command_status: helper_status,
+        }
+    }
+}
+fn helper_status(command: &mut Command) -> Result<bool> {
+    Ok(command.status()?.success())
+}
 
 /// Inspect the actual macOS mount table, including volumes mounted outside rdrive.
 pub fn list() -> Result<Vec<MountInfo>> {
-    Ok(Native
-        .mounts()?
+    Ok(network_mounts(Native::default().mounts()?))
+}
+fn network_mounts(mounts: Vec<KernelMount>) -> Vec<MountInfo> {
+    mounts
         .into_iter()
         .filter(|m| is_network(&m.info))
         .map(|m| m.info)
-        .collect())
+        .collect()
 }
 
 /// A dry run validates the existing mountpoint and builds only credential-free arguments.
 pub fn plan(profile: &Profile, mountpoint: &Path, options: &MountOptions) -> Result<MountPlan> {
     ensure_macos()?;
-    plan_with(&Native, profile, mountpoint, options)
+    plan_with(&Native::default(), profile, mountpoint, options)
 }
 
 /// Mount a volume and confirm its owner, filesystem, root, and requested readonly flag.
@@ -101,14 +115,14 @@ pub fn mount(
     if password.is_none() && !options.no_prompt && !terminal_available() {
         bail!("native mount requires a controlling terminal for its credential prompt; run it in a terminal or use --no-prompt with existing macOS credentials");
     }
-    mount_with(&Native, profile, mountpoint, options, password)
+    mount_with(&Native::default(), profile, mountpoint, options, password)
 }
 
 /// Unmount only an exact, user-owned SMB/WebDAV mountpoint. No force by default.
 /// Returns the volume that has been confirmed absent from the kernel mount table.
 pub fn unmount(mountpoint: &Path, force: bool) -> Result<MountInfo> {
     ensure_macos()?;
-    unmount_with(&Native, mountpoint, force)
+    unmount_with(&Native::default(), mountpoint, force)
 }
 
 fn is_network(info: &MountInfo) -> bool {
@@ -116,9 +130,11 @@ fn is_network(info: &MountInfo) -> bool {
 }
 
 fn ensure_macos() -> Result<()> {
-    if !cfg!(target_os = "macos") {
+    #[cfg(not(target_os = "macos"))]
+    {
         bail!("native network mounts are currently supported on macOS only");
     }
+    #[cfg(target_os = "macos")]
     Ok(())
 }
 
@@ -390,6 +406,30 @@ struct MountPoint {
 }
 
 #[cfg(unix)]
+fn validate_ancestor_permissions(
+    path: &Path,
+    owner: u32,
+    mode: u32,
+    current_uid: u32,
+) -> Result<()> {
+    if owner != 0 && owner != current_uid {
+        bail!(
+            "mountpoint ancestor is owned by a different user: {}",
+            path.display()
+        );
+    }
+    // Sticky root temp directories protect entries from deletion by other users.
+    let trusted_sticky = owner == 0 && mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !trusted_sticky {
+        bail!(
+            "mountpoint ancestor is writable by other users: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_mountpoint(path: &Path) -> Result<MountPoint> {
     let path = absolute_path(path)?;
     let mut prefix = PathBuf::new();
@@ -407,21 +447,7 @@ fn validate_mountpoint(path: &Path) -> Result<MountPoint> {
                 prefix.display()
             );
         }
-        let owner = meta.uid();
-        if owner != 0 && owner != uid() {
-            bail!(
-                "mountpoint ancestor is owned by a different user: {}",
-                prefix.display()
-            );
-        }
-        // Sticky root temp directories protect entries from deletion by other users.
-        let trusted_sticky = owner == 0 && meta.mode() & 0o1000 != 0;
-        if meta.mode() & 0o022 != 0 && !trusted_sticky {
-            bail!(
-                "mountpoint ancestor is writable by other users: {}",
-                prefix.display()
-            );
-        }
+        validate_ancestor_permissions(&prefix, meta.uid(), meta.mode(), uid())?;
     }
     let file = OpenOptions::new()
         .read(true)
@@ -700,29 +726,30 @@ impl System for Native {
         if let Some(credentials) = credentials {
             command.stdin(Stdio::from(credentials.file.try_clone()?));
         }
-        Ok(command
-            .status()
-            .context("could not start macOS native mount helper")?
-            .success())
+        (self.command_status)(&mut command).context("could not start macOS native mount helper")
     }
     fn detach(&self, path: &Path, force: bool) -> Result<bool> {
         let mut command = Command::new("/sbin/umount");
         if force {
             command.arg("-f");
         }
-        Ok(command
-            .arg(path)
-            .status()
-            .context("could not start macOS unmount helper")?
-            .success())
+        command.arg(path);
+        (self.command_status)(&mut command).context("could not start macOS unmount helper")
     }
 }
 
 #[cfg(target_os = "macos")]
 fn kernel_mounts() -> Result<Vec<KernelMount>> {
+    kernel_mounts_with(|records, bytes, flags| unsafe { libc::getfsstat(records, bytes, flags) })
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_mounts_with(
+    mut query: impl FnMut(*mut libc::statfs, i32, i32) -> i32,
+) -> Result<Vec<KernelMount>> {
     // getfsstat gives us an owned buffer, avoiding getmntinfo's process-global data.
     for _ in 0..4 {
-        let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        let count = query(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
         if count < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -731,7 +758,7 @@ fn kernel_mounts() -> Result<Vec<KernelMount>> {
             .map(|_| unsafe { std::mem::zeroed() })
             .collect();
         let bytes = i32::try_from(capacity * std::mem::size_of::<libc::statfs>())?;
-        let got = unsafe { libc::getfsstat(records.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        let got = query(records.as_mut_ptr(), bytes, libc::MNT_NOWAIT);
         if got < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -960,6 +987,39 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_permissions_reject_foreign_owners_and_unprotected_writable_directories() {
+        let path = Path::new("/synthetic/ancestor");
+        assert!(validate_ancestor_permissions(path, 502, 0o700, 501)
+            .unwrap_err()
+            .to_string()
+            .contains("different user"));
+        assert!(validate_ancestor_permissions(path, 501, 0o777, 501)
+            .unwrap_err()
+            .to_string()
+            .contains("writable by other users"));
+        assert!(validate_ancestor_permissions(path, 0, 0o777, 501).is_err());
+        assert!(validate_ancestor_permissions(path, 501, 0o1777, 501).is_err());
+        assert!(validate_ancestor_permissions(path, 0, 0o1777, 501).is_ok());
+        assert!(validate_ancestor_permissions(path, 501, 0o700, 501).is_ok());
+    }
+
+    #[test]
+    fn public_mount_inspection_and_planning_never_mount_an_empty_fixture() {
+        let (_root, path) = target();
+        assert!(list().is_ok());
+        assert!(plan(&profile(Protocol::Webdav), &path, &MountOptions::default()).is_ok());
+        assert!(unmount(&path, false)
+            .unwrap_err()
+            .to_string()
+            .contains("not an exact mounted volume"));
+        let network = record(&path, "//fixture@host/share", "smbfs");
+        let local = record(&path, "disk1s1", "apfs");
+        let filtered = network_mounts(vec![local, network]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].filesystem, "smbfs");
+    }
+
+    #[test]
     fn rejects_nonempty_symlink_and_public_mountpoints() {
         let (_root, path) = target();
         fs::write(path.join("data"), "do not hide me").unwrap();
@@ -1126,5 +1186,209 @@ mod tests {
         wrong_owner.info.owner = uid().wrapping_add(1);
         system.active.borrow_mut().push(wrong_owner);
         assert!(unmount_with(&system, &path, false).is_err());
+    }
+
+    #[test]
+    fn command_adapters_are_observable_without_running_mount_or_umount() {
+        fn inspected(command: &mut Command) -> Result<bool> {
+            let program = command.get_program().to_string_lossy();
+            let arguments = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if program == "/sbin/umount" {
+                assert!(arguments == ["/synthetic"] || arguments == ["-f", "/synthetic"]);
+            } else {
+                assert_eq!(program, "/sbin/mount");
+                assert!(command
+                    .get_envs()
+                    .any(|(name, value)| name == "RDRIVE_TEST_SECRET" && value.is_none()));
+            }
+            Ok(true)
+        }
+        let system = Native {
+            command_status: inspected,
+        };
+        let (_root, path) = target();
+        let plan = build_plan(
+            &profile(Protocol::Webdav),
+            &path,
+            "https://example.invalid/".into(),
+            &MountOptions::default(),
+        )
+        .unwrap();
+        assert!(system.run(&plan, None, Some("RDRIVE_TEST_SECRET")).unwrap());
+        let credentials = CredentialFile::new("synthetic", "private-fixture-only").unwrap();
+        assert!(system
+            .run(&plan, Some(&credentials), Some("RDRIVE_TEST_SECRET"))
+            .unwrap());
+        assert!(system.detach(Path::new("/synthetic"), false).unwrap());
+        assert!(system.detach(Path::new("/synthetic"), true).unwrap());
+        assert!(helper_status(&mut Command::new("/usr/bin/true")).unwrap());
+        assert!(!helper_status(&mut Command::new("/usr/bin/false")).unwrap());
+        assert!(helper_status(&mut Command::new("/rdrive-synthetic-missing-program")).is_err());
+    }
+
+    #[test]
+    fn additional_mountpoint_and_source_guards_preserve_existing_files() {
+        let (_root, path) = target();
+        assert!(absolute_path(Path::new("/")).is_err());
+        let percent = path.with_file_name("percent%name");
+        assert!(build_plan(
+            &profile(Protocol::Smb),
+            &percent,
+            "//host/share".into(),
+            &MountOptions::default()
+        )
+        .is_err());
+        let mut dav = profile(Protocol::Webdav);
+        dav.url = "https://example.test/no-trailing-slash".into();
+        assert!(source_for(&dav).unwrap().ends_with('/'));
+        let mut anonymous = profile(Protocol::Smb);
+        anonymous.username = None;
+        assert_eq!(source_for(&anonymous).unwrap(), "//server/test/subdir");
+        for input in ["%", "%0", "%xx", "%ff"] {
+            assert!(decode(input).is_err());
+        }
+        for (expected, actual) in [
+            ("invalid", "https://host/root"),
+            ("https://host/root", "invalid"),
+            ("https://host/%2f", "https://host/root"),
+        ] {
+            assert!(!source_matches(expected, actual, "webdav"));
+        }
+        assert!(!source_matches(
+            "//alice@host/share",
+            "//bob@host/share",
+            "smbfs"
+        ));
+        assert!(!source_matches(
+            "https://host/root",
+            "https://user:secret@host/root",
+            "webdav"
+        ));
+        let point = validate_mountpoint(&path).unwrap();
+        fs::write(path.join("appeared"), b"preserve").unwrap();
+        assert!(point.recheck().is_err());
+        assert!(mount(
+            &profile(Protocol::Smb),
+            &path,
+            &MountOptions::default(),
+            Some("synthetic")
+        )
+        .is_err());
+        assert_eq!(fs::read(path.join("appeared")).unwrap(), b"preserve");
+        let missing = path.join("missing");
+        assert!(mount(
+            &profile(Protocol::Webdav),
+            &missing,
+            &MountOptions {
+                no_prompt: true,
+                ..Default::default()
+            },
+            Some("synthetic")
+        )
+        .is_err());
+        assert!(mount(
+            &profile(Protocol::Webdav),
+            &missing,
+            &MountOptions::default(),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn failed_helper_and_nested_unmount_never_hide_unconfirmed_state() {
+        let (_root, path) = target();
+        let mut system = MockSystem::new(None);
+        system.helper_success = false;
+        assert!(mount_with(
+            &system,
+            &profile(Protocol::Webdav),
+            &path,
+            &MountOptions::default(),
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no volume"));
+        assert!(mount_with(
+            &system,
+            &profile(Protocol::Smb),
+            &path,
+            &MountOptions::default(),
+            Some("synthetic")
+        )
+        .is_err());
+        system
+            .active
+            .borrow_mut()
+            .push(record(&path, "//test@server/test", "smbfs"));
+        system.active.borrow_mut().push(record(
+            &path.join("nested"),
+            "//test@server/other",
+            "smbfs",
+        ));
+        assert!(unmount_with(&system, &path, false)
+            .unwrap_err()
+            .to_string()
+            .contains("nested"));
+        assert!(system.forced.borrow().is_empty());
+        system
+            .active
+            .borrow_mut()
+            .retain(|entry| entry.info.mountpoint == path);
+        system.detach_success = false;
+        assert!(unmount_with(&system, &path, true)
+            .unwrap_err()
+            .to_string()
+            .contains("remains"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kernel_snapshot_failures_and_churn_are_tested_with_synthetic_records() {
+        assert!(kernel_mounts_with(|_, _, _| -1).is_err());
+        assert!(
+            kernel_mounts_with(|records, _, _| if records.is_null() { 0 } else { -1 }).is_err()
+        );
+        assert!(
+            kernel_mounts_with(|records, bytes, _| if records.is_null() {
+                0
+            } else {
+                bytes / (std::mem::size_of::<libc::statfs>() as i32)
+            })
+            .is_err()
+        );
+        let malformed = |kind: u8| {
+            kernel_mounts_with(|records, _, _| {
+                if records.is_null() {
+                    return 1;
+                }
+                let mut record: libc::statfs = unsafe { std::mem::zeroed() };
+                for (field, text) in [
+                    (&mut record.f_fstypename[..], b"smbfs".as_slice()),
+                    (&mut record.f_mntfromname[..], b"//host/share".as_slice()),
+                    (&mut record.f_mntonname[..], b"/synthetic".as_slice()),
+                ] {
+                    for (out, value) in field.iter_mut().zip(text) {
+                        *out = *value as libc::c_char;
+                    }
+                }
+                if kind == 1 {
+                    record.f_fstypename.fill(1);
+                } else if kind == 2 {
+                    record.f_mntfromname[0] = 255_u8 as libc::c_char;
+                }
+                unsafe { *records = record };
+                1
+            })
+        };
+        assert!(malformed(1).is_err());
+        assert!(malformed(2).is_err());
+        let valid = malformed(0).unwrap();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].info.mountpoint, Path::new("/synthetic"));
     }
 }

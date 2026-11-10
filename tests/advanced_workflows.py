@@ -12,7 +12,9 @@ import os
 from pathlib import Path
 import plistlib
 import posixpath
+import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -495,12 +497,16 @@ def main():
                 # Simulate a crash between the successful immutable commit and
                 # response journaling. The old delete must reconcile its own
                 # transaction even after a new file appears at the same path.
-                journal_path = Path(environment()["RDRIVE_HOME"]) / "provider" / (hashlib.sha256(b"advanced-managed").hexdigest() + ".json")
-                journal = json.loads(journal_path.read_bytes())
-                pending = [value for key, value in journal["requests"].items() if key.endswith(":" + deletion["request_id"])]
-                assert len(pending) == 1 and pending[0]["transaction"] and pending[0]["response"] is not None
-                pending[0]["response"] = None
-                journal_path.write_text(json.dumps(journal), encoding="utf-8")
+                journal_path = Path(environment()["RDRIVE_HOME"]) / "provider" / (hashlib.sha256(b"advanced-managed").hexdigest() + ".sqlite3")
+                # The authoritative journal moved to SQLite in 0.8. Fault the
+                # receipt in one transaction, preserving the actual namespace
+                # rows and other control state rather than a retired JSON file.
+                with sqlite3.connect(journal_path) as database:
+                    journal = json.loads(database.execute("SELECT control_json FROM meta WHERE id=1").fetchone()[0])
+                    pending = [value for key, value in journal["requests"].items() if key.endswith(":" + deletion["request_id"])]
+                    assert len(pending) == 1 and pending[0]["transaction"] and pending[0]["response"] is not None
+                    pending[0]["response"] = None
+                    database.execute("UPDATE meta SET control_json=? WHERE id=1", (json.dumps(journal),))
                 replacement_source = root / "delete-replacement"
                 replacement_source.write_bytes(b"a distinct replacement must survive delete replay")
                 replacement_tx = cli("repo", "begin", "test", "repo", home="b")["id"]
@@ -561,8 +567,9 @@ def main():
                 second = request(descriptor, op="list", domain="advanced-raw", parent_id="root")["items"]
                 assert len(second) == 2 and len({item["id"] for item in second}) == 2
                 assert next(item for item in second if item["name"] == "a")["id"] == first[0]["id"]
-                process.terminate()
+                process.send_signal(signal.SIGINT)
                 stdout, stderr = process.communicate(timeout=10)
+                assert process.returncode == 0, "provider did not exit cleanly after SIGINT"
                 assert b"fixture-password" not in stdout + stderr and descriptor["token"].encode() not in stdout + stderr
 
             group("authenticated provider IPC: lazy fetch, concurrent callbacks, CRUD/replay, collision/delete recovery and snapshot races", provider_workflows)
@@ -572,7 +579,7 @@ def main():
         finally:
             for process in processes:
                 if process.poll() is None:
-                    process.terminate()
+                    process.send_signal(signal.SIGINT)
                     try:
                         process.communicate(timeout=5)
                     except subprocess.TimeoutExpired:

@@ -824,4 +824,10 @@ mod tests {
         policy.enabled = false;
         assert!(next_directory(&j, &requests, &policy, NOW + 1).is_none());
     }
+    #[test]
+    fn excluded_directory_is_not_scheduled_even_when_explicitly_demanded() {
+        let mut journal=journal();directory(&mut journal,"excluded","excluded","root");let mut settings=policy();settings.enabled=false;
+        assert_eq!(next_directory_where(&journal,&[demand("excluded","excluded",NOW)],&settings,NOW,|path,_|path!="excluded").as_deref(),Some("root"),"root initialization remains available while the excluded child is skipped");
+    }
+
 }

@@ -286,19 +286,9 @@ async fn prepare(
         let attrs = node.metadata.as_ref().map(extended).unwrap_or_default();
         let item = Item {
             id: ids[&path].clone(),
-            parent_id: if parent.is_empty() {
-                "root".into()
-            } else {
-                ids.get(parent)
-                    .cloned()
-                    .or_else(|| {
-                        j.items
-                            .values()
-                            .find(|r| r.path == parent)
-                            .map(|r| r.item.id.clone())
-                    })
-                    .context("namespace parent missing")?
-            },
+            // New records are strict descendants: tree() lists each direct
+            // parent before descending, and ids contains the whole manifest.
+            parent_id: ids.get(parent).cloned().context("namespace parent missing")?,
             name: path.rsplit('/').next().unwrap().into(),
             kind: if node.entry.is_dir {
                 "directory"
@@ -309,7 +299,7 @@ async fn prepare(
             size: node.entry.size,
             modified: None,
             content_version: version(&node.entry)?,
-            metadata_version: metadata_version(&path, &tags, &attrs, false)?,
+            metadata_version: metadata_version(&path, &tags, &attrs, false),
             pinned: false,
             capabilities: capabilities(node.entry.is_dir),
             tag_data_hex: tags,
@@ -420,7 +410,7 @@ async fn migrate(
                 &record.item.tag_data_hex,
                 &record.item.extended_attributes,
                 record.item.pinned,
-            )?;
+            );
             next.insert(record.item.id.clone(), record);
         }
     }
@@ -622,4 +612,41 @@ fn complete(
 
 pub(super) fn recovery(j: &Journal) -> Value {
     json!(j.requests.iter().filter_map(|(id,p)|p.namespace.as_ref().filter(|plan|plan.deleted||plan.phase!="complete").map(|plan|json!({"id":id,"source":plan.from,"recovery_path":plan.to,"phase":plan.phase,"recoverable":true,"space_reclaimed":false}))).collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::coverage_tests::{setup,entry,Tree};
+    use std::sync::{Mutex,atomic::{AtomicBool,Ordering}};
+    fn fixture()->(tempfile::TempDir,Store,Domain,Journal,Tree,Request) {
+        let (temp,store,domain)=setup();let mut journal=checked_journal(&store.home,&store.config,&domain).unwrap();let source=entry("folder",true);
+        let mut item=root_item(&domain);item.id="folder".into();item.name="folder".into();item.content_version=version(&source).unwrap();
+        journal.items.insert("folder".into(),Record{path:"folder".into(),item,entry:Some(source.clone()),strong:None,client_id:None,metadata_known:false,metadata_checked:0});
+        let tree=Tree{entries:Mutex::new(vec![source,entry("folder/sub",true),entry("folder/sub/file",false)]),unsafe_listing:AtomicBool::new(false)};
+        let request=serde_json::from_value(json!({"v":1,"op":"modify","domain":domain.id,"id":"folder","request_id":"rename","name":"renamed"})).unwrap();(temp,store,domain,journal,tree,request)
+    }
+    #[tokio::test]
+    async fn unopened_descendants_get_stable_ids_and_survive_guarded_namespace_projection() {
+        let (_temp,store,domain,mut journal,tree,request)=fixture();let plan=prepare(&store,&tree,&domain,&mut journal,&request).await.unwrap();
+        assert_eq!(plan.records.len(),3);assert_eq!(plan.records[0].item.id,"folder");assert_eq!(plan.nodes.len(),3);
+        for record in tree.entries.lock().unwrap().iter_mut(){record.path=record.path.replacen("folder","renamed",1);}
+        let actual=verify(&tree,&domain,&plan).await.unwrap();migrate(&store,&tree,&domain,&mut journal,&plan,&actual,&request).await.unwrap();
+        assert_eq!(journal.items.len(),3);assert_eq!(journal.items["folder"].path,"renamed");
+        assert!(journal.items.values().any(|record|record.path=="renamed/sub/file"&&record.item.kind=="file"));
+        tree.entries.lock().unwrap().pop();assert!(verify(&tree,&domain,&plan).await.unwrap_err().to_string().contains("subtree changed"));
+        tree.entries.lock().unwrap().push(entry("renamed/sub/file",false));tree.entries.lock().unwrap().last_mut().unwrap().size=99;
+        assert!(verify(&tree,&domain,&plan).await.is_err());
+    }
+    #[tokio::test]
+    async fn namespace_preparation_rejects_invalid_moves_attributes_and_stale_observations() {
+        let (_temp,store,domain,mut journal,tree,request)=fixture();
+        let mut invalid=request.clone();invalid.content_path=Some("not-opened".into());assert!(prepare(&store,&tree,&domain,&mut journal,&invalid).await.unwrap_err().to_string().contains("directory contents"));
+        let mut invalid=request.clone();invalid.op="delete".into();assert!(prepare(&store,&tree,&domain,&mut journal,&invalid).await.unwrap_err().to_string().contains("recursive"));
+        let mut invalid=request.clone();invalid.name=Some("folder".into());assert!(prepare(&store,&tree,&domain,&mut journal,&invalid).await.unwrap_err().to_string().contains("same item"));
+        tree.unsafe_listing.store(true,Ordering::SeqCst);assert!(prepare(&store,&tree,&domain,&mut journal,&request).await.unwrap_err().to_string().contains("unsafe namespace"));tree.unsafe_listing.store(false,Ordering::SeqCst);
+        let mut stale=journal.items["folder"].entry.clone().unwrap();stale.etag=Some("changed".into());journal.items.get_mut("folder").unwrap().entry=Some(stale);
+        assert!(prepare(&store,&tree,&domain,&mut journal,&request).await.unwrap_err().to_string().contains("source changed since enumeration"));
+        assert!(revision(&tree,"missing",false).await.is_err());assert!(mapped("outside","folder","renamed").is_err());
+    }
 }

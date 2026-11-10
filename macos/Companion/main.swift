@@ -8,13 +8,13 @@ func printJSON(_ value: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), let string = String(data: data, encoding: .utf8) { print(string) }
 }
 
-func option(_ name: String) -> String? {
-    guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
-    return CommandLine.arguments[index + 1]
+func option(_ name: String, arguments: [String] = CommandLine.arguments) -> String? {
+    guard let index = arguments.firstIndex(of: name), index + 1 < arguments.count else { return nil }
+    return arguments[index + 1]
 }
 
-func configuredPaths() throws -> NativePaths {
-    if let path = option("--group-directory") {
+func configuredPaths(arguments: [String] = CommandLine.arguments, bundle: Bundle = .main) throws -> NativePaths {
+    if let path = option("--group-directory", arguments: arguments) {
         let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         guard path.hasPrefix("/"), FileManager.default.fileExists(atPath: url.path) else {
             throw NativeFailure.invalid("The explicit development group directory must already exist.")
@@ -25,20 +25,20 @@ func configuredPaths() throws -> NativePaths {
         }
         return NativePaths(group: url, development: true)
     }
-    if let development = Bundle.main.object(forInfoDictionaryKey: "RDriveDevelopmentIPCRoot") as? String,
+    if let development = bundle.object(forInfoDictionaryKey: "RDriveDevelopmentIPCRoot") as? String,
        !FileManager.default.fileExists(atPath: development) {
         try FileManager.default.createDirectory(atPath: development, withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700])
     }
-    return try NativePaths.configured()
+    return try NativePaths.configured(bundle: bundle)
 }
 
-func runUntil(_ invoke: (@escaping (Error?) -> Void) -> Void) -> Int32 {
+func runUntil(timeout: TimeInterval = 30, _ invoke: (@escaping (Error?) -> Void) -> Void) -> Int32 {
     let lock = NSLock()
     var finished = false
     var failure: Error?
     invoke { error in lock.lock(); failure = error; finished = true; lock.unlock() }
-    let deadline = Date(timeIntervalSinceNow: 30)
+    let deadline = Date(timeIntervalSinceNow: timeout)
     while true {
         lock.lock(); let done = finished; lock.unlock()
         if done { break }
@@ -56,69 +56,122 @@ func runUntil(_ invoke: (@escaping (Error?) -> Void) -> Void) -> Int32 {
     return 0
 }
 
-func controlCommand() -> Int32? {
-    if CommandLine.arguments.contains("--watch-domains") {
-        do {
-            let bridge = BackendBridge(paths: try configuredPaths())
-            _ = try bridge.request(["op": "domains"])
-            let watcher = NativeDomainWatcher(bridge: bridge)
-            var running = true
+/// The control parser uses the same OS defaults in production and narrow
+/// boundaries in host tests; no command is acknowledged before its callback.
+struct CompanionControlIntegration {
+    var paths: ([String]) throws -> NativePaths
+    var system: NativeSystemManaging
+    var addDomain: (NSFileProviderDomain, @escaping (Error?) -> Void) -> Void
+    var removeDomain: (NSFileProviderDomain, @escaping (URL?, Error?) -> Void) -> Void
+    var identify: (URL, @escaping (NSFileProviderItemIdentifier?, NSFileProviderDomainIdentifier?, Error?) -> Void) -> Void
+    var finderEnabled: () -> Bool
+    var enableFinder: () -> Void
+    var setTags: (URL, [String]) throws -> Void
+    var budget: (BackendBridge, String) -> NativeMaterializationBudget
+    var watch: (BackendBridge) -> Int32
+
+    static var live: CompanionControlIntegration {
+        CompanionControlIntegration(
+            paths: { try configuredPaths(arguments: $0) }, system: NativeSystemManager(),
+            addDomain: { NSFileProviderManager.add($0, completionHandler: $1) },
+            removeDomain: { NSFileProviderManager.remove($0, mode: .preserveDownloadedUserData, completionHandler: $1) },
+            identify: { NSFileProviderManager.getIdentifierForUserVisibleFile(at: $0, completionHandler: $1) },
+            finderEnabled: { FIFinderSyncController.isExtensionEnabled },
+            enableFinder: { FIFinderSyncController.showExtensionManagementInterface() },
+            setTags: { url, names in
+                var coordinationError: NSError?
+                var failure: Error?
+                NSFileCoordinator().coordinate(writingItemAt: url, options: .contentIndependentMetadataOnly, error: &coordinationError) { coordinated in
+                    do { try (coordinated as NSURL).setResourceValue(names, forKey: .tagNamesKey) }
+                    catch { failure = error }
+                }
+                if let error = failure ?? coordinationError { throw error }
+            },
+            budget: { NativeMaterializationBudget(bridge: $0, domain: $1) },
+            watch: { watchDomains($0) })
+    }
+}
+
+struct CompanionWatchIntegration {
+    var signals: (@escaping () -> Void) -> [DispatchSourceSignal]
+    var timer: (@escaping () -> Void) -> Timer
+    var wait: () -> Void
+    static var live: CompanionWatchIntegration {
+        CompanionWatchIntegration(signals: { stop in
             var sources: [DispatchSourceSignal] = []
             for number in [SIGINT, SIGTERM] {
                 Darwin.signal(number, SIG_IGN)
                 let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-                source.setEventHandler { running = false }
+                source.setEventHandler(handler: stop)
                 source.resume(); sources.append(source)
             }
-            let timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in watcher.poll() }
-            watcher.poll()
-            printJSON(["ok": true, "event": "native_watcher_started"])
-            while running { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1)) }
-            timer.invalidate(); sources.forEach { $0.cancel() }; watcher.stop()
-            printJSON(["ok": true, "event": "native_watcher_stopped"])
-            return 0
+            return sources
+        }, timer: { tick in Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in tick() } },
+        wait: { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1)) })
+    }
+}
+
+func watchDomains(_ bridge: BackendBridge, system: NativeSystemManaging = NativeSystemManager(), integration: CompanionWatchIntegration = .live) -> Int32 {
+    let watcher = NativeDomainWatcher(bridge: bridge, system: system)
+    var running = true
+    let sources = integration.signals { running = false }
+    let timer = integration.timer { watcher.poll() }
+    watcher.poll()
+    printJSON(["ok": true, "event": "native_watcher_started"])
+    while running { integration.wait() }
+    timer.invalidate(); sources.forEach { $0.cancel() }; watcher.stop()
+    printJSON(["ok": true, "event": "native_watcher_stopped"])
+    return 0
+}
+
+func controlCommand(arguments: [String] = CommandLine.arguments, integration: CompanionControlIntegration = .live) -> Int32? {
+    if arguments.contains("--watch-domains") {
+        do {
+            let bridge = BackendBridge(paths: try integration.paths(arguments))
+            _ = try bridge.request(["op": "domains"])
+            return integration.watch(bridge)
         } catch { printJSON(["ok": false, "error": String(describing: error)]); return 1 }
     }
-    if CommandLine.arguments.contains("--diagnose") {
-        var report: [String: Any] = ["ok": true, "bundle_id": Bundle.main.bundleIdentifier ?? "", "finder_enabled": FIFinderSyncController.isExtensionEnabled]
-        do { report["group_directory"] = try configuredPaths().group.path }
+    if arguments.contains("--diagnose") {
+        var report: [String: Any] = ["ok": true, "bundle_id": Bundle.main.bundleIdentifier ?? "", "finder_enabled": integration.finderEnabled()]
+        do { report["group_directory"] = try integration.paths(arguments).group.path }
         catch { report["group_error"] = String(describing: error) }
         printJSON(report)
         return 0
     }
-    if CommandLine.arguments.contains("--list-domains") {
+    if arguments.contains("--list-domains") {
         return runUntil { done in
-            NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
+            integration.system.domains { domains, error in
                 if error == nil { printJSON(["ok": true, "domains": domains.map { ["id": $0.identifier.rawValue, "display_name": $0.displayName] }]) }
                 done(error)
             }
         }
     }
-    if let limitString = option("--trim-cache") {
+    if let limitString = option("--trim-cache", arguments: arguments) {
         guard let limit = UInt64(limitString) else { printJSON(["ok": false, "error": "Pass a nonnegative cache byte limit."]); return 2 }
         return runUntil { done in
             DispatchQueue.global(qos: .utility).async {
                 do {
-                    let bridge = try BackendBridge(paths: configuredPaths())
-                    try NativeMaterializationBudget(bridge: bridge, domain: "").trim(to: limit)
+                    let bridge = try BackendBridge(paths: integration.paths(arguments))
+                    try integration.budget(bridge, "").trim(to: limit)
                     printJSON(["ok": true, "trimmed_to_max_total_bytes": limit]); done(nil)
                 } catch { done(error) }
             }
         }
     }
     for action in ["--pin", "--unpin", "--check-cache"] {
-        if let identifier = option(action) {
-            guard let index = CommandLine.arguments.firstIndex(of: action), index + 2 < CommandLine.arguments.count else {
+        if let identifier = option(action, arguments: arguments) {
+            guard let index = arguments.firstIndex(of: action), index + 2 < arguments.count else {
                 printJSON(["ok": false, "error": "An item identifier is required."]); return 2
             }
-            let id = CommandLine.arguments[index + 2]
+            let id = arguments[index + 2]
             return runUntil { done in
                 DispatchQueue.global(qos: .utility).async {
                     var reservation: [String]?
                     var budget: NativeMaterializationBudget?
                     do {
-                        let bridge = BackendBridge(paths: try configuredPaths())
-                        let activeBudget = NativeMaterializationBudget(bridge: bridge, domain: identifier); budget = activeBudget
+                        let bridge = BackendBridge(paths: try integration.paths(arguments))
+                        let activeBudget = integration.budget(bridge, identifier); budget = activeBudget
                         if action != "--unpin" {
                             let item = try bridge.item(["op": "item", "domain": identifier, "id": id])
                             reservation = try activeBudget.reserve(item, pin: action == "--pin", operation: nil)
@@ -126,127 +179,185 @@ func controlCommand() -> Int32? {
                         if action == "--check-cache" { activeBudget.release(reservation); printJSON(["ok": true, "cache_preflight": true]); done(nil); return }
                         _ = try bridge.request(["op": "pin", "domain": identifier, "id": id, "pinned": action == "--pin"])
                         let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: identifier)
-                        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
+                        integration.system.manager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
                         printJSON(["ok": true, "action": action, "domain": identifier, "id": id]); done(nil)
                     } catch { budget?.release(reservation); done(error) }
                 }
             }
         }
     }
-    if let identifier = option("--register-domain") {
-        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: option("--display-name") ?? identifier)
+    if let identifier = option("--register-domain", arguments: arguments) {
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: option("--display-name", arguments: arguments) ?? identifier)
         return runUntil { done in
-            NSFileProviderManager.add(domain) { error in
+            integration.addDomain(domain) { error in
                 if error == nil { printJSON(["ok": true, "registered_domain": identifier]) }
                 done(error)
             }
         }
     }
-    if let identifier = option("--remove-domain") {
+    if let identifier = option("--remove-domain", arguments: arguments) {
         let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: identifier)
         return runUntil { done in
-            NSFileProviderManager.remove(domain, mode: .preserveDownloadedUserData) { preserved, error in
+            integration.removeDomain(domain) { preserved, error in
                 if error == nil { printJSON(["ok": true, "removed_domain": identifier, "preserved_location": preserved?.path ?? ""]) }
                 done(error)
             }
         }
     }
-    if let identifier = option("--domain-root") {
+    if let identifier = option("--domain-root", arguments: arguments) {
         let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: identifier)
         return runUntil { done in
-            guard let manager = NSFileProviderManager(for: domain) else { done(NativeFailure.invalid("The domain manager is unavailable.")); return }
+            guard let manager = integration.system.manager(for: domain) else { done(NativeFailure.invalid("The domain manager is unavailable.")); return }
             manager.getUserVisibleURL(for: .rootContainer) { url, error in
                 if error == nil { printJSON(["ok": true, "path": url?.path ?? ""]) }
                 done(error)
             }
         }
     }
-    if let path = option("--resolve-file") {
+    if let path = option("--resolve-file", arguments: arguments) {
         return runUntil { done in
-            NSFileProviderManager.getIdentifierForUserVisibleFile(at: URL(fileURLWithPath: path)) { item, domain, error in
+            integration.identify(URL(fileURLWithPath: path)) { item, domain, error in
                 if error == nil { printJSON(["ok": true, "id": item.map(wireID) ?? "", "domain": domain?.rawValue ?? ""]) }
                 done(error)
             }
         }
     }
-    if let path = option("--set-tags"), let index = CommandLine.arguments.firstIndex(of: "--set-tags") {
-        let names = Array(CommandLine.arguments.dropFirst(index + 2))
-        var coordinationError: NSError?
-        var failure: Error?
-        NSFileCoordinator().coordinate(writingItemAt: URL(fileURLWithPath: path), options: .contentIndependentMetadataOnly, error: &coordinationError) { coordinated in
-            do {
-                try (coordinated as NSURL).setResourceValue(names, forKey: .tagNamesKey)
-            } catch { failure = error }
-        }
-        if let error = failure ?? coordinationError { printJSON(["ok": false, "error": (error as NSError).localizedDescription]); return 1 }
+    if let path = option("--set-tags", arguments: arguments), let index = arguments.firstIndex(of: "--set-tags") {
+        let names = Array(arguments.dropFirst(index + 2))
+        do { try integration.setTags(URL(fileURLWithPath: path), names) }
+        catch { printJSON(["ok": false, "error": (error as NSError).localizedDescription]); return 1 }
         printJSON(["ok": true, "tags": names]); return 0
     }
     for action in ["--signal", "--download", "--evict"] {
-        if let identifier = option(action) {
+        if let identifier = option(action, arguments: arguments) {
             let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: identifier)
             return runUntil { done in
-                guard let manager = NSFileProviderManager(for: domain) else { done(NativeFailure.invalid("The domain manager is unavailable.")); return }
+                guard let manager = integration.system.manager(for: domain) else { done(NativeFailure.invalid("The domain manager is unavailable.")); return }
                 let complete: (Error?) -> Void = { error in
                     if error == nil { printJSON(["ok": true, "action": action, "domain": identifier]) }
                     done(error)
                 }
                 if action == "--signal" { manager.signalEnumerator(for: .workingSet, completionHandler: complete); return }
-                guard let index = CommandLine.arguments.firstIndex(of: action), index + 2 < CommandLine.arguments.count else {
+                guard let index = arguments.firstIndex(of: action), index + 2 < arguments.count else {
                     done(NativeFailure.invalid("An item identifier is required.")); return
                 }
-                let item = providerID(CommandLine.arguments[index + 2])
+                let item = providerID(arguments[index + 2])
                 if action == "--download" { manager.requestDownloadForItem(withIdentifier: item, completionHandler: complete) }
                 else { manager.evictItem(identifier: item, completionHandler: complete) }
             }
         }
     }
-    if CommandLine.arguments.contains("--enable-finder") {
-        FIFinderSyncController.showExtensionManagementInterface()
+    if arguments.contains("--enable-finder") {
+        integration.enableFinder()
         printJSON(["ok": true, "opened_extension_settings": true])
         return 0
     }
     let allowedGUI = Set(["--group-directory", "--show-status", "--show-message"])
-    if let unknown = CommandLine.arguments.dropFirst().first(where: { $0.hasPrefix("--") && !allowedGUI.contains($0) }) {
+    if let unknown = arguments.dropFirst().first(where: { $0.hasPrefix("--") && !allowedGUI.contains($0) }) {
         printJSON(["ok": false, "error": "Unknown native control option: " + unknown]); return 2
     }
     return nil
 }
 
+protocol CompanionProcessManaging: AnyObject {
+    var isRunning: Bool { get }
+    var processIdentifier: Int32 { get }
+    func launch(executable: URL?, arguments: [String]) throws
+}
+final class NativeCompanionProcess: CompanionProcessManaging {
+    private let process = Process()
+    var isRunning: Bool { process.isRunning }
+    var processIdentifier: Int32 { process.processIdentifier }
+    func launch(executable: URL?, arguments: [String]) throws {
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+}
+
+struct CompanionHostIntegration {
+    var arguments: [String]
+    var paths: () throws -> NativePaths
+    var bridge: (NativePaths) -> BackendBridge
+    var watcher: (BackendBridge) -> NativeDomainWatcher
+    var request: (BackendBridge, [String: Any]) throws -> [String: Any]
+    var configureStatus: (NSMenu) -> NSStatusItem?
+    var process: () -> CompanionProcessManaging
+    var serviceURL: () -> URL?
+    var home: () -> String?
+    var interrupt: (Int32) -> Void
+    var timer: (TimeInterval, @escaping () -> Void) -> Timer
+    var after: (@escaping () -> Void) -> Void
+    var addDomain: (NSFileProviderDomain, @escaping (Error?) -> Void) -> Void
+    var message: (String) -> Void
+    var enableFinder: () -> Void
+    var openStorage: () -> Void
+    var quit: () -> Void
+
+    static var live: CompanionHostIntegration {
+        CompanionHostIntegration(arguments: CommandLine.arguments,
+            paths: { try configuredPaths() }, bridge: { BackendBridge(paths: $0) },
+            watcher: { NativeDomainWatcher(bridge: $0) }, request: { try $0.request($1) },
+            configureStatus: { menu in
+                NSApp.setActivationPolicy(.accessory)
+                let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                status.button?.image = NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: "RDrive")
+                status.menu = menu
+                return status
+            }, process: { NativeCompanionProcess() },
+            serviceURL: { Bundle.main.resourceURL?.appendingPathComponent("rdrive") },
+            home: { ProcessInfo.processInfo.environment["RDRIVE_HOME"] },
+            interrupt: { _ = Darwin.kill($0, SIGINT) },
+            timer: { interval, tick in Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in tick() } },
+            after: { DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: $0) },
+            addDomain: { NSFileProviderManager.add($0, completionHandler: $1) },
+            message: { text in
+                let alert = NSAlert(); alert.messageText = "RDrive"; alert.informativeText = text
+                alert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }, enableFinder: { FIFinderSyncController.showExtensionManagementInterface() },
+            openStorage: { NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")) },
+            quit: { NSApp.terminate(nil) })
+    }
+}
+
 final class CompanionDelegate: NSObject, NSApplicationDelegate {
     private var status: NSStatusItem?
-    private var service: Process?
+    private var service: CompanionProcessManaging?
     private let serviceLock = NSLock()
     private var terminating = false
     private var bridge: BackendBridge?
     private var refresh: Timer?
     private var catalogRefresh: Timer?
     private var watcher: NativeDomainWatcher?
-    private let menu = NSMenu()
+    let menu = NSMenu()
+    let integration: CompanionHostIntegration
+    init(integration: CompanionHostIntegration = .live) { self.integration = integration; super.init() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        status?.button?.image = NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: "RDrive")
-        status?.menu = menu
+        status = integration.configureStatus(menu)
         do {
-            let paths = try configuredPaths()
+            let paths = try integration.paths()
             try paths.prepare()
-            bridge = BackendBridge(paths: paths)
-            watcher = NativeDomainWatcher(bridge: bridge!)
+            bridge = integration.bridge(paths)
+            watcher = integration.watcher(bridge!)
             startService(paths)
             rebuildMenu()
-            refresh = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.rebuildMenu() }
-            catalogRefresh = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.watcher?.poll() }
+            refresh = integration.timer(15) { [weak self] in self?.rebuildMenu() }
+            catalogRefresh = integration.timer(3) { [weak self] in self?.watcher?.poll() }
         } catch {
             menu.addItem(withTitle: "Connection unavailable", action: nil, keyEquivalent: "")
             menu.addItem(withTitle: "Quit RDrive", action: #selector(quit), keyEquivalent: "q").target = self
             showMessage((error as NSError).localizedDescription)
         }
-        if let domain = option("--show-status"),
-           let index = CommandLine.arguments.firstIndex(of: "--show-status"), index + 2 < CommandLine.arguments.count {
-            showStatus(domain: domain, id: CommandLine.arguments[index + 2])
+        if let domain = option("--show-status", arguments: integration.arguments),
+           let index = integration.arguments.firstIndex(of: "--show-status"), index + 2 < integration.arguments.count {
+            showStatus(domain: domain, id: integration.arguments[index + 2])
         }
-        if let message = option("--show-message") { showMessage(message) }
+        if let message = option("--show-message", arguments: integration.arguments) { showMessage(message) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -254,7 +365,7 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         catalogRefresh?.invalidate()
         watcher?.stop()
         serviceLock.lock(); terminating = true; let owned = service; serviceLock.unlock()
-        if let owned = owned, owned.isRunning { _ = Darwin.kill(owned.processIdentifier, SIGINT) }
+        if let owned = owned, owned.isRunning { integration.interrupt(owned.processIdentifier) }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -266,28 +377,24 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startService(_ paths: NativePaths) {
+    func startService(_ paths: NativePaths) {
         DispatchQueue.global(qos: .utility).async {
-            if (try? self.bridge?.request(["op": "domains"])) != nil { return }
-            let process = Process()
-            process.executableURL = Bundle.main.resourceURL?.appendingPathComponent("rdrive")
+            if let bridge = self.bridge, (try? self.integration.request(bridge, ["op": "domains"])) != nil { return }
+            let process = self.integration.process()
             var arguments = ["provider", "serve", "--socket", paths.socket.path, "--staging", paths.transfers.path]
             if paths.development { arguments += ["--development-tcp"] }
-            if let home = ProcessInfo.processInfo.environment["RDRIVE_HOME"] { arguments += ["--home", home] }
-            process.arguments = arguments
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            if let home = self.integration.home() { arguments += ["--home", home] }
             do {
                 self.serviceLock.lock(); defer { self.serviceLock.unlock() }
                 if self.terminating { return }
-                try process.run(); self.service = process
+                try process.launch(executable: self.integration.serviceURL(), arguments: arguments); self.service = process
             }
             catch { DispatchQueue.main.async { self.showMessage("RDrive could not start its connection service.") } }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.rebuildMenu() }
+            self.integration.after { self.rebuildMenu() }
         }
     }
 
-    private func rebuildMenu() {
+    func rebuildMenu() {
         menu.removeAllItems()
         menu.addItem(withTitle: "RDrive Connections", action: nil, keyEquivalent: "")
         let connections = NSMenu(title: "Add Connection to Finder")
@@ -295,7 +402,7 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         let parent = NSMenuItem(title: "Add Connection to Finder", action: nil, keyEquivalent: "")
         parent.submenu = connections; menu.addItem(parent)
         DispatchQueue.global(qos: .utility).async {
-            let reply = try? self.bridge?.request(["op": "domains"])
+            let reply = self.bridge.flatMap { try? self.integration.request($0, ["op": "domains"]) }
             DispatchQueue.main.async {
                 connections.removeAllItems()
                 if let domains = reply?["domains"] as? [[String: Any]] {
@@ -317,20 +424,20 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         updateRoots()
     }
 
-    @objc private func addDomain(_ sender: NSMenuItem) {
+    @objc func addDomain(_ sender: NSMenuItem) {
         guard let value = sender.representedObject as? [String: Any], let id = value["id"] as? String else { return }
         let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(id), displayName: value["display_name"] as? String ?? id)
-        NSFileProviderManager.add(domain) { error in
+        integration.addDomain(domain) { error in
             DispatchQueue.main.async {
                 if let error = error { self.showMessage(error.localizedDescription) }
                 else { self.updateRoots() }
             }
         }
     }
-    private func updateRoots() {
+    func updateRoots() {
         guard let bridge = bridge else { return }
         DispatchQueue.global(qos: .utility).async {
-            guard let reply = try? bridge.request(["op": "domains"]), let domains = reply["domains"] as? [[String: Any]] else { return }
+            guard let reply = try? self.integration.request(bridge, ["op": "domains"]), let domains = reply["domains"] as? [[String: Any]] else { return }
             // File Provider owns its native menus and decorations. Finder Sync
             // observes only explicitly mapped ordinary folders, avoiding two
             // extensions competing for the same CloudStorage namespace.
@@ -341,24 +448,24 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
             if let data = try? JSONEncoder().encode(roots) { try? data.write(to: bridge.paths.roots, options: .atomic) }
         }
     }
-    private func showStatus(domain: String, id: String) {
+    func showStatus(domain: String, id: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                guard let reply = try self.bridge?.request(["op": "status", "domain": domain, "id": id]) else { throw NativeFailure.bridge("RDrive is unavailable.") }
+                guard let bridge = self.bridge else { throw NativeFailure.bridge("RDrive is unavailable.") }
+                let reply = try self.integration.request(bridge, ["op": "status", "domain": domain, "id": id])
                 let state = reply["state"] as? String ?? "unknown"
                 let detail = reply["message"] as? String ?? ""
                 DispatchQueue.main.async { self.showMessage(state.capitalized + (detail.isEmpty ? "" : "\n\n" + detail)) }
             } catch { DispatchQueue.main.async { self.showMessage((error as NSError).localizedDescription) } }
         }
     }
-    private func showMessage(_ message: String) {
-        let alert = NSAlert(); alert.messageText = "RDrive"; alert.informativeText = message
-        alert.addButton(withTitle: "OK"); NSApp.activate(ignoringOtherApps: true); alert.runModal()
+    func showMessage(_ message: String) {
+        integration.message(message)
     }
-    @objc private func enableFinder() { FIFinderSyncController.showExtensionManagementInterface() }
-    @objc private func openStorage() { NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")) }
-    @objc private func refreshConnections() { rebuildMenu() }
-    @objc private func quit() { NSApp.terminate(nil) }
+    @objc func enableFinder() { integration.enableFinder() }
+    @objc func openStorage() { integration.openStorage() }
+    @objc func refreshConnections() { rebuildMenu() }
+    @objc func quit() { integration.quit() }
 }
 
 if let status = controlCommand() { exit(status) }

@@ -9,133 +9,9 @@ use tokio::{
     net::TcpListener,
 };
 
-async fn server(
-    responses: Vec<String>,
-) -> (
-    WebDav,
-    Arc<Mutex<Vec<Vec<u8>>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    server_configured(responses, false).await
-}
-async fn server_configured(
-    responses: Vec<String>,
-    nextcloud: bool,
-) -> (
-    WebDav,
-    Arc<Mutex<Vec<Vec<u8>>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let captured = requests.clone();
-    let task = tokio::spawn(async move {
-        for response in responses {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut data = Vec::new();
-            let mut buffer = [0u8; 4096];
-            let boundary = loop {
-                let count = socket.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "request closed before headers");
-                data.extend_from_slice(&buffer[..count]);
-                if let Some(index) = data.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break index + 4;
-                }
-                assert!(data.len() < 64 * 1024);
-            };
-            let headers = String::from_utf8_lossy(&data[..boundary]);
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':')
-                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            while data.len() < boundary + length {
-                let count = socket.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "request closed before body");
-                data.extend_from_slice(&buffer[..count]);
-            }
-            let response = if response.contains("{{request_path}}") {
-                let target = String::from_utf8_lossy(&data[..boundary])
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .to_owned();
-                let (head, body) = response.split_once("\r\n\r\n").unwrap();
-                let body = body.replace("{{request_path}}", &target);
-                let head = head
-                    .lines()
-                    .filter(|line| !line.to_lowercase().starts_with("content-length:"))
-                    .collect::<Vec<_>>()
-                    .join("\r\n");
-                format!("{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
-            } else {
-                response
-            };
-            captured.lock().unwrap().push(data);
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        }
-    });
-    let profile = Profile {
-        protocol: Protocol::Webdav,
-        url: format!("http://{address}/root/"),
-        username: Some("user".into()),
-        password_env: None,
-        allow_http: true,
-        timeout_secs: 5,
-        smb_encryption: true,
-        nextcloud_upload_url: nextcloud.then(|| format!("http://{address}/uploads/user/")),
-    };
-    (
-        WebDav::new(&profile, "test-secret").unwrap(),
-        requests,
-        task,
-    )
-}
-fn reply(status: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-fn entry_xml(path: &str, size: u64) -> String {
-    format!(
-        r#"<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/root/{path}</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>{size}</D:getcontentlength><D:getetag>&quot;revision-1&quot;</D:getetag><D:getlastmodified>Mon, 09 Nov 2026 08:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
-    )
-}
-fn resume_entry(size: u64) -> Entry {
-    Entry {
-        path: "file".into(),
-        is_dir: false,
-        size,
-        modified: None,
-        etag: Some("\"revision-1\"".into()),
-    }
-}
-fn range_reply(start: u64, end: u64, total: u64, body: &str) -> String {
-    format!("HTTP/1.1 206 Partial Content\r\nETag: \"revision-1\"\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", end - start + 1)
-}
-fn upload_metadata_xml(is_dir: bool, size: u64, etag: Option<&str>) -> String {
-    let kind = if is_dir { "<D:collection/>" } else { "" };
-    let etag = etag
-        .map(|etag| format!("<D:getetag>{}</D:getetag>", etag.replace('"', "&quot;")))
-        .unwrap_or_default();
-    format!(
-        r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>{{{{request_path}}}}</D:href><D:propstat><D:prop><D:resourcetype>{kind}</D:resourcetype><D:getcontentlength>{size}</D:getcontentlength>{etag}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
-    )
-}
-fn confirmed_put(etag: &str) -> String {
-    format!(
-        "HTTP/1.1 201 Created\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    )
-}
+#[path = "support/webdav.rs"]
+mod test_peer;
+use test_peer::*;
 
 #[tokio::test]
 async fn auth_error_is_never_interpreted_as_missing_resource() {
@@ -147,6 +23,131 @@ async fn auth_error_is_never_interpreted_as_missing_resource() {
     let request = String::from_utf8(requests.lock().unwrap()[0].clone()).unwrap();
     assert!(request.starts_with("PROPFIND /root/file HTTP/1.1\r\n"));
     assert!(request.to_lowercase().contains("authorization: basic "));
+}
+
+#[tokio::test]
+async fn invalid_directory_snapshots_are_rejected_instead_of_treated_as_empty() {
+    let row = |path: &str, props: &str, status: &str| format!(r#"<D:response><D:href>/root/{path}</D:href>{status}<D:propstat><D:prop>{props}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#);
+    let directory = "<D:resourcetype><D:collection/></D:resourcetype>";
+    let file = "<D:resourcetype/><D:getcontentlength>1</D:getcontentlength>";
+    let own = row("", directory, "");
+    let cases = [
+        (format!("{own}{}", row("gone", file, "<D:status>HTTP/1.1 404 Not Found</D:status>")), "missing child"),
+        (row("", directory, "<D:status>HTTP/1.1 500 Failed</D:status>"), "failed WebDAV resource"),
+        (row("", "<D:getcontentlength>1</D:getcontentlength>", ""), "omitted resource type"),
+        (format!("{own}{own}"), "duplicate WebDAV paths"),
+        (row("child", file, ""), "omitted the requested"),
+        (format!("{own}{}", row("nested/child", file, "")), "outside the requested directory"),
+        (row("", file, ""), "not a directory"),
+    ];
+    for (rows, message) in cases {
+        let xml = format!(r#"<D:multistatus xmlns:D="DAV:">{rows}</D:multistatus>"#);
+        let (backend, _, task) = server(vec![reply("207 Multi-Status", &xml)]).await;
+        assert!(backend.list("").await.unwrap_err().to_string().contains(message), "{message}");
+        task.await.unwrap();
+    }
+    let xml = format!(r#"<D:multistatus xmlns:D="DAV:">{}{}</D:multistatus>"#, row("file", file, ""), row("extra", file, ""));
+    let (backend, _, task) = server(vec![reply("207 Multi-Status", &xml)]).await;
+    assert!(backend.stat("file").await.unwrap_err().to_string().contains("Depth: 0")); task.await.unwrap();
+    let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/root/file</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response></D:multistatus>"#;
+    let (backend, _, task) = server(vec![reply("207 Multi-Status", xml)]).await;
+    assert!(backend.stat("file").await.unwrap().is_none()); task.await.unwrap();
+}
+
+#[tokio::test]
+async fn same_resource_slash_redirect_and_metadata_limits_are_enforced() {
+    let redirect = "HTTP/1.1 301 Moved Permanently\r\nLocation: /root/file/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into();
+    let (backend, requests, task) = server(vec![redirect, reply("207 Multi-Status", &entry_xml("file/", 3))]).await;
+    assert_eq!(backend.stat("file").await.unwrap().unwrap().size, 3); task.await.unwrap();
+    assert!(String::from_utf8_lossy(&requests.lock().unwrap()[1]).starts_with("PROPFIND /root/file/ "));
+    let (backend, _, task) = server(vec!["HTTP/1.1 207 Multi-Status\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n".into()]).await;
+    assert!(backend.stat("file").await.unwrap_err().to_string().contains("16 MiB")); task.await.unwrap();
+}
+
+#[tokio::test]
+async fn protected_mutation_preflight_and_server_errors_preserve_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let (backend, requests, task) = server(vec![]).await;
+    let file = root.join("file"); std::fs::write(&file, b"abc").unwrap();
+    assert!(backend.upload(&file, "", WriteCondition::CreateNew).await.is_err());
+    assert!(backend.upload(&root, "file", WriteCondition::CreateNew).await.unwrap_err().to_string().contains("regular file"));
+    assert!(backend.upload(&file, "other", WriteCondition::Match(resume_entry(3))).await.unwrap_err().to_string().contains("revision belongs"));
+    assert!(backend.mkdir("").await.is_err()); assert!(backend.remove("", true).await.is_err());
+    assert!(backend.remove_checked("other", &resume_entry(3)).await.is_err());
+    let mut weak = resume_entry(3); weak.etag = None;
+    assert!(backend.remove_checked("file", &weak).await.is_err());
+    assert!(backend.lock("file", 0).await.is_err());
+    assert!(backend.rename("file", "file", false).await.is_err());
+    assert!(backend.copy("file", "file/child", false).await.is_err());
+    assert!(backend.download_checked("other", &root.join("out"), &resume_entry(3)).await.unwrap_err().to_string().contains("revision belongs"));
+    assert!(backend.download_resume("other", &file, &resume_entry(3), 0).await.is_err());
+    assert!(backend.download_resume("file", &file, &resume_entry(3), 4).await.is_err());
+    assert!(requests.lock().unwrap().is_empty()); task.await.unwrap();
+    for operation in ["mkdir", "delete", "checked_delete", "lock", "unlock"] {
+        let mut responses = vec![];
+        if operation == "delete" { responses.push(reply("207 Multi-Status", &entry_xml("file", 3))); }
+        responses.push(reply("500 Failed", ""));
+        let (backend, _, task) = server(responses).await;
+        let result = match operation {
+            "mkdir" => backend.mkdir("new").await,
+            "delete" => backend.remove("file", true).await,
+            "checked_delete" => backend.remove_checked("file", &resume_entry(3)).await,
+            "lock" => backend.lock("file", 60).await.map(|_| ()),
+            _ => backend.unlock("file", "opaquelocktoken:test").await,
+        };
+        assert!(result.unwrap_err().to_string().contains("500"), "{operation}"); task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn encoded_multipart_wrong_status_and_wrong_length_ranges_keep_the_prefix() {
+    let temporary=tempfile::tempdir().unwrap();let root=temporary.path().canonicalize().unwrap();
+    let base=range_reply(1,2,3,"bc");
+    for (response,offset,prefix,message) in [
+        (base.replace("Content-Length:","Content-Encoding: gzip\r\nContent-Length:"),1,"a","encoded HTTP"),
+        (base.replace("Content-Length:","Content-Type: multipart/byteranges\r\nContent-Length:"),1,"a","multipart range"),
+        (reply("500 Failed",""),1,"a","500"),
+        (reply("200 OK","abc").replace("Content-Length:","Content-Range: bytes 0-2/3\r\nContent-Length:"),0,"","unexpected Content-Range"),
+        (range_reply(1,2,3,"bc").replace("Content-Length: 2","Content-Length: 3").replace("\r\n\r\nbc","\r\n\r\nbcd"),1,"a","length differs"),
+    ] {
+        let partial=root.join(format!("partial-{}",uuid::Uuid::new_v4()));std::fs::write(&partial,prefix).unwrap();
+        let (backend,_,task)=server(vec![response]).await;
+        let error=backend.download_resume("file",&partial,&resume_entry(3),offset).await.unwrap_err();
+        assert!(error.to_string().contains(message),"{message}: {error}");task.await.unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(),prefix.as_bytes());
+    }
+    for (response,message) in [(reply("404 Not Found",""),"disappeared"),(reply("207 Multi-Status",&entry_xml("file",3).replace("revision-1","changed")),"revision changed")] {
+        let partial=root.join(format!("complete-{}",uuid::Uuid::new_v4()));std::fs::write(&partial,b"abc").unwrap();
+        let (backend,_,task)=server(vec![response]).await;
+        assert!(backend.download_resume("file",&partial,&resume_entry(3),3).await.unwrap_err().to_string().contains(message));task.await.unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(),b"abc");
+    }
+    let partial=root.join("new-partial");let (backend,_,task)=server(vec![reply("500 Failed","")]).await;
+    assert!(backend.download_resume("file",&partial,&resume_entry(3),0).await.unwrap_err().to_string().contains("500"));task.await.unwrap();
+    assert_eq!(std::fs::read(&partial).unwrap(),b"");
+}
+
+#[tokio::test]
+async fn protected_get_rejects_ignored_revision_or_wrong_size_before_creating_output() {
+    let temporary=tempfile::tempdir().unwrap();let root=temporary.path().canonicalize().unwrap();
+    for (response,message) in [(reply("200 OK","abc").replace("Content-Length:","ETag: \"different\"\r\nContent-Length:"),"ignored the GET revision"),(reply("200 OK","abcd"),"length differs")] {
+        let path=root.join(format!("output-{}",uuid::Uuid::new_v4()));let (backend,_,task)=server(vec![response]).await;
+        assert!(backend.download_checked("file",&path,&resume_entry(3)).await.unwrap_err().to_string().contains(message));task.await.unwrap();assert!(!path.exists());
+    }
+    let path=root.join("weak-revision");let (backend,_,task)=server(vec![reply("200 OK","abc")]).await;
+    let mut weak=resume_entry(3);weak.etag=None;backend.download_checked("file",&path,&weak).await.unwrap();task.await.unwrap();
+    assert_eq!(std::fs::read(path).unwrap(),b"abc");
+}
+
+#[tokio::test]
+async fn connection_refusal_and_request_timeout_are_reported_without_credentials() {
+    let (backend,_,task)=server(vec![]).await;task.await.unwrap();
+    let error=backend.stat("file").await.unwrap_err().to_string();assert!(error.contains("check connection"));assert!(!error.contains("test-secret"));
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+    let peer=tokio::spawn(async move{let (_socket,_)=listener.accept().await.unwrap();std::future::pending::<()>().await;});
+    let profile=Profile{protocol:Protocol::Webdav,url:format!("http://{address}/root/"),username:None,password_env:None,allow_http:true,timeout_secs:1,smb_encryption:true,nextcloud_upload_url:None};
+    let backend=WebDav::new(&profile,"").unwrap();assert!(backend.stat("file").await.unwrap_err().to_string().contains("timed out"));peer.abort();let _=peer.await;
 }
 
 #[tokio::test]

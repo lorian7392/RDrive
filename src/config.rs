@@ -137,22 +137,34 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
 }
 
 pub fn password(profile: &Profile, name: &str) -> Result<String> {
+    password_with(profile, name, process_output)
+}
+
+fn process_output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    command.output()
+}
+
+// Keep credential lookup injectable so tests can cover Keychain responses
+// without reading credentials, presenting a prompt or replacing system tools.
+fn password_with(
+    profile: &Profile,
+    name: &str,
+    _run: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Output>,
+) -> Result<String> {
     if let Some(key) = &profile.password_env {
         return std::env::var(key)
             .with_context(|| format!("credential environment variable {key} is missing"));
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/usr/bin/security")
-            .args([
+        let output = _run(std::process::Command::new("/usr/bin/security").args([
                 "find-generic-password",
                 "-s",
                 &format!("rdrive:{name}"),
                 "-a",
                 profile.username.as_deref().unwrap_or(""),
                 "-w",
-            ])
-            .output()
+            ]))
             .context("unable to read macOS Keychain")?;
         if output.status.success() {
             return Ok(String::from_utf8(output.stdout)?
@@ -165,4 +177,41 @@ pub fn password(profile: &Profile, name: &str) -> Result<String> {
         return Ok(String::new());
     }
     bail!("no credential found; set password-env or add a Keychain generic password with service rdrive:{name}")
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use std::{os::unix::process::ExitStatusExt, process::{Command, ExitStatus, Output}};
+
+    fn profile(username: Option<&str>) -> Profile {
+        Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: username.map(str::to_owned), password_env: None, allow_http: false, timeout_secs: 120, smb_encryption: true, nextcloud_upload_url: None }
+    }
+
+    #[test]
+    fn command_runner_reports_success_and_spawn_failure_without_keychain() {
+        assert!(process_output(&mut Command::new("/usr/bin/true")).unwrap().status.success());
+        assert!(!process_output(&mut Command::new("/usr/bin/false")).unwrap().status.success());
+        assert!(process_output(&mut Command::new("/rdrive-test-no-such-executable")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_arguments_success_invalid_text_failure_and_anonymous_fallback() {
+        let result = password_with(&profile(Some("test user")), "test profile", |command| {
+            assert_eq!(command.get_program(), "/usr/bin/security");
+            assert_eq!(command.get_args().collect::<Vec<_>>(), ["find-generic-password", "-s", "rdrive:test profile", "-a", "test user", "-w"]);
+            Ok(Output { status: ExitStatus::from_raw(0), stdout: b"fake password\n\n".to_vec(), stderr: vec![] })
+        }).unwrap();
+        assert_eq!(result, "fake password");
+        assert!(password_with(&profile(Some("u")), "p", |_| Ok(Output { status: ExitStatus::from_raw(0), stdout: vec![255], stderr: vec![] })).is_err());
+        let denied = password_with(&profile(Some("u")), "p", |_| Ok(Output { status: ExitStatus::from_raw(256), stdout: vec![], stderr: b"test-only denial".to_vec() })).unwrap_err();
+        assert!(denied.to_string().contains("no credential found"));
+        assert_eq!(password_with(&profile(None), "p", |command| {
+            assert_eq!(command.get_args().nth(4).unwrap(), "");
+            Ok(Output { status: ExitStatus::from_raw(256), stdout: vec![], stderr: vec![] })
+        }).unwrap(), "");
+        let failed = password_with(&profile(None), "p", |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic missing security"))).unwrap_err();
+        assert!(failed.to_string().contains("unable to read macOS Keychain"));
+    }
 }

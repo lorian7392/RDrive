@@ -507,15 +507,20 @@ enum VersionsCommand {
 }
 
 fn emit(json: bool, value: &impl Serialize) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string(value)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    }
-    Ok(())
+    emit_to(json, value, &mut std::io::stdout().lock())
+}
+fn emit_to(json: bool, value: &impl Serialize, output: &mut impl std::io::Write) -> Result<()> {
+    let text = if json { serde_json::to_string(value)? } else { serde_json::to_string_pretty(value)? };
+    writeln!(output, "{text}").context("cannot write command output")
 }
 fn path(p: &str) -> Result<String> {
     backend::normalize(p)
+}
+fn require_guarded_edit(conditional_write: bool) -> Result<()> {
+    if !conditional_write {
+        bail!("this backend cannot guard edits against remote changes; use get/put --overwrite explicitly");
+    }
+    Ok(())
 }
 fn profile(store: &Store, name: &str) -> Result<Profile> {
     store
@@ -985,9 +990,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             remote,
         } => {
             let b = connect(store, name).await?;
-            if !b.capabilities().conditional_write {
-                bail!("this backend cannot guard edits against remote changes; use get/put --overwrite explicitly");
-            }
+            require_guarded_edit(b.capabilities().conditional_write)?;
             let remote = path(remote)?;
             let temp = store
                 .home
@@ -1274,6 +1277,23 @@ async fn main() {
     }
 }
 async fn run(cli: &Cli) -> Result<()> {
+    run_with_native(cli, &NativeCalls::default()).await
+}
+
+struct NativeCalls {
+    plan: fn(&Profile, &std::path::Path, &rdrive::mount::MountOptions) -> Result<rdrive::mount::MountPlan>,
+    mount: fn(&Profile, &std::path::Path, &rdrive::mount::MountOptions, Option<&str>) -> Result<rdrive::mount::MountInfo>,
+    list: fn() -> Result<Vec<rdrive::mount::MountInfo>>,
+    unmount: fn(&std::path::Path, bool) -> Result<rdrive::mount::MountInfo>,
+    password: fn(&Profile, &str) -> Result<String>,
+}
+impl Default for NativeCalls {
+    fn default() -> Self {
+        Self { plan: rdrive::mount::plan, mount: rdrive::mount::mount, list: rdrive::mount::list, unmount: rdrive::mount::unmount, password: config::password }
+    }
+}
+
+async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
     let home = cli.home.clone().unwrap_or_else(config::default_home);
     match &cli.command {
         Command::Service {command} => {
@@ -1331,9 +1351,9 @@ async fn run(cli: &Cli) -> Result<()> {
             if args.is_empty(){let child=std::process::Command::new(executable).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;return emit(cli.json,&serde_json::json!({"pid":child.id(),"app":app}));}
             let status=std::process::Command::new(executable).args(args).status()?;if !status.success(){bail!("native companion command failed");}return Ok(());
         },
-        Command::Mounts => return emit(cli.json, &rdrive::mount::list()?),
+        Command::Mounts => return emit(cli.json, &(native.list)()?),
         Command::Unmount { local, force } => {
-            return emit(cli.json, &rdrive::mount::unmount(local, *force)?)
+            return emit(cli.json, &(native.unmount)(local, *force)?)
         }
         Command::Mount {
             profile: name,
@@ -1352,12 +1372,12 @@ async fn run(cli: &Cli) -> Result<()> {
                 no_prompt: *no_prompt,
             };
             if *dry_run {
-                return emit(cli.json, &rdrive::mount::plan(&p, local, &options)?);
+                return emit(cli.json, &(native.plan)(&p, local, &options)?);
             }
             let credential = if matches!(p.protocol, Protocol::Webdav)
                 && (p.username.is_some() || p.password_env.is_some())
             {
-                match config::password(&p, name) {
+                match (native.password)(&p, name) {
                     Ok(value) => Some(value),
                     Err(e) if p.password_env.is_some() => return Err(e),
                     Err(_) => None,
@@ -1367,7 +1387,7 @@ async fn run(cli: &Cli) -> Result<()> {
             };
             return emit(
                 cli.json,
-                &rdrive::mount::mount(&p, local, &options, credential.as_deref())?,
+                &(native.mount)(&p, local, &options, credential.as_deref())?,
             );
         }
         _ => (),
@@ -1451,3 +1471,321 @@ mod cli_tests {
 }
 
 fn self_profile(store:&Store,name:&str)->Result<()> { profile(store,name).map(|_|()) }
+
+#[cfg(test)]
+mod coverage_cli_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn cli(home: &Path, args: &[&str]) -> Cli {
+        let mut input = vec!["rdrive".to_owned(), "--json".into(), "--home".into(), home.to_string_lossy().into_owned()];
+        input.extend(args.iter().map(|value| (*value).to_owned()));
+        Cli::try_parse_from(input).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_commands_persist_profiles_metadata_and_domain_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("state");
+        let mut store = Store::open(home.clone()).unwrap();
+        for args in [vec!["profile","add","dav","--protocol","webdav","--url","https://example.invalid/dav/"],
+                     vec!["profile","add","smb","--protocol","smb","--url","smb://example.invalid/share"]] {
+            execute(&cli(&home,&args), &mut store).await.unwrap();
+        }
+        assert_eq!(store.config.profiles.len(), 2);
+        assert!(execute(&cli(&home,&["profile","add","dav","--protocol","webdav","--url","https://example.invalid/"]),&mut store).await.is_err());
+        for name in ["", "bad!", "-bad"] {
+            let mut input = cli(&home,&["profile","add","new","--protocol","webdav","--url","https://example.invalid/"]);
+            if let Command::Profile {command:ProfileCommand::Add{name: value,..}} = &mut input.command { *value = name.into(); }
+            assert!(execute(&input,&mut store).await.is_err());
+        }
+        for variable in ["", "bad-name"] {
+            let input = cli(&home,&["profile","add","new","--protocol","webdav","--url","https://example.invalid/","--password-env",variable]);
+            assert!(execute(&input,&mut store).await.is_err());
+        }
+        execute(&cli(&home,&["profile","remove","smb"]),&mut store).await.unwrap();
+        assert!(!store.config.profiles.contains_key("smb"));
+        assert!(execute(&cli(&home,&["profile","remove","missing"]),&mut store).await.is_err());
+        let local = temp.path().join("data"); std::fs::write(&local,b"same contents").unwrap();
+        let metadata = temp.path().join("metadata.json");
+        state::atomic_json(&metadata,&rdrive::metadata::capture(&local,&Default::default()).unwrap()).unwrap();
+        execute(&cli(&home,&["metadata","apply",local.to_str().unwrap(),metadata.to_str().unwrap()]),&mut store).await.unwrap();
+        let recovery = temp.path().join("recovery");
+        std::fs::create_dir(&recovery).unwrap();
+        std::fs::set_permissions(&recovery,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = recovery.join("recovery.json");
+        execute(&cli(&home,&["metadata","apply",local.to_str().unwrap(),metadata.to_str().unwrap(),"--journal",journal.to_str().unwrap()]),&mut store).await.unwrap();
+        assert!(execute(&cli(&home,&["metadata","recover",local.to_str().unwrap(),journal.to_str().unwrap()]),&mut store).await.is_err());
+        let oversized = temp.path().join("oversized.json");
+        std::fs::File::create(&oversized).unwrap().set_len(64*1024*1024+1).unwrap();
+        assert!(execute(&cli(&home,&["metadata","apply",local.to_str().unwrap(),oversized.to_str().unwrap()]),&mut store).await.is_err());
+        for args in [vec!["index","config","--disable"],vec!["index","config","--enable","--depth","1"],vec!["index","config","--all","--refresh-seconds","12","--active-refresh-seconds","3"],
+                     vec!["provider","domain-add","ordinary","dav"],vec!["provider","domains"],vec!["provider","domain-remove","ordinary"],
+                     vec!["smart","setup","smart-one","dav"],vec!["smart","list","smart-one"],vec!["smart","retry","smart-one"],vec!["smart","recovery","smart-one"],vec!["smart","status"],
+                     vec!["transfers","list"],vec!["cache","list","dav"],vec!["cache","unpin","dav","missing","--recursive"],vec!["history","--limit","1"]] {
+            execute(&cli(&home,&args),&mut store).await.unwrap();
+        }
+        let domain=rdrive::provider::domains(&home).unwrap().into_iter().find(|value|value.id=="smart-one").unwrap();
+        let binding=rdrive::provider::journal_binding(&store.config,&domain).unwrap();
+        let mutation={let mut queue=rdrive::smart::Queue::open(&store,"smart-one",&binding).unwrap();
+            let mutation=queue.enqueue(serde_json::json!({"v":1,"op":"modify","domain":"smart-one","id":"file","request_id":"cli-recovery","base_content_version":"c","base_metadata_version":"m"}),Some(&std::fs::File::open(&local).unwrap())).unwrap();
+            queue.start(&mutation.id).unwrap();queue.fail(&mutation.id,rdrive::smart::FailureKind::Other,"Synthetic failure").unwrap();mutation};
+        execute(&cli(&home,&["smart","retry","smart-one"]),&mut store).await.unwrap();
+        execute(&cli(&home,&["smart","retry","smart-one",&mutation.id]),&mut store).await.unwrap();
+        let recovered=temp.path().join("exported");
+        execute(&cli(&home,&["smart","export","smart-one",&mutation.id,recovered.to_str().unwrap()]),&mut store).await.unwrap();
+        assert_eq!(std::fs::read(recovered).unwrap(),b"same contents");
+        execute(&cli(&home,&["smart","cancel","smart-one",&mutation.id]),&mut store).await.unwrap();
+        execute(&cli(&home,&["smart","discard","smart-one",&mutation.id]),&mut store).await.unwrap();
+        assert!(execute(&cli(&home,&["smart","export","smart-one",&mutation.id,temp.path().join("missing-snapshot").to_str().unwrap()]),&mut store).await.is_err());
+        let upload=ops::enqueue(&mut store,"dav",&local,"upload",false,None,false).unwrap();
+        assert!(execute(&cli(&home,&["profile","remove","dav"]),&mut store).await.is_err());
+        execute(&cli(&home,&["queue","cancel",&upload.id]),&mut store).await.unwrap();
+        assert!(!home.join("spool").join(upload.snapshot).exists());
+        execute(&cli(&home,&["queue","cancel",&upload.id]),&mut store).await.unwrap();
+        store.db.jobs[0].status="done".into();
+        assert!(execute(&cli(&home,&["queue","cancel",&upload.id]),&mut store).await.is_err());
+        store.db.cache.insert("synthetic".into(),state::CacheItem{profile:"dav".into(),remote:"cached".into(),object:"not-a-real-payload".into(),entry:rdrive::backend::Entry{path:"cached".into(),is_dir:false,size:0,modified:None,etag:None},sha256:String::new(),pinned:false,accessed:state::now(),scope:None});
+        assert!(execute(&cli(&home,&["profile","remove","dav"]),&mut store).await.is_err());
+        store.db.cache.clear();
+        assert!(execute(&cli(&home,&["smart","setup","smart-one","dav"]),&mut store).await.is_err());
+        assert!(execute(&cli(&home,&["smart","list","missing"]),&mut store).await.is_err());
+        assert!(execute(&cli(&home,&["smart","setup","invalid","dav","--display-name",""]),&mut store).await.is_err());
+        assert!(execute(&cli(&home,&["lock","dav","file","--seconds","0"]),&mut store).await.is_err());
+        assert!(execute(&cli(&home,&["transfers","discard","invalid"]),&mut store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_companion_is_scoped_to_test_bundle_and_never_registers_a_real_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("state");
+        let bundle = temp.path().join("Synthetic.app");
+        let executable = bundle.join("Contents/MacOS/RDriveCompanion");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fn install(executable:&Path,body:&str) {std::fs::write(executable,format!("#!/bin/sh\n{body}\n")).unwrap();std::fs::set_permissions(executable,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        install(&executable,"printf '{\"ok\":true}'");
+        let mut store = Store::open(home.clone()).unwrap();
+        execute(&cli(&home,&["profile","add","dav","--protocol","webdav","--url","https://example.invalid/"]),&mut store).await.unwrap();
+        execute(&cli(&home,&["smart","setup","registered-fake","dav","--register","--app",bundle.to_str().unwrap()]),&mut store).await.unwrap();
+        install(&executable,"printf '{\"ok\":false}'; exit 1");
+        assert!(execute(&cli(&home,&["smart","setup","failed-fake","dav","--register","--app",bundle.to_str().unwrap()]),&mut store).await.is_err());
+        install(&executable,"printf 'invalid-json'");
+        assert!(execute(&cli(&home,&["smart","setup","invalid-fake","dav","--register","--app",bundle.to_str().unwrap()]),&mut store).await.is_err());
+        drop(store);
+        install(&executable,"exit 0");
+        run(&cli(&home,&["provider","native","--app",bundle.to_str().unwrap(),"--","--synthetic"])).await.unwrap();
+        install(&executable,"exit 1");
+        assert!(run(&cli(&home,&["provider","native","--app",bundle.to_str().unwrap(),"--","--synthetic"])).await.is_err());
+        assert!(run(&cli(&home,&["provider","native","--app",temp.path().join("missing.app").to_str().unwrap()])).await.is_err());
+        assert!(run(&cli(&home,&["watch","dav",temp.path().to_str().unwrap(),"--interval","0"])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn notification_coalesces_changes_and_preserves_disconnected_state() {
+        let (sender,receiver) = tokio::sync::mpsc::channel(8);
+        let mut feed = Some(receiver);
+        sender.send(Ok(rdrive::backend::ChangeEvent {kind:"ready".into(),path:String::new()})).await.unwrap();
+        sender.send(Ok(rdrive::backend::ChangeEvent {kind:"modified".into(),path:"a".into()})).await.unwrap();
+        sender.send(Err(anyhow::anyhow!("synthetic notification failure"))).await.unwrap();
+        notification(&mut feed).await;
+        assert!(feed.as_mut().unwrap().try_recv().is_err());
+        drop(sender);
+        notification(&mut feed).await;
+        assert!(feed.is_none());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(1), notification(&mut feed)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn synchronous_dispatch_rejects_commands_owned_by_the_outer_runner() {
+        for args in [vec!["mcp","tools"],vec!["service","status"],vec!["index","status"],vec!["provider","serve","--socket","/unused","--staging","/unused"],vec!["smart","run"],vec!["smart","resolve","d","m","--strategy","remote"],vec!["notify","d"],vec!["watch","d","/unused"],vec!["mounts"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let home=temp.path().join("state");let input=cli(&home,&args);
+            let task=tokio::spawn(async move {let mut store=Store::open(home).unwrap();execute(&input,&mut store).await});
+            assert!(task.await.unwrap_err().is_panic(),"outer-runner command reached synchronous dispatcher without rejecting it");
+        }
+    }
+
+    #[tokio::test]
+    async fn service_previews_and_missing_state_fail_before_any_system_action() {
+        let temporary = tempfile::tempdir_in("/private/tmp").unwrap();
+        let home = temporary.path().join("state");
+        let mut store = Store::open(home.clone()).unwrap();
+        store.config.profiles.insert("smb".into(), serde_json::from_value(serde_json::json!({"protocol":"smb","url":"smb://example.invalid/share"})).unwrap());
+        store.save_config().unwrap();
+        // An absent source fails before connecting. SMB must pass the resume
+        // protocol guard used to reject unconfigured WebDAV chunk uploads.
+        let missing = temporary.path().join("absent-source");
+        assert!(execute(&cli(&home, &["put", "smb", missing.to_str().unwrap(), "file", "--resume"]), &mut store).await.is_err());
+        assert!(execute(&cli(&home, &["versions", "restore", "smb", "file", "nested/version"]), &mut store).await.unwrap_err().to_string().contains("invalid version id"));
+        drop(store);
+        run(&cli(&home, &["service", "status"])).await.unwrap();
+        run(&cli(&home, &["service", "install", "--dry-run"])).await.unwrap();
+        let ipc = temporary.path().join("ipc");
+        let agents = temporary.path().join("agents");
+        run(&cli(&home, &["service", "install", "--ipc-root", ipc.to_str().unwrap(), "--launch-agents-dir", agents.to_str().unwrap(), "--dry-run"])).await.unwrap();
+        for operation in ["start", "stop", "restart", "uninstall"] {
+            assert!(run(&cli(&home, &["service", operation, "--dry-run"])).await.is_err());
+        }
+        assert!(run(&cli(&home, &["service", "run"])).await.is_err());
+        assert!(!home.join("service").exists());
+        assert!(!ipc.exists());
+        assert!(!agents.exists());
+        assert!(run(&cli(&home, &["index", "search", "missing", "query"])).await.is_err());
+        assert!(run(&cli(&home, &["smart", "resolve", "missing", "mutation", "--strategy", "remote"])).await.is_err());
+        run(&cli(&home, &["mcp", "tools"])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_filters_profile_overrides_and_reset_preserve_declared_rules() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("state");
+        let mut store = Store::open(home.clone()).unwrap();
+        execute(&cli(&home, &["profile", "add", "dav", "--protocol", "webdav", "--url", "https://example.invalid/"]), &mut store).await.unwrap();
+        execute(&cli(&home, &["filter", "config", "--exclude-temporary", "--include", "*.txt", "--exclude", "private*"]), &mut store).await.unwrap();
+        assert!(rdrive::filtering::allowed(&store.config, "dav", "notes.txt", false).unwrap());
+        assert!(!rdrive::filtering::allowed(&store.config, "dav", "private-notes.txt", false).unwrap());
+        execute(&cli(&home, &["filter", "test", "dav", "notes.txt"]), &mut store).await.unwrap();
+        execute(&cli(&home, &["filter", "test", "dav", "folder", "--directory"]), &mut store).await.unwrap();
+        execute(&cli(&home, &["filter", "config", "--profile", "dav", "--include-temporary", "--include", "*"]), &mut store).await.unwrap();
+        assert!(rdrive::filtering::allowed(&store.config, "dav", "scratch.tmp", false).unwrap());
+        execute(&cli(&home, &["filter", "reset", "dav"]), &mut store).await.unwrap();
+        assert!(!store.config.filters.profiles.contains_key("dav"));
+        assert!(!rdrive::filtering::allowed(&store.config, "dav", "scratch.tmp", false).unwrap());
+        execute(&cli(&home, &["filter", "config", "--include-temporary", "--clear-include", "--clear-exclude"]), &mut store).await.unwrap();
+        assert!(rdrive::filtering::allowed(&store.config, "dav", "scratch.tmp", false).unwrap());
+        let original = std::fs::read(home.join("config.json")).unwrap();
+        assert!(execute(&cli(&home, &["filter", "config", "--include", "../escape"]), &mut store).await.is_err());
+        assert_eq!(std::fs::read(home.join("config.json")).unwrap(), original);
+        assert!(matches!(sync_options(SyncDirection::Push, false, false).direction, sync::Direction::Push));
+        assert!(matches!(sync_options(SyncDirection::Pull, false, false).direction, sync::Direction::Pull));
+    }
+}
+
+#[cfg(test)]
+mod cli_contract {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn value(arg: &clap::Arg) -> String {
+        if let Some(values) = arg.get_value_parser().possible_values() {
+            return values.into_iter().next().unwrap().get_name().into();
+        }
+        let kind = arg.get_value_parser().type_id();
+        if kind == std::any::TypeId::of::<u64>() || kind == std::any::TypeId::of::<u32>() || kind == std::any::TypeId::of::<usize>() { return "2".into(); }
+        if arg.get_id() == "strategy" { return "stop".into(); }
+        "fixture".into()
+    }
+    fn append(args: &mut Vec<String>, arg: &clap::Arg) {
+        if let Some(long) = arg.get_long() { args.push(format!("--{long}")); }
+        else if let Some(short) = arg.get_short() { args.push(format!("-{short}")); }
+        if arg.get_action().takes_values() { args.push(value(arg)); }
+    }
+    fn visit(command: &clap::Command, path: &[String], cases: &mut Vec<serde_json::Value>) {
+        let children = command.get_subcommands().filter(|command| command.get_name() != "help").collect::<Vec<_>>();
+        if !children.is_empty() {
+            for child in children { let mut path=path.to_vec(); path.push(child.get_name().into()); visit(child, &path, cases); }
+            return;
+        }
+        let args = command.get_arguments().filter(|arg| !["help", "version"].contains(&arg.get_id().as_str())).collect::<Vec<_>>();
+        let mut required = args.iter().filter(|arg| arg.is_required_set()).copied().collect::<Vec<_>>();
+        required.sort_by_key(|arg| arg.get_index().unwrap_or(0));
+        let mut base = vec!["rdrive".into()]; base.extend(path.to_vec());
+        for arg in &required { append(&mut base, arg); }
+        let cache_config=path==["cache", "config"];
+        if cache_config { base.push("--unlimited".into()); }
+        Cli::try_parse_from(&base).unwrap_or_else(|error| panic!("baseline {base:?}: {error}"));
+        for arg in args {
+            let mut invocation = base.clone();
+            if cache_config && arg.get_id()=="max_bytes" { invocation.retain(|argument|argument!="--unlimited"); }
+            if arg.get_id()=="app" && command.get_arguments().any(|argument|argument.get_id()=="register") { invocation.push("--register".into()); }
+            if !arg.is_required_set() && !(cache_config && arg.get_id()=="unlimited") { append(&mut invocation, arg); }
+            Cli::try_parse_from(&invocation).unwrap_or_else(|error| panic!("parameter {invocation:?}: {error}"));
+            let mut values = 1;
+            if arg.get_action().takes_values() {
+                if let Some(possible) = arg.get_value_parser().possible_values() {
+                    for possible in possible {
+                        let mut choice=invocation.clone();
+                        let index=arg.get_long().map(|long|choice.iter().position(|argument|argument==&format!("--{long}")).unwrap()+1).unwrap_or(choice.len()-1);
+                        choice[index]=possible.get_name().into();
+                        Cli::try_parse_from(&choice).unwrap_or_else(|error| panic!("enum {choice:?}: {error}")); values+=1;
+                    }
+                }
+                let kind=arg.get_value_parser().type_id();
+                if !arg.is_required_set() && (kind==std::any::TypeId::of::<u64>() || kind==std::any::TypeId::of::<u32>() || kind==std::any::TypeId::of::<usize>()) {
+                    let mut invalid=invocation.clone(); *invalid.last_mut().unwrap()="not-an-integer".into();
+                    assert!(Cli::try_parse_from(&invalid).is_err(), "numeric parameter accepted text: {invalid:?}");
+                }
+            }
+            for conflicting in command.get_arg_conflicts_with(arg) {
+                let mut invalid=invocation.clone(); append(&mut invalid,conflicting);
+                assert!(Cli::try_parse_from(&invalid).is_err(),"conflicting arguments were accepted: {invalid:?}");
+            }
+            cases.push(serde_json::json!({"command":path.join(" "),"argument":arg.get_id().as_str(),"accepted_value_cases":values,"required":arg.is_required_set()}));
+        }
+    }
+    #[test]
+    fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
+        let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
+        let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(leaves.len(),97,"update the public interface inventory when adding a command");
+        assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
+        let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();
+    }
+    #[test]
+    fn output_serialization_and_broken_writers_return_errors() {
+        assert!(require_guarded_edit(true).is_ok());
+        assert!(require_guarded_edit(false).unwrap_err().to_string().contains("cannot guard edits"));
+        let value=serde_json::json!({"value":1}); let mut compact=Vec::new(); let mut pretty=Vec::new();
+        emit_to(true,&value,&mut compact).unwrap(); emit_to(false,&value,&mut pretty).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&compact).unwrap(),value); assert!(pretty.len()>compact.len());
+        struct Broken;
+        impl std::io::Write for Broken { fn write(&mut self,_:&[u8])->std::io::Result<usize>{Err(std::io::ErrorKind::BrokenPipe.into())} fn flush(&mut self)->std::io::Result<()>{Ok(())} }
+        assert!(emit_to(true,&value,&mut Broken).unwrap_err().to_string().contains("cannot write command output"));
+        struct Invalid;
+        impl Serialize for Invalid { fn serialize<S:serde::Serializer>(&self,_:S)->std::result::Result<S::Ok,S::Error>{Err(serde::ser::Error::custom("synthetic invalid value"))} }
+        assert!(emit_to(true,&Invalid,&mut Vec::new()).is_err()); assert!(emit_to(false,&Invalid,&mut Vec::new()).is_err());
+    }
+    fn mounted(path: &std::path::Path) -> rdrive::mount::MountInfo {
+        rdrive::mount::MountInfo { mountpoint:path.into(),source:"synthetic://fixture/share".into(),filesystem:"webdav".into(),read_only:true,no_browse:false,owner:unsafe{libc::geteuid()},fsid:[1,2] }
+    }
+    #[tokio::test]
+    async fn native_dispatch_uses_explicit_credential_policy_without_os_mutations() {
+        let temp=tempfile::tempdir().unwrap(); let home=temp.path().join("state"); let point=temp.path().join("mount"); std::fs::create_dir(&point).unwrap();
+        let mut store=Store::open(home.clone()).unwrap();
+        for (name,protocol,username,environment) in [
+            ("credential",Protocol::Webdav,Some("credential"),Some("MOCKED_ENV")),
+            ("env-failure",Protocol::Webdav,Some("env-failure"),Some("MOCKED_ENV")),
+            ("keychain-failure",Protocol::Webdav,Some("keychain-failure"),None),
+            ("anonymous",Protocol::Webdav,None,None),
+            ("smb",Protocol::Smb,Some("smb"),None),
+        ] {
+            let url=if matches!(protocol,Protocol::Smb){"smb://fixture/share"}else{"https://fixture.invalid/root/"};
+            store.config.profiles.insert(name.into(),Profile{protocol,url:url.into(),username:username.map(str::to_owned),password_env:environment.map(str::to_owned),allow_http:false,timeout_secs:5,smb_encryption:true,nextcloud_upload_url:None});
+        }
+        store.save_config().unwrap(); drop(store);
+        let native=NativeCalls {
+            password: |_,name| if name.ends_with("failure"){bail!("synthetic credential lookup failed")}else{Ok("mock credential".into())},
+            mount: |profile,path,options,credential| {
+                assert!(options.read_only&&options.no_prompt&&!options.no_browse);
+                assert_eq!(credential,if profile.username.as_deref()==Some("credential"){Some("mock credential")}else{None});
+                std::fs::write(path.join("observed"),profile.username.as_deref().unwrap_or("anonymous"))?;
+                Ok(mounted(path))
+            },
+            plan: |_,point,options| Ok(rdrive::mount::MountPlan{program:"synthetic-helper".into(),args:vec![],mountpoint:point.into(),source:"synthetic://fixture/share".into(),filesystem:"webdav".into(),credential_mode:"mock".into(),read_only:options.read_only,encryption_required:true,notes:vec![]}),
+            list: || Ok(vec![mounted(std::path::Path::new("/synthetic/fixture"))]),
+            unmount: |path,force| { assert!(force); Ok(mounted(path)) },
+        };
+        for name in ["credential","keychain-failure","anonymous","smb"] {
+            let args: Vec<String>=vec!["rdrive".into(),"--home".into(),home.to_string_lossy().into(),"--json".into(),"mount".into(),name.into(),point.to_string_lossy().into(),"--read-only".into(),"--browse".into(),"--no-prompt".into()];
+            run_with_native(&Cli::try_parse_from(args).unwrap(),&native).await.unwrap();
+            assert_eq!(std::fs::read_to_string(point.join("observed")).unwrap(),if name=="keychain-failure"{"keychain-failure"}else{name});
+        }
+        let input=Cli::try_parse_from(["rdrive","--home",home.to_str().unwrap(),"mount","env-failure",point.to_str().unwrap(),"--no-prompt"]).unwrap();
+        assert!(run_with_native(&input,&native).await.unwrap_err().to_string().contains("synthetic credential"));
+        for args in [vec!["mounts"],vec!["unmount",point.to_str().unwrap(),"--force"],vec!["mount","credential",point.to_str().unwrap(),"--dry-run"]] {
+            let mut arguments=vec!["rdrive","--home",home.to_str().unwrap(),"--json"]; arguments.extend(args);
+            run_with_native(&Cli::try_parse_from(arguments).unwrap(),&native).await.unwrap();
+        }
+    }
+}

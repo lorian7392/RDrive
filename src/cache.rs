@@ -77,7 +77,13 @@ impl Default for NativeLedger {
 }
 const NATIVE_RESERVATION_TTL: i64 = 120;
 
+fn flock(fd: std::os::fd::RawFd, operation: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::flock(fd, operation) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
 pub(crate) fn budget_lock(home: &Path, exclusive: bool) -> Result<File> {
+    budget_lock_with(home, exclusive, flock)
+}
+fn budget_lock_with(home: &Path, exclusive: bool, lock: impl FnOnce(std::os::fd::RawFd,libc::c_int)->std::io::Result<()>) -> Result<File> {
     let metadata = fs::symlink_metadata(home)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
@@ -96,19 +102,7 @@ pub(crate) fn budget_lock(home: &Path, exclusive: bool) -> Result<File> {
     if !file.metadata()?.is_file() {
         bail!("cache accounting lock is not a regular file");
     }
-    if unsafe {
-        libc::flock(
-            file.as_raw_fd(),
-            if exclusive {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_SH
-            },
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    lock(file.as_raw_fd(), if exclusive { libc::LOCK_EX } else { libc::LOCK_SH })?;
     Ok(file)
 }
 
@@ -300,6 +294,9 @@ fn payload_file(path: &Path) -> Result<File> {
 }
 
 fn lock_exclusive(path: &Path) -> Result<Option<File>> {
+    lock_exclusive_with(path, flock)
+}
+fn lock_exclusive_with(path: &Path, lock: impl FnOnce(std::os::fd::RawFd,libc::c_int)->std::io::Result<()>) -> Result<Option<File>> {
     let file = match payload_file(path) {
         Ok(file) => file,
         Err(error)
@@ -311,10 +308,10 @@ fn lock_exclusive(path: &Path) -> Result<Option<File>> {
         }
         Err(error) => return Err(error),
     };
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let error = std::io::Error::last_os_error();
+    let error = match lock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => return Ok(Some(file)),
+        Err(error) => error,
+    };
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return Ok(None);
     }
@@ -329,7 +326,9 @@ fn inventory_parts(
     config: &crate::config::Config,
     cache: &BTreeMap<String, CacheItem>,
 ) -> Result<Vec<Payload>> {
-    let directory = configured_directory(home, config)?;
+    inventory_at(configured_directory(home, config)?, cache)
+}
+fn inventory_at(directory: PathBuf, cache: &BTreeMap<String,CacheItem>) -> Result<Vec<Payload>> {
     let metadata = fs::symlink_metadata(&directory)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("cache directory was replaced or is not a directory");
@@ -499,6 +498,9 @@ fn make_room(
     protected: &BTreeSet<String>,
     strict: bool,
 ) -> Result<CachePruneReport> {
+    make_room_with_remover(store,limit,additional,protected,strict,|path|fs::remove_file(path))
+}
+fn make_room_with_remover(store:&mut Store,limit:u64,additional:u64,protected:&BTreeSet<String>,strict:bool,mut remove:impl FnMut(&Path)->std::io::Result<()>) -> Result<CachePruneReport> {
     let mut payloads = inventory(store)?;
     let actual = payloads
         .iter()
@@ -549,7 +551,7 @@ fn make_room(
     }
     let mut freed_bytes = 0;
     for (payload, _guard) in &candidates {
-        fs::remove_file(&payload.path).context(
+        remove(&payload.path).context(
             "cache entry was unindexed but its clean payload could not be removed; retry cleanup",
         )?;
         freed_bytes = add(freed_bytes, payload.size)?;
@@ -678,17 +680,20 @@ pub(crate) fn hash_fd(file: &mut File) -> Result<String> {
 }
 
 fn acquire_item(store: &Store, item: &CacheItem) -> Result<CacheLease> {
+    acquire_item_with_hash(store,item,hash_fd)
+}
+fn acquire_item_with_hash(store:&Store,item:&CacheItem,hash:impl FnOnce(&mut File)->Result<String>)->Result<CacheLease> {
     if item.scope.as_deref() != Some(scope(store, &item.profile)?.as_str()) {
         bail!("cached file belongs to another or an unbound legacy account scope; fetch it online before offline use");
     }
     let path = object_path(store, &item.object)?;
     let mut file =
         payload_file(&path).context("cached file is missing or unsafe; fetch it online")?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+    if flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB).is_err() {
         bail!("cached file is being evicted; retry the read");
     }
     let before = file.metadata()?;
-    if before.len() != item.entry.size || hash_fd(&mut file)? != item.sha256 {
+    if before.len() != item.entry.size || hash(&mut file)? != item.sha256 {
         bail!("cache checksum mismatch; local cached copy is corrupt");
     }
     let after = file.metadata()?;
@@ -978,6 +983,12 @@ mod tests {
         fail: AtomicBool,
         pause: AtomicBool,
         started: Notify,
+        poison_state: Mutex<Option<PathBuf>>,
+        payload_override: Mutex<Option<Vec<u8>>>,
+        hash_override: Mutex<Option<String>>,
+        after_download: Mutex<Option<Option<Vec<u8>>>>,
+        fail_before: AtomicBool,
+        after_usage: Mutex<Option<(PathBuf,u64)>>,
     }
     impl Memory {
         fn put(&self, path: &str, data: &[u8]) {
@@ -986,6 +997,7 @@ mod tests {
     }
     #[async_trait]
     impl Backend for Memory {
+        fn content_sha256(&self,_:&Entry)->Option<String> { self.hash_override.lock().unwrap().clone() }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 protocol: "test",
@@ -1008,8 +1020,9 @@ mod tests {
             bail!("unused")
         }
         async fn download(&self, remote: &str, local: &Path) -> Result<()> {
+            if self.fail_before.load(Ordering::SeqCst) {bail!("synthetic failure before payload creation");}
             self.downloads.fetch_add(1, Ordering::SeqCst);
-            let data = self.files.lock().unwrap()[remote].clone();
+            let data = self.payload_override.lock().unwrap().clone().unwrap_or_else(||self.files.lock().unwrap()[remote].clone());
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1025,6 +1038,16 @@ mod tests {
                 bail!("injected interrupted payload");
             }
             file.write_all(&data)?;
+            if let Some((home,used))=self.after_usage.lock().unwrap().take() {
+                state::atomic_json(&home.join("native-cache-usage.json"),&NativeLedger{version:1,reports:BTreeMap::from([("native-race".into(),NativeReport{used,reserved:0,pinned:0,updated:chrono::Utc::now().timestamp()})])})?;
+            }
+            if let Some(next) = self.after_download.lock().unwrap().take() {
+                if let Some(bytes)=next { self.files.lock().unwrap().insert(remote.into(),bytes); } else {self.files.lock().unwrap().remove(remote);}
+            }
+            if let Some(path) = self.poison_state.lock().unwrap().take() {
+                fs::remove_file(&path)?;
+                fs::create_dir(path)?;
+            }
             Ok(())
         }
         async fn upload(&self, _: &Path, _: &str, _: WriteCondition) -> Result<Entry> {
@@ -1325,4 +1348,201 @@ mod tests {
         let config: crate::config::Config = serde_json::from_str(r#"{"profiles":{}}"#).unwrap();
         assert_eq!(config.cache.max_bytes, None);
     }
+
+    #[tokio::test]
+    async fn cache_reuse_recursive_pins_and_copy_read_from_verified_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = setup(&directory.path().join("state"));
+        let backend = Memory::default();
+        for path in ["folder/a", "folder/b", "other"] { backend.put(path, b"abc"); }
+        for path in ["folder/a", "folder/b", "other"] { fetch(&mut store, &backend, "test", path, false).await.unwrap(); }
+        set_limit(&mut store, Some(9)).unwrap();
+        assert_eq!(set_pinned(&mut store, "test", "folder", true, true).unwrap(), 2);
+        assert_eq!(set_pinned(&mut store, "test", "folder/a", false, false).unwrap(), 1);
+        assert_eq!(set_pinned(&mut store, "test", "missing", true, false).unwrap(), 0);
+        assert_eq!(status(&store).unwrap().pinned_files, 1);
+        let reuse = fetch(&mut store, &backend, "test", "folder/a", true).await.unwrap();
+        assert!(reuse.pinned);
+        assert_eq!(backend.downloads.load(Ordering::SeqCst), 3, "same revision must not redownload");
+        let lease = acquire(&mut store, "test", "folder/a").unwrap();
+        assert_eq!(lease.path(), object_path(&store, &reuse.object).unwrap());
+        assert_eq!(lease.file().metadata().unwrap().len(), 3);
+        assert_eq!(status(&store).unwrap().leased_bytes, 3);
+        let output = directory.path().join("copy");
+        copy_lease(&lease, &output, false).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"abc");
+        assert!(copy_lease(&lease, &output, false).is_err());
+        drop(lease);
+        let output2 = directory.path().join("get");
+        assert_eq!(get(&mut store, "test", "folder/a", &output2, false).unwrap().object, reuse.object);
+        assert_eq!(fs::read(output2).unwrap(), b"abc");
+        let previous_reader=acquire(&mut store,"test","folder/a").unwrap();backend.put("folder/a",b"new");
+        let replacement=fetch(&mut store,&backend,"test","folder/a",true).await.unwrap();
+        assert_ne!(replacement.object,reuse.object);assert!(store.db.cache_garbage.contains(&reuse.object));
+        assert_eq!(status(&store).unwrap().leased_bytes,3);drop(previous_reader);recover(&mut store).unwrap();
+        assert!(!store.db.cache_garbage.contains(&reuse.object));assert!(!object_path(&store,&reuse.object).unwrap().exists());
+        set_pinned(&mut store, "test", "", false, true).unwrap();
+        assert_eq!(status(&store).unwrap().pinned_files, 0);
+        set_limit(&mut store, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_payload_and_concurrent_exclusive_lease_are_refused_without_copying() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = setup(&directory.path().join("state"));
+        let backend = Memory::default(); backend.put("file", b"abc");
+        let item = fetch(&mut store, &backend, "test", "file", false).await.unwrap();
+        let path = object_path(&store, &item.object).unwrap();
+        let lock = lock_exclusive(&path).unwrap().unwrap();
+        assert!(acquire(&mut store, "test", "file").err().unwrap().to_string().contains("being evicted"));
+        drop(lock);
+        let lease = acquire(&mut store, "test", "file").unwrap();
+        fs::write(&path, b"").unwrap();
+        let output = directory.path().join("refused-short");
+        assert!(copy_lease(&lease, &output, false).unwrap_err().to_string().contains("ended early"));
+        assert!(!output.exists());
+        fs::write(&path, b"xyz").unwrap();
+        assert!(copy_lease(&lease, &output, false).unwrap_err().to_string().contains("changed while reading"));
+        assert!(acquire(&mut store, "test", "file").err().unwrap().to_string().contains("checksum mismatch"));
+        drop(lease);
+        let repaired = fetch(&mut store, &backend, "test", "file", false).await.unwrap();
+        assert_ne!(repaired.object, item.object);
+        assert_eq!(backend.downloads.load(Ordering::SeqCst), 2);
+        fs::remove_file(object_path(&store, &repaired.object).unwrap()).unwrap();
+        assert_eq!(clear(&mut store, false).unwrap()["missing_files"], 1);
+        assert_eq!(status(&store).unwrap().missing_files, 1);
+    }
+
+    #[tokio::test]
+    async fn state_write_failures_restore_cache_index_limits_and_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = setup(&directory.path().join("state"));
+        let backend = Memory::default(); backend.put("file", b"abc");
+        let original = fetch(&mut store, &backend, "test", "file", false).await.unwrap();
+        let state_path = store.home.join("state.json");
+        let saved = fs::read(&state_path).unwrap();
+        fs::remove_file(&state_path).unwrap(); fs::create_dir(&state_path).unwrap();
+        assert!(clear(&mut store, true).is_err());
+        assert_eq!(store.db.cache.len(), 1); assert!(store.db.cache_garbage.is_empty());
+        assert!(prune(&mut store, 0).is_err());
+        assert_eq!(store.db.cache.len(), 1); assert!(store.db.cache_garbage.is_empty());
+        assert!(object_path(&store, &original.object).unwrap().exists());
+        backend.put("new", b"new");
+        assert!(fetch(&mut store, &backend, "test", "new", false).await.is_err());
+        assert!(store.db.cache_reservations.is_empty());
+        fs::remove_dir(&state_path).unwrap(); fs::write(&state_path, &saved).unwrap();
+        let config_path = store.home.join("config.json");
+        let config = fs::read(&config_path).unwrap();
+        fs::remove_file(&config_path).unwrap(); fs::create_dir(&config_path).unwrap();
+        assert!(set_limit(&mut store, Some(99)).is_err());
+        assert_eq!(store.config.cache.max_bytes, None);
+        fs::remove_dir(&config_path).unwrap(); fs::write(config_path, config).unwrap();
+        backend.put("file", b"updated");
+        *backend.poison_state.lock().unwrap() = Some(state_path.clone());
+        assert!(fetch(&mut store, &backend, "test", "file", false).await.is_err());
+        assert_eq!(store.db.cache[&Store::cache_key("test", "file")].object, original.object);
+        assert_eq!(store.db.cache_reservations.len(), 1);
+        assert!(store.db.cache_garbage.is_empty());
+        fs::remove_dir(&state_path).unwrap(); fs::write(&state_path, saved).unwrap();
+        recover(&mut store).unwrap();
+        assert!(store.db.cache_reservations.is_empty());
+        assert_eq!(fs::read(object_path(&store, &original.object).unwrap()).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn unsafe_accounting_files_and_malformed_native_reports_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = setup(&directory.path().join("state"));
+        let path = store.home.join("native-cache-usage.json");
+        assert!(add(u64::MAX, 1).is_err());
+        assert!(lock_exclusive(&directory.path().join("absent")).unwrap().is_none());
+        assert!(payload_file(directory.path()).is_err());
+        assert!(lock_exclusive(directory.path()).is_err());
+        let accounting_lock=store.home.join("cache-budget.lock");fs::remove_file(&accounting_lock).unwrap();
+        let fifo=std::ffi::CString::new(accounting_lock.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(fifo.as_ptr(),0o600)},0);
+        assert!(budget_lock(&store.home,false).unwrap_err().to_string().contains("not a regular file"));
+        fs::remove_file(accounting_lock).unwrap();
+        for id in ["", "\n", &"x".repeat(257)] { assert!(report_native_usage(&store.home, id, 0, 0, 0).is_err()); }
+        assert!(report_native_usage(&store.home, "x", 0, 0, 1).is_err());
+        for value in [serde_json::json!({"version":2,"reports":{}}), serde_json::json!({"version":1,"reports":{"":{"used":0,"reserved":0,"pinned":0,"updated":1}}}), serde_json::json!({"version":1,"reports":{"x":{"used":0,"reserved":0,"pinned":1,"updated":1}}}), serde_json::json!({"version":1,"reports":{"x":{"used":0,"reserved":0,"pinned":0,"updated":-1}}})] {
+            state::atomic_json(&path, &value).unwrap(); assert!(read_native(&store.home).is_err());
+        }
+        fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap(); assert!(read_native(&store.home).is_err());
+        fs::remove_file(&path).unwrap(); symlink(directory.path().join("missing"), &path).unwrap(); assert!(read_native(&store.home).is_err());
+        fs::remove_file(&path).unwrap();
+        let mut ledger = NativeLedger::default();
+        for i in 0..4096 { ledger.reports.insert(i.to_string(), NativeReport { used:0, reserved:0, pinned:0, updated:1 }); }
+        state::atomic_json(&path, &ledger).unwrap();
+        assert!(report_native_usage(&store.home, "overflow", 0, 0, 0).unwrap_err().to_string().contains("too many"));
+        ledger.reports.insert("overflow".into(), NativeReport { used:0, reserved:0, pinned:0, updated:1 });
+        state::atomic_json(&path, &ledger).unwrap(); assert!(read_native(&store.home).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::set_permissions(&store.home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(budget_lock(&store.home, false).is_err());
+        fs::set_permissions(&store.home, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = store.home.join("cache");
+        fs::remove_dir(&cache).unwrap(); fs::write(&cache, b"foreign").unwrap();
+        assert!(inventory(&store).is_err());
+        fs::remove_file(&cache).unwrap(); fs::create_dir(&cache).unwrap(); fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = cache.join("directory"); fs::create_dir(&foreign).unwrap();
+        assert!(inventory(&store).is_err()); fs::remove_dir(foreign).unwrap();
+        assert!(set_limit(&mut store, Some(0)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_downloads_are_removed_and_never_advertised_as_cached() {
+        let temporary=tempfile::tempdir().unwrap();let mut store=setup(&temporary.path().join("state"));let backend=Memory::default();backend.put("file",b"abc");
+        let mut invalid=backend.stat("file").await.unwrap().unwrap();invalid.is_dir=true;
+        assert!(fetch_expected(&mut store,&backend,"test","file",&invalid,false).await.unwrap_err().to_string().contains("matching regular file"));
+        *backend.payload_override.lock().unwrap()=Some(b"ab".to_vec());
+        assert!(fetch(&mut store,&backend,"test","file",false).await.unwrap_err().to_string().contains("length differs"));
+        *backend.payload_override.lock().unwrap()=None;*backend.hash_override.lock().unwrap()=Some("0".repeat(64));
+        assert!(fetch(&mut store,&backend,"test","file",false).await.unwrap_err().to_string().contains("hash differs"));
+        *backend.hash_override.lock().unwrap()=None;*backend.after_download.lock().unwrap()=Some(Some(b"new".to_vec()));
+        assert!(fetch(&mut store,&backend,"test","file",false).await.unwrap_err().to_string().contains("remote file changed"));
+        *backend.after_download.lock().unwrap()=Some(None);
+        assert!(fetch(&mut store,&backend,"test","file",false).await.unwrap_err().to_string().contains("disappeared"));
+        assert!(store.db.cache.is_empty());assert!(store.db.cache_reservations.is_empty());assert_eq!(status(&store).unwrap().used_bytes,0);
+    }
+    #[test]
+    fn lock_failures_remain_errors_without_misclassifying_other_process_readers() {
+        let temporary=tempfile::tempdir().unwrap();let store=setup(&temporary.path().join("state"));
+        assert!(flock(-1,libc::LOCK_EX).is_err());
+        assert!(budget_lock_with(&store.home,true,|_,mode|{assert_eq!(mode,libc::LOCK_EX);Err(std::io::Error::other("synthetic locking failure"))}).is_err());
+        let payload=store.home.join("cache/payload");fs::write(&payload,b"data").unwrap();
+        assert!(lock_exclusive_with(&payload,|_,_|Err(std::io::Error::other("synthetic locking failure"))).is_err());
+        assert!(lock_exclusive_with(&payload,|_,_|Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))).unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn unlimited_pins_reuse_and_native_overage_keep_verified_cache_records() {
+        let temporary=tempfile::tempdir().unwrap();let mut store=setup(&temporary.path().join("state"));let backend=Memory::default();backend.put("file",b"abc");
+        fetch(&mut store,&backend,"test","file",false).await.unwrap();set_pinned(&mut store,"test","file",true,false).unwrap();set_pinned(&mut store,"test","file",false,false).unwrap();fetch(&mut store,&backend,"test","file",false).await.unwrap();assert_eq!(backend.downloads.load(Ordering::SeqCst),1);
+        backend.fail_before.store(true,Ordering::SeqCst);backend.put("failed",b"xyz");assert!(fetch(&mut store,&backend,"test","failed",false).await.is_err());assert!(store.db.cache_reservations.is_empty());backend.fail_before.store(false,Ordering::SeqCst);
+        set_limit(&mut store,Some(3)).unwrap();backend.put("new",b"new");*backend.after_usage.lock().unwrap()=Some((store.home.clone(),1));
+        assert!(fetch(&mut store,&backend,"test","new",false).await.unwrap_err().to_string().contains("cache capacity"));assert!(store.db.cache.contains_key(&Store::cache_key("test","new")));assert!(status(&store).unwrap().over_budget);
+    }
+    #[tokio::test]
+    async fn cache_mutation_during_hashing_and_failed_unlink_preserve_recovery_ownership() {
+        let temporary=tempfile::tempdir().unwrap();let mut store=setup(&temporary.path().join("state"));let backend=Memory::default();backend.put("file",b"abc");let item=fetch(&mut store,&backend,"test","file",false).await.unwrap();let path=object_path(&store,&item.object).unwrap();
+        let error=acquire_item_with_hash(&store,&item,|file|{let hash=hash_fd(file)?;fs::write(&path,b"new")?;File::open(&path)?.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))?;Ok(hash)}).err().unwrap();assert!(error.to_string().contains("changed while verifying"));
+        fs::write(&path,b"abc").unwrap();
+        let result=make_room_with_remover(&mut store,0,0,&BTreeSet::new(),false,|_|Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));assert!(result.unwrap_err().to_string().contains("could not be removed"));assert!(path.exists());assert!(store.db.cache.is_empty());assert!(store.db.cache_garbage.contains(&item.object));
+        let recovered=make_room(&mut store,0,0,&BTreeSet::new(),false).unwrap();assert_eq!(recovered.freed_bytes,3);assert!(!path.exists());assert!(store.db.cache_garbage.is_empty());
+        let foreign=store.home.join("foreign-file");fs::write(&foreign,b"not a directory").unwrap();assert!(inventory_at(foreign,&BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn native_and_reserved_byte_counter_overflows_are_rejected_without_wrapping() {
+        let temporary=tempfile::tempdir().unwrap();let mut store=setup(&temporary.path().join("state"));fs::write(store.home.join("cache/untracked"),b"x").unwrap();
+        store.db.cache_reservations.insert("reservation".into(),CacheReservation{size:u64::MAX,created:state::now()});store.save().unwrap();assert!(report_native_usage(&store.home,"native",0,0,0).unwrap_err().to_string().contains("overflow"));store.db.cache_reservations.clear();store.save().unwrap();
+        assert!(report_native_usage(&store.home,"native",u64::MAX,0,0).unwrap_err().to_string().contains("overflow"));
+        state::atomic_json(&store.home.join("native-cache-usage.json"),&NativeLedger{version:1,reports:BTreeMap::from([("native".into(),NativeReport{used:u64::MAX,reserved:1,pinned:0,updated:chrono::Utc::now().timestamp()})])}).unwrap();assert!(make_room(&mut store,u64::MAX,0,&BTreeSet::new(),false).unwrap_err().to_string().contains("overflow"));
+        // Each accounting source fits individually, but their combined total
+        // must also fail without unlinking the existing local payload.
+        state::atomic_json(&store.home.join("native-cache-usage.json"),&NativeLedger{version:1,reports:BTreeMap::from([("native".into(),NativeReport{used:u64::MAX,reserved:0,pinned:0,updated:chrono::Utc::now().timestamp()})])}).unwrap();
+        assert!(make_room(&mut store,u64::MAX,0,&BTreeSet::new(),false).unwrap_err().to_string().contains("overflow"));
+        assert_eq!(fs::read(store.home.join("cache/untracked")).unwrap(),b"x");
+    }
+
 }

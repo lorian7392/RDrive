@@ -2,6 +2,46 @@ import Foundation
 import FileProvider
 import Darwin
 
+/// The native SDK boundary used by cache accounting and provider callbacks.
+/// Tests supply a manager without contacting or mutating registered OS domains.
+protocol NativeDomainManaging: AnyObject {
+    func enumeratorForMaterializedItems() -> NSFileProviderEnumerator
+    func getUserVisibleURL(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void)
+    func evictItem(identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
+    func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
+    func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
+    func temporaryDirectoryURL() throws -> URL
+}
+final class NativeSystemDomainManager: NativeDomainManaging {
+    private let manager: NSFileProviderManager
+    init(_ manager: NSFileProviderManager) { self.manager = manager }
+    func enumeratorForMaterializedItems() -> NSFileProviderEnumerator { manager.enumeratorForMaterializedItems() }
+    func getUserVisibleURL(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void) {
+        manager.getUserVisibleURL(for: identifier) { completionHandler($0, $1) }
+    }
+    func evictItem(identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
+        manager.evictItem(identifier: identifier) { completionHandler($0) }
+    }
+    func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
+        manager.signalEnumerator(for: identifier) { completionHandler($0) }
+    }
+    func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
+        manager.requestDownloadForItem(withIdentifier: identifier, requestedRange: nil, completionHandler: completionHandler)
+    }
+    func temporaryDirectoryURL() throws -> URL { try manager.temporaryDirectoryURL() }
+}
+
+protocol NativeSystemManaging {
+    func domains(completionHandler: @escaping ([NSFileProviderDomain], Error?) -> Void)
+    func manager(for domain: NSFileProviderDomain) -> NativeDomainManaging?
+}
+struct NativeSystemManager: NativeSystemManaging {
+    func domains(completionHandler: @escaping ([NSFileProviderDomain], Error?) -> Void) {
+        NSFileProviderManager.getDomainsWithCompletionHandler(completionHandler)
+    }
+    func manager(for domain: NSFileProviderDomain) -> NativeDomainManaging? { NSFileProviderManager(for: domain).map(NativeSystemDomainManager.init) }
+}
+
 private struct NativeReservation: Codable {
     let domain: String
     let id: String
@@ -30,7 +70,7 @@ private struct NativeResident {
     let remoteVersion: String
     let remoteSize: UInt64
     let knownMaterialized: Bool
-    let manager: NSFileProviderManager
+    let manager: NativeDomainManaging
 }
 private final class NativeMaterializedObserver: NSObject, NSFileProviderEnumerationObserver {
     let done = DispatchSemaphore(value: 0)
@@ -48,7 +88,13 @@ private final class NativeMaterializedObserver: NSObject, NSFileProviderEnumerat
 final class NativeMaterializationBudget {
     private let bridge: BackendBridge
     private let domain: String
-    init(bridge: BackendBridge, domain: String) { self.bridge = bridge; self.domain = domain }
+    private let system: NativeSystemManaging
+    private let timeout: TimeInterval
+    private let now: () -> Date
+    init(bridge: BackendBridge, domain: String, system: NativeSystemManaging = NativeSystemManager(),
+         timeout: TimeInterval = 20, now: @escaping () -> Date = Date.init) {
+        self.bridge = bridge; self.domain = domain; self.system = system; self.timeout = timeout; self.now = now
+    }
 
     private func quota(_ message: String) -> NSError {
         NSError(domain: NSFileProviderErrorDomain, code: NSFileProviderError.insufficientQuota.rawValue,
@@ -75,10 +121,10 @@ final class NativeMaterializationBudget {
               metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), metadata.st_mode & 0o077 == 0 else {
             throw NativeFailure.invalid("The native cache budget lock must be a private regular file.")
         }
-        let deadline = Date(timeIntervalSinceNow: 20)
+        let deadline = now().addingTimeInterval(timeout)
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             try operation?.check()
-            guard errno == EWOULDBLOCK, Date() < deadline else { throw NativeFailure.bridge("Another native cache operation is still in progress.") }
+            guard errno == EWOULDBLOCK, now() < deadline else { throw NativeFailure.bridge("Another native cache operation is still in progress.") }
             usleep(20_000)
         }
         let stateURL = bridge.paths.group.appendingPathComponent("native-budget.json")
@@ -91,7 +137,7 @@ final class NativeMaterializationBudget {
                   info.st_mode & 0o077 == 0, info.st_size <= 1024 * 1024 else { throw NativeFailure.invalid("Invalid native cache reservation file.") }
             state = try JSONDecoder().decode(NativeBudgetState.self, from: handle.readDataToEndOfFile())
         } else if errno != ENOENT { throw NativeFailure.bridge("Native cache reservations cannot be read safely.") }
-        state.reservations = state.reservations.filter { $0.value.expires > Date().timeIntervalSince1970 }
+        state.reservations = state.reservations.filter { $0.value.expires > now().timeIntervalSince1970 }
         let result = try body(&state)
         let payload = try JSONEncoder().encode(state)
         guard payload.count <= 1024 * 1024 else { throw NativeFailure.invalid("The native reservation plan is too large; pin smaller folders separately.") }
@@ -108,7 +154,7 @@ final class NativeMaterializationBudget {
         let done = DispatchSemaphore(value: 0)
         var value: T?; var failure: Error?
         body { value = $0; failure = $1; done.signal() }
-        guard done.wait(timeout: .now() + 20) == .success else { throw NativeFailure.bridge("The system cache metadata request timed out.") }
+        guard done.wait(timeout: .now() + timeout) == .success else { throw NativeFailure.bridge("The system cache metadata request timed out.") }
         if let failure = failure { throw failure }
         guard let value = value else { throw NativeFailure.bridge("The system did not return cache metadata.") }
         return value
@@ -117,10 +163,10 @@ final class NativeMaterializationBudget {
     private func residents(_ operation: SocketOperation?) throws -> [NativeResident] {
         let reply = try bridge.request(["op": "domains"], operation: operation)
         let smart = Set((reply["domains"] as? [[String: Any]] ?? []).filter { $0["smart"] as? Bool == true }.compactMap { $0["id"] as? String })
-        let domains: [NSFileProviderDomain] = try awaitValue { NSFileProviderManager.getDomainsWithCompletionHandler($0) }
+        let domains: [NSFileProviderDomain] = try awaitValue { self.system.domains(completionHandler: $0) }
         var result: [NativeResident] = []
         for domain in domains where smart.contains(domain.identifier.rawValue) {
-            guard let manager = NSFileProviderManager(for: domain) else { throw NativeFailure.bridge("A registered Smart domain's cache cannot be inspected safely.") }
+            guard let manager = system.manager(for: domain) else { throw NativeFailure.bridge("A registered Smart domain's cache cannot be inspected safely.") }
             let enumerator = manager.enumeratorForMaterializedItems()
             defer { enumerator.invalidate() }
             var page: NSFileProviderPage? = NSFileProviderPage(Data())
@@ -129,7 +175,7 @@ final class NativeMaterializationBudget {
                 try operation?.check()
                 let observer = NativeMaterializedObserver()
                 enumerator.enumerateItems(for: observer, startingAt: current)
-                guard observer.done.wait(timeout: .now() + 20) == .success else { throw NativeFailure.bridge("The system materialized-file scan timed out.") }
+                guard observer.done.wait(timeout: .now() + timeout) == .success else { throw NativeFailure.bridge("The system materialized-file scan timed out.") }
                 if let failure = observer.failure { throw failure }
                 for item in observer.items {
                     let id = wireID(item.itemIdentifier)
@@ -164,7 +210,7 @@ final class NativeMaterializationBudget {
     private func evict(_ resident: NativeResident) -> Bool {
         let done = DispatchSemaphore(value: 0); var failure: Error?
         resident.manager.evictItem(identifier: providerID(resident.id)) { failure = $0; done.signal() }
-        return done.wait(timeout: .now() + 20) == .success && failure == nil
+        return done.wait(timeout: .now() + timeout) == .success && failure == nil
     }
 
     /// Reservation survives the callback until the OS materializes its visible file.
@@ -207,7 +253,7 @@ final class NativeMaterializationBudget {
         try locked(operation) { state in
             let configured = try bridge.request(["op": "domains"], operation: operation)
             let allowed = Set((configured["domains"] as? [[String: Any]] ?? []).filter { $0["smart"] as? Bool == true }.compactMap { $0["id"] as? String })
-            let registered: [NSFileProviderDomain] = try awaitValue { NSFileProviderManager.getDomainsWithCompletionHandler($0) }
+            let registered: [NSFileProviderDomain] = try awaitValue { self.system.domains(completionHandler: $0) }
             let registeredIDs = Set(registered.map { $0.identifier.rawValue })
             for removed in (state.usage ?? [:]).keys where !allowed.contains(removed) && !registeredIDs.contains(removed) {
                 // Only OS-confirmed absence permits clearing durable used bytes.
@@ -283,7 +329,7 @@ final class NativeMaterializationBudget {
                 let delta = item.size > (resident?.bytes ?? 0) ? item.size - (resident?.bytes ?? 0) : 0
                 let token = UUID().uuidString
                 proposed[token] = NativeReservation(domain: domain, id: item.id, version: item.content_version,
-                    bytes: delta, targetSize: item.size, pinPreflight: pin, delivered: false, expires: Date().timeIntervalSince1970 + 120)
+                    bytes: delta, targetSize: item.size, pinPreflight: pin, delivered: false, expires: now().timeIntervalSince1970 + 120)
                 requested?.append(token)
             }
             let oldReserved = try sum(previous.values.map { $0.bytes })
@@ -346,7 +392,7 @@ final class NativeMaterializationBudget {
                 guard let current = state.reservations[key] else { continue }
                 state.reservations[key] = NativeReservation(domain: current.domain, id: current.id, version: current.version,
                     bytes: current.bytes, targetSize: current.targetSize, pinPreflight: current.pinPreflight,
-                    delivered: current.delivered, expires: Date().timeIntervalSince1970 + 120)
+                    delivered: current.delivered, expires: now().timeIntervalSince1970 + 120)
                 domains.insert(current.domain)
             }
             for domain in domains { try publish(domain, state) }
@@ -360,7 +406,7 @@ final class NativeMaterializationBudget {
                 guard let current = state.reservations[key] else { continue }
                 state.reservations[key] = NativeReservation(domain: current.domain, id: current.id, version: current.version,
                     bytes: current.bytes, targetSize: current.targetSize, pinPreflight: false, delivered: true,
-                    expires: Date().timeIntervalSince1970 + 120)
+                    expires: now().timeIntervalSince1970 + 120)
             }
         }
     }
@@ -373,7 +419,7 @@ final class NativeMaterializationBudget {
         try locked(nil) { state in
             state.reservations[UUID().uuidString] = NativeReservation(domain: domain, id: item.id,
                 version: item.content_version, bytes: 0, targetSize: item.size, pinPreflight: false,
-                delivered: true, expires: Date().timeIntervalSince1970 + 120)
+                delivered: true, expires: now().timeIntervalSince1970 + 120)
         }
     }
 }

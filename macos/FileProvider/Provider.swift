@@ -17,21 +17,36 @@ private final class CompletionOnce<T> {
 final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileProviderCustomAction {
     let domain: NSFileProviderDomain
     private let bridge: BackendBridge?
-    private let manager: NSFileProviderManager?
+    private let manager: NativeDomainManaging?
+    private let budgetFactory: (BackendBridge, String) -> NativeMaterializationBudget
+    private let heartbeatInterval: TimeInterval
     private let lock = NSLock()
     private var active: [UUID: SocketOperation] = [:]
     private var invalidated = false
     private var timer: DispatchSourceTimer?
     private var budgetSweepInFlight = false
 
-    required init(domain: NSFileProviderDomain) {
-        self.domain = domain
+    required convenience init(domain: NSFileProviderDomain) {
+        let bridge: BackendBridge?
         do { bridge = try BackendBridge(bundle: Bundle(for: RDriveProvider.self)) }
         catch { bridge = nil; nativeDevelopmentLog("Provider initialization: \(error)") }
-        manager = NSFileProviderManager(for: domain)
+        self.init(domain: domain, bridge: bridge, manager: NativeSystemManager().manager(for: domain))
+    }
+
+    /// The extension host supplies OS defaults; isolated callers may supply
+    /// a scoped bridge and manager without starting background system work.
+    init(domain: NSFileProviderDomain, bridge: BackendBridge?, manager: NativeDomainManaging?,
+         startBackground: Bool = true, backgroundInterval: TimeInterval = 15, heartbeatInterval: TimeInterval = 30,
+         budgetFactory: @escaping (BackendBridge, String) -> NativeMaterializationBudget = { NativeMaterializationBudget(bridge: $0, domain: $1) }) {
+        self.domain = domain
+        self.bridge = bridge
+        self.manager = manager
+        self.budgetFactory = budgetFactory
+        self.heartbeatInterval = heartbeatInterval
         super.init()
+        guard startBackground else { return }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 15, repeating: 15)
+        timer.schedule(deadline: .now() + backgroundInterval, repeating: backgroundInterval)
         timer.setEventHandler { [weak self] in self?.signal(); self?.sweepBudget() }
         timer.resume()
         self.timer = timer
@@ -68,7 +83,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
         budgetSweepInFlight = true; lock.unlock()
         DispatchQueue.global(qos: .utility).async {
             defer { self.lock.lock(); self.budgetSweepInFlight = false; self.lock.unlock() }
-            do { try NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue).sweep() }
+            do { try self.budgetFactory(bridge, self.domain.identifier.rawValue).sweep() }
             catch { nativeDevelopmentLog("Native cache sweep: \(error)") }
         }
     }
@@ -122,7 +137,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                        request: NSFileProviderRequest, completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
         work({ bridge, operation -> (URL, ProviderItem, () -> Void) in
             let expected = try bridge.item(["op": "item", "domain": self.domain.identifier.rawValue, "id": wireID(itemIdentifier)], operation: operation)
-            let budget = NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue)
+            let budget = self.budgetFactory(bridge, self.domain.identifier.rawValue)
             let reservation: [String]?
             do { reservation = try budget.reserve(expected, operation: operation) }
             catch {
@@ -136,7 +151,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             }
             var delivered = false
             let heartbeat = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-            heartbeat.schedule(deadline: .now() + 30, repeating: 30)
+            heartbeat.schedule(deadline: .now() + self.heartbeatInterval, repeating: self.heartbeatInterval)
             heartbeat.setEventHandler {
                 do { try budget.renew(reservation) } catch { operation.cancel() }
             }
@@ -189,7 +204,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             if let source = url { staged = try bridge.stagedCopy(source); message["content_path"] = staged!.path }
             defer { if let staged = staged { try? FileManager.default.removeItem(at: staged) } }
             let item = ProviderItem(try bridge.item(message, operation: operation))
-            try? NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue).acknowledgeLocalContent(item.wire)
+            try? self.budgetFactory(bridge, self.domain.identifier.rawValue).acknowledgeLocalContent(item.wire)
             self.signal(item.parentItemIdentifier)
             return item
         }) { result in
@@ -221,7 +236,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             }
             defer { if let staged = staged { try? FileManager.default.removeItem(at: staged) } }
             let updated = ProviderItem(try bridge.item(message, operation: operation))
-            if newContents != nil { try? NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue).acknowledgeLocalContent(updated.wire) }
+            if newContents != nil { try? self.budgetFactory(bridge, self.domain.identifier.rawValue).acknowledgeLocalContent(updated.wire) }
             self.signal(updated.parentItemIdentifier)
             if let previousParent = previousParent, previousParent != updated.parentItemIdentifier { self.signal(previousParent) }
             return updated
@@ -251,7 +266,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             for identifier in itemIdentifiers {
                 try operation.check()
                 if actionIdentifier.rawValue == "rdrive.pin" || actionIdentifier.rawValue == "rdrive.unpin" {
-                    let budget = NativeMaterializationBudget(bridge: bridge, domain: self.domain.identifier.rawValue)
+                    let budget = self.budgetFactory(bridge, self.domain.identifier.rawValue)
                     var reservation: [String]?
                     if actionIdentifier.rawValue == "rdrive.pin" {
                         let item = try bridge.item(["op": "item", "domain": self.domain.identifier.rawValue, "id": wireID(identifier)], operation: operation)

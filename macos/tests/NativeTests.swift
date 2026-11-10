@@ -1,6 +1,7 @@
 import Foundation
 import FileProvider
 import UniformTypeIdentifiers
+import Darwin
 
 struct TestFailure: Error { let message: String }
 func expect(_ value: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -66,15 +67,281 @@ enum NativeTests {
         let largePairs: [[Any]] = (0..<100).map { [String(repeating: "x", count: 800) + String($0), 4] }
         try reject(archive(["v": 1, "t": largePairs]), "Oversized normalized tags accepted")
         try reject(Data(repeating: 0, count: 1024 * 1024 + 1), "Oversized tag archive accepted")
+        for tags in [[""], ["bad\0tag"], [String(repeating: "x", count: 1031)], Array(repeating: "Blue\n4", count: 1025)] {
+            try reject(PropertyListSerialization.data(fromPropertyList: tags, format: .binary, options: 0), "Invalid raw tag array accepted")
+        }
+        try reject(archive(["v": 1, "t": [["Blue"]]]), "Incomplete native tag pair accepted")
+        try reject(archive(["v": 1, "t": [[String(repeating: "x", count: 1025), 4]]]), "Overlong native tag name accepted")
+        try reject(archive(["v": 1, "t": Array(repeating: ["Blue", 4], count: 1025)]), "Too many native tags accepted")
         print("PASS native tag archive normalization, exact raw bytes, explicit clear, names/colors and size bounds")
     }
 
-    static func main() throws {
+    static func rejects(_ message: String, _ body: () throws -> Void) throws {
+        do { try body() } catch { return }
+        throw TestFailure(message: message)
+    }
+
+    static func fixtureItem(_ changes: [String: Any] = [:]) throws -> WireItem {
+        var raw: [String: Any] = ["id": "test-file", "parent_id": "root", "name": "test.txt", "kind": "file", "size": 19,
+            "content_version": "content", "metadata_version": "metadata", "pinned": false, "capabilities": ["read"]]
+        raw.merge(changes) { _, right in right }
+        return try WireItem.decode(raw)
+    }
+
+    static func testValidation(_ paths: NativePaths, _ bridge: BackendBridge) throws {
+        let object: [String: Any] = ["path": paths.group.path, "domain": "fixture"]
+        let root = try JSONDecoder().decode(WatchedRoot.self, from: JSONSerialization.data(withJSONObject: object))
+        try expect(root.domain == "fixture" && root.path == paths.group.path, "Watched roots did not round trip")
+        try expect(paths.roots.lastPathComponent == "finder-roots.json", "Root mapping path changed")
+        for id in ["root", "working_set", "trash", "stable-file"] {
+            try expect(wireID(providerID(id)) == id, "Special provider identity did not round trip")
+        }
+        for name in ["", "user.bad\n#S", "com.apple.metadata:_kMDItemUserTags#S", "user.no-suffix", "com.apple.quarantine#S"] {
+            try expect(!nativeSyncableAttribute(name), "Unsafe native attribute accepted")
+        }
+        try expect(nativeSyncableAttribute("com.apple.metadata:test#S"), "Safe metadata attribute refused")
+        try expect(try nativeAttributePayload(["user.test#S": Data([0, 255]), "security.test#S": Data([1])]) == ["user.test#S": "00ff"], "Attribute encoding/filtering failed")
+        try rejects("Oversized outgoing attributes accepted") { _ = try nativeAttributePayload(["user.test#S": Data(repeating: 0, count: 32769)]) }
+        try expect(nativeHexData("0") == nil && nativeHexData("zz") == nil, "Invalid hex accepted")
+        try expect(nativeHexData("") == Data() && nativeHexData("01FF") == Data([1, 255]), "Hex decoder changed valid bytes")
+        for changes: [String: Any] in [["name": ""], ["name": "."], ["name": ".."], ["name": "a/b"], ["name": "a\0b"], ["id": ""], ["kind": "symlink"], ["metadata_version": String(repeating: "x", count: 129)], ["extended_attributes": ["user.test#S": "0"]], ["extended_attributes": ["user.test#S": "GG"]], ["extended_attributes": ["user.test#S": String(repeating: "00", count: 32769)]]] {
+            try rejects("Invalid wire metadata accepted") { _ = try fixtureItem(changes) }
+        }
+        for state in NativeSyncState.allCases {
+            try expect(!state.title.isEmpty, "State has no display title")
+        }
+        try expect(NativeSyncState.item(fixtureItem(["sync_state": "unknown", "pinned": true])) == .pinned, "Unknown state did not preserve pin fallback")
+        try expect(NativeSyncState.item(fixtureItem()) == .online, "Default state changed")
+        let codes: [String: NSFileProviderError.Code] = ["no_such_item": .noSuchItem, "not_authenticated": .notAuthenticated,
+            "filename_collision": .filenameCollision, "sync_anchor_expired": .syncAnchorExpired, "version_conflict": .cannotSynchronize,
+            "insufficient_quota": .insufficientQuota, "directory_not_empty": .directoryNotEmpty, "deletion_rejected": .deletionRejected,
+            "unknown": .serverUnreachable]
+        for (code, expected) in codes { try expect(remoteError(["code": code]).code == expected.rawValue, "Typed backend error changed") }
+        try expect(remoteError([:]).code == NSFileProviderError.serverUnreachable.rawValue, "Missing backend code was not conservative")
+        try expect(remoteError(["code": "cancelled"]).code == NSUserCancelledError, "Cancellation error mapping changed")
+        try expect(remoteError(["code": "unsupported"]).code == NSFeatureUnsupportedError, "Unsupported error mapping changed")
+        let cocoa = NSError(domain: NSCocoaErrorDomain, code: 1)
+        try expect(providerError(cocoa) === cocoa, "Existing Cocoa error was replaced")
+        try expect(providerError(NativeFailure.invalid("synthetic")).code == NSFileProviderError.serverUnreachable.rawValue, "Untyped native error did not map")
+        let progress = Progress(totalUnitCount: 7)
+        let operation = SocketOperation(progress: progress)
+        for (completed, total): (Int64, Int64) in [(-1, 10), (11, 10), (0, 0)] { operation.report(completed: completed, total: total) }
+        try expect(progress.totalUnitCount == 7, "Invalid progress widened bounds")
+        operation.cancel()
+        try rejects("Cancelled operation attached a socket") { try operation.attach(-1) }
+        try rejects("Precancelled request started I/O") { _ = try bridge.request(["op": "test.fragmented"], operation: operation) }
+        for op in ["test.nonobject", "test.malformed", "test.disconnected", "test.error"] {
+            try rejects("Invalid/disconnected backend response accepted") { _ = try bridge.request(["op": op]) }
+        }
+        do { _ = try bridge.request(["op": "test.oversized"]); throw TestFailure(message: "Oversized bridge response accepted") }
+        catch let NativeFailure.invalid(message) { try expect(message.contains("too large"), "Large response failed for an unrelated reason") }
+        try expect(try bridge.item(["op": "item"]).id == "stable-0", "Item response did not decode")
+        try rejects("Missing backend item accepted") { _ = try bridge.item(["op": "test.missing-item"]) }
+        try rejects("Oversized bridge request accepted") { _ = try bridge.request(["op": "unused", "text": String(repeating: "x", count: 4 * 1024 * 1024)]) }
+        let long = BackendBridge(paths: NativePaths(group: paths.group.appendingPathComponent(String(repeating: "x", count: 110))))
+        try rejects("Oversized Unix socket path accepted") { _ = try long.request(["op": "unused"]) }
+        let absent = BackendBridge(paths: NativePaths(group: paths.group.appendingPathComponent("missing-peer")))
+        try rejects("Missing Unix peer did not fail") { _ = try absent.request(["op": "unused"]) }
+        try rejects("Missing development endpoint accepted") {
+            _ = try BackendBridge(paths: NativePaths(group: paths.group.appendingPathComponent("missing-peer"), development: true)).request(["op": "unused"])
+        }
+        try rejects("Directory was accepted as upload content") { _ = try bridge.stagedCopy(paths.group) }
+        print("PASS strict wire/attribute validation, typed errors, cancellation and malformed/disconnected IPC responses")
+    }
+
+    static func testConfiguredPaths(_ paths: NativePaths) throws {
+        func bundle(_ values: [String: Any]) throws -> Bundle {
+            let url = paths.group.appendingPathComponent(UUID().uuidString + ".bundle")
+            let contents = url.appendingPathComponent("Contents")
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: values.merging(["CFBundleIdentifier": UUID().uuidString]) { left, _ in left }, format: .xml, options: 0)
+            try data.write(to: contents.appendingPathComponent("Info.plist"))
+            guard let bundle = Bundle(url: url) else { throw TestFailure(message: "Could not create a synthetic bundle") }
+            return bundle
+        }
+        let valid = try bundle(["RDriveDevelopmentIPCRoot": paths.group.path])
+        let selected = try NativePaths.configured(bundle: valid)
+        try expect(selected.development && selected.group.standardizedFileURL.path == paths.group.standardizedFileURL.path, "Private development bundle path changed")
+        try expect(try BackendBridge(bundle: valid).paths.group.standardizedFileURL.path == paths.group.standardizedFileURL.path, "Bundle bridge did not use selected path")
+        let appGroup = try bundle(["RDriveAppGroup": "synthetic.coverage.group"])
+        let grouped = try NativePaths.configured(bundle: appGroup, groupContainer: { identifier in
+            identifier == "synthetic.coverage.group" ? paths.group : nil
+        })
+        try expect(grouped.group == paths.group && !grouped.development, "Authorized-container boundary changed its configured result")
+        try rejects("Missing app group accepted") { _ = try NativePaths.configured(bundle: bundle([:])) }
+        try rejects("Relative development path accepted") { _ = try NativePaths.configured(bundle: bundle(["RDriveDevelopmentIPCRoot": "relative"])) }
+        let publicDirectory = paths.group.appendingPathComponent("public-test")
+        try? FileManager.default.removeItem(at: publicDirectory)
+        try FileManager.default.createDirectory(at: publicDirectory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+        try rejects("Public development directory accepted") { _ = try NativePaths.configured(bundle: bundle(["RDriveDevelopmentIPCRoot": publicDirectory.path])) }
+        let alias = paths.group.appendingPathComponent("group-alias")
+        try? FileManager.default.removeItem(at: alias)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: paths.group)
+        try rejects("Symlink development directory accepted") { _ = try NativePaths.configured(bundle: bundle(["RDriveDevelopmentIPCRoot": alias.path])) }
+        print("PASS synthetic bundle configuration, private path selection and unsafe/missing path refusal")
+    }
+
+    static func testProviderProperties() throws {
+        var properties: [String: Any] = ["capabilities": ["read", "write", "add", "rename", "reparent", "delete", "unknown"], "modified": "2026-11-10T10:00:00Z"]
+        let regular = ProviderItem(try fixtureItem(properties))
+        try expect(regular.filename == "test.txt" && regular.documentSize == 19 && regular.contentType == .plainText, "Regular file properties changed")
+        try expect(regular.contentModificationDate != nil && regular.contentPolicy == .inherited, "Unpinned file/date properties changed")
+        try expect(regular.capabilities.contains(.allowsReading) && regular.capabilities.contains(.allowsReparenting) && regular.capabilities.contains(.allowsDeleting), "Native capability projection incomplete")
+        try expect(regular.itemVersion.contentVersion == Data("content".utf8), "Content version changed")
+        try expect(regular.tagData == nil && regular.extendedAttributes.isEmpty && regular.uploadingError == nil && regular.isUploaded && !regular.isUploading, "Clean defaults changed")
+        properties["modified"] = "not-a-date"; properties["name"] = "unknown-no-extension"
+        try expect(ProviderItem(fixtureItem(properties)).contentModificationDate == nil && ProviderItem(fixtureItem(properties)).contentType == .data, "Unknown content/date fallback changed")
+        let directory = ProviderItem(try fixtureItem(["kind": "directory", "id": "root"]))
+        try expect(directory.documentSize == nil && directory.contentType == .folder && directory.contentPolicy == .downloadLazily && directory.decorations == nil && directory.contentModificationDate == nil, "Root directory properties changed")
+        for state in ["syncing", "conflict", "error"] {
+            let item = ProviderItem(try fixtureItem(["sync_state": state]))
+            try expect(item.isUploading == (state == "syncing"), "Uploading state projection changed")
+            try expect((item.uploadingError != nil) == (state != "syncing"), "Error state projection changed")
+        }
+        let dirty = ProviderItem(try fixtureItem(["has_unsynced_changes": true]))
+        try expect(!dirty.isUploaded, "Explicit unsynced flag was ignored")
+        if #available(macOS 27.0, *) {
+            try expect(directory.namespacePolicy == .materializeLazily, "Root namespace policy changed")
+            try expect(ProviderItem(fixtureItem(["kind": "directory", "pinned": true])).namespacePolicy == .materializeEagerly, "Pinned directory namespace policy changed")
+            try expect(regular.namespacePolicy == .inherited, "File namespace policy changed")
+        }
+        print("PASS complete file/directory properties, version/capability projection, native policies and error states")
+    }
+
+    static func testBudgetLocalState(_ paths: NativePaths, _ bridge: BackendBridge) throws {
+        let budget = NativeMaterializationBudget(bridge: bridge, domain: "local-fixture")
+        let state = paths.group.appendingPathComponent("native-budget.json")
+        let lock = paths.group.appendingPathComponent("native-budget.lock")
+        try? FileManager.default.removeItem(at: state); try? FileManager.default.removeItem(at: lock)
+        budget.release(nil); try budget.renew(nil); try budget.markDelivered(nil)
+        try expect(try budget.reserve(fixtureItem(), operation: nil) == nil, "Non-Smart content unexpectedly requested system quota")
+        try budget.sweep() // The synthetic peer reports no Smart domains: no OS manager is queried.
+        try rejects("Oversized Smart content was admitted before its size check") {
+            _ = try budget.reserve(fixtureItem(["smart": true, "size": 1025]), operation: nil)
+        }
+        try budget.acknowledgeLocalContent(fixtureItem())
+        try budget.acknowledgeLocalContent(fixtureItem(["smart": true, "kind": "directory"]))
+        try budget.acknowledgeLocalContent(fixtureItem(["smart": true, "has_unsynced_changes": true]))
+        try expect(!FileManager.default.fileExists(atPath: state.path), "Unconfirmed/nonfile content created a receipt")
+        try budget.acknowledgeLocalContent(fixtureItem(["smart": true]))
+        func readState() throws -> [String: Any] { try JSONSerialization.jsonObject(with: Data(contentsOf: state)) as! [String: Any] }
+        var reservations = try readState()["reservations"] as! [String: [String: Any]]
+        try expect(reservations.count == 1, "Confirmed local content did not create one receipt")
+        let token = reservations.keys.first!
+        try expect(reservations[token]?["delivered"] as? Bool == true && (reservations[token]?["bytes"] as? NSNumber)?.intValue == 0, "Local content incorrectly allocated download bytes")
+        try budget.renew([token, "missing"])
+        try budget.markDelivered([token, "missing"])
+        reservations = try readState()["reservations"] as! [String: [String: Any]]
+        try expect(reservations[token]?["pinPreflight"] as? Bool == false, "Delivered reservation retained pin ownership")
+        budget.release([token, "missing"])
+        try expect((try readState()["reservations"] as! [String: Any]).isEmpty, "Released receipt persisted")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: state.path)
+        try rejects("Public reservation state accepted") { try budget.renew([]) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: state.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: lock.path)
+        try rejects("Public budget lock accepted") { try budget.renew([]) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: lock.path)
+        try FileManager.default.removeItem(at: state)
+        try FileManager.default.createSymbolicLink(at: state, withDestinationURL: paths.group.appendingPathComponent("unrelated"))
+        try rejects("Symlink reservation file accepted") { try budget.markDelivered([]) }
+        try FileManager.default.removeItem(at: state)
+        try FileManager.default.removeItem(at: lock)
+        try FileManager.default.createSymbolicLink(at: lock, withDestinationURL: paths.group.appendingPathComponent("unrelated"))
+        try rejects("Symlink lock accepted") { try budget.renew([]) }
+        try FileManager.default.removeItem(at: lock)
+        print("PASS local native budget receipts/leases, zero-byte acknowledgements and private-file guards without system cache operations")
+    }
+
+    static func testEnumeratorFailures(_ bridge: BackendBridge) throws {
+        let enumerator = ProviderEnumerator(domain: "edge-fixture", container: .workingSet, bridge: bridge)
+        let anchored = DispatchSemaphore(value: 0)
+        var anchor: NSFileProviderSyncAnchor?
+        enumerator.currentSyncAnchor { anchor = $0; anchored.signal() }
+        try wait(anchored)
+        try expect(anchor?.rawValue == Data("999".utf8), "Fresh current anchor did not come from the backend")
+        for data in [Data([255]), Data("unknown:0".utf8)] {
+            let observer = EnumerationProbe()
+            enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(data))
+            try wait(observer.done)
+            try expect(observer.error != nil && observer.items.isEmpty, "Invalid page was accepted")
+        }
+        let first = EnumerationProbe()
+        enumerator.enumerateItems(for: first, startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByDate as Data))
+        try wait(first.done)
+        let snapshot = String(data: first.next!.rawValue, encoding: .utf8)!.split(separator: ":")[0]
+        for suffix in ["-1", "999"] {
+            let observer = EnumerationProbe()
+            enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(Data((snapshot + ":" + suffix).utf8)))
+            try wait(observer.done)
+            try expect(observer.error != nil && observer.items.isEmpty, "Invalid page offset was accepted")
+        }
+        let changes = ChangesProbe()
+        enumerator.enumerateChanges(for: changes, from: NSFileProviderSyncAnchor(Data("1".utf8)))
+        try wait(changes.done)
+        try expect(changes.error == nil && changes.items.count == 3, "Working-set changes were incorrectly parent filtered")
+        let invalid = ChangesProbe()
+        enumerator.enumerateChanges(for: invalid, from: NSFileProviderSyncAnchor(Data([255])))
+        try wait(invalid.done)
+        try expect(invalid.error != nil, "Invalid UTF-8 sync anchor accepted")
+        enumerator.invalidate()
+        let cancelled = ChangesProbe()
+        enumerator.enumerateChanges(for: cancelled, from: NSFileProviderSyncAnchor(Data("1".utf8)))
+        try wait(cancelled.done)
+        try expect(cancelled.error != nil, "Invalidated changes enumerator emitted a success")
+        let finished = DispatchSemaphore(value: 0)
+        enumerator.currentSyncAnchor { anchor = $0; finished.signal() }
+        try wait(finished)
+        try expect(anchor == nil, "Invalidated enumerator produced an anchor")
+        for domain in ["missing-list", "missing-list-anchor", "invalid-list-item"] {
+            let invalid = ProviderEnumerator(domain: domain, container: .rootContainer, bridge: bridge)
+            let observer = EnumerationProbe()
+            invalid.enumerateItems(for: observer, startingAt: NSFileProviderPage(NSFileProviderPage.initialPageSortedByName as Data))
+            try wait(observer.done)
+            try expect(observer.error != nil && observer.items.isEmpty, "Incomplete listing was treated as an empty success")
+            invalid.invalidate()
+        }
+        for domain in ["missing-changes", "missing-changes-anchor"] {
+            let invalid = ProviderEnumerator(domain: domain, container: .rootContainer, bridge: bridge)
+            let observer = ChangesProbe()
+            invalid.enumerateChanges(for: observer, from: NSFileProviderSyncAnchor(Data("1".utf8)))
+            try wait(observer.done)
+            try expect(observer.error != nil, "Incomplete changes were acknowledged")
+            invalid.invalidate()
+        }
+        let missing = ProviderEnumerator(domain: "missing-changes-anchor", container: .rootContainer, bridge: bridge)
+        let missingDone = DispatchSemaphore(value: 0)
+        missing.currentSyncAnchor { anchor = $0; missingDone.signal() }
+        try wait(missingDone)
+        try expect(anchor == nil, "Missing current anchor was manufactured")
+        missing.invalidate()
+        print("PASS invalid/expired pagination, current/invalidated anchors, working-set projection and incomplete catalog refusal")
+    }
+
+    static func main() {
+        setbuf(stdout, nil)
+        do { try run() }
+        catch {
+            fflush(stdout)
+            fputs("FAIL native tests: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
+    static func run() throws {
         guard (2...3).contains(CommandLine.arguments.count) else { throw TestFailure(message: "Pass an isolated bridge directory") }
         let development = CommandLine.arguments.last == "--development-tcp"
         let paths = NativePaths(group: URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true), development: development)
         let bridge = BackendBridge(paths: paths)
         try testFinderTagNormalization()
+        try testValidation(paths, bridge)
+        try testConfiguredPaths(paths)
+        try testProviderProperties()
+        try testBudgetLocalState(paths, bridge)
+        try testEnumeratorFailures(bridge)
+        try ProviderCoverageTests.run(paths, bridge)
+        try BudgetCoverageTests.run(paths, bridge)
+        try UICoverageTests.run(paths, bridge)
+        try CompanionCoverageTests.run(paths, bridge)
         var raw: [String: Any] = ["id": "stable-uuid", "parent_id": "root", "name": "notes.txt", "kind": "file", "size": 19,
             "modified": "2026-11-09T12:00:00.123Z", "content_version": "content-A", "metadata_version": "meta-A", "pinned": true,
             "capabilities": ["read", "write", "rename"], "tag_data_hex": "0102ff",
@@ -185,5 +452,6 @@ enum NativeTests {
             try FileManager.default.moveItem(at: backup, to: endpoint)
             print("PASS development TCP requires localhost, private nonce descriptor and no symlink")
         }
+        try NativeSDKCoverageTests.run(paths)
     }
 }

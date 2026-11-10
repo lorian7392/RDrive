@@ -31,6 +31,9 @@ async fn plan(
     strategy: ConflictStrategy,
     explicit: bool,
 ) -> Result<Mutation> {
+    plan_with(store,d,queue,mutation,strategy,explicit,&NetworkConnector).await
+}
+async fn plan_with(store:&Store,d:&Domain,queue:&mut Queue,mutation:&Mutation,strategy:ConflictStrategy,explicit:bool,connector:&dyn Connector) -> Result<Mutation> {
     if !matches!(
         mutation.state,
         MutationState::Conflict | MutationState::Failed
@@ -70,7 +73,7 @@ async fn plan(
         .profiles
         .get(&d.profile)
         .context("domain profile missing")?;
-    let b = crate::factory::connect(profile, &d.profile, crate::transfer::global()).await?;
+    let b = connector.connect(profile, &d.profile, crate::transfer::global()).await?;
     let snapshot = if d.repository {
         refresh(store, b.as_ref(), d, &mut j).await?
     } else {
@@ -278,6 +281,9 @@ pub(super) fn planned_version(
 }
 
 pub(super) async fn finish_resolution(home: &Path, d: &Domain, mutation: &Mutation) -> Result<()> {
+    finish_resolution_with(home,d,mutation,&NetworkConnector).await
+}
+async fn finish_resolution_with(home:&Path,d:&Domain,mutation:&Mutation,connector:&dyn Connector)->Result<()> {
     if d.repository {
         return Ok(());
     }
@@ -294,7 +300,97 @@ pub(super) async fn finish_resolution(home: &Path, d: &Domain, mutation: &Mutati
         .profiles
         .get(&d.profile)
         .context("domain profile missing")?;
-    let b = crate::factory::connect(profile, &d.profile, crate::transfer::global()).await?;
+    let b = connector.connect(profile, &d.profile, crate::transfer::global()).await?;
     policies::finish_version(&store, b.as_ref(), &d.profile, &version.path, version).await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn plan_for_test(store:&Store,d:&Domain,queue:&mut Queue,mutation:&Mutation,strategy:ConflictStrategy,explicit:bool,connector:&dyn Connector)->Result<Mutation> {
+    plan_with(store,d,queue,mutation,strategy,explicit,connector).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request(value:Value)->Request {serde_json::from_value(value).unwrap()}
+    fn decision()->crate::policies::ResolutionPlan {crate::policies::ResolutionPlan{strategy:ConflictStrategy::KeepBoth,request:json!({}),target_path:"saved-copy".into(),version:None,repository_snapshot:None,fingerprint:"test".into(),created:state::now()}}
+    fn setup()->(tempfile::TempDir,Store,Domain,Queue,Mutation) {
+        let temporary=tempfile::tempdir().unwrap();let mut store=Store::open(temporary.path().join("state")).unwrap();
+        store.config.profiles.insert("p".into(),config::Profile{protocol:config::Protocol::Webdav,url:"https://example.invalid/".into(),username:None,password_env:None,allow_http:false,timeout_secs:1,smb_encryption:true,nextcloud_upload_url:None});store.save_config().unwrap();
+        let domain=Domain{id:"resolution-test".into(),profile:"p".into(),remote:String::new(),display_name:"Test".into(),repository:false,local_root:None,smart:true};
+        add_domain(&store,domain.clone()).unwrap();
+        let mut queue=Queue::open(&store,&domain.id,&journal_binding(&store.config,&domain).unwrap()).unwrap();
+        let source=temporary.path().join("local-edit");fs::write(&source,b"retained edit").unwrap();
+        let mutation=queue.enqueue(json!({"v":1,"op":"modify","domain":domain.id,"id":"file","request_id":"change","base_content_version":"base","base_metadata_version":"metadata"}),Some(&File::open(source).unwrap())).unwrap();
+        (temporary,store,domain,queue,mutation)
+    }
+    #[test]
+    fn original_location_uses_indexed_identity_or_validates_explicit_parent_and_name() {
+        let (_temporary,_store,domain,_queue,_mutation)=setup();let mut journal=Journal::default();
+        let mut item=root_item(&domain);item.id="file".into();item.kind="file".into();item.name="indexed".into();
+        journal.items.insert("file".into(),Record{path:"indexed".into(),item,entry:None,strong:None,client_id:None,metadata_known:false,metadata_checked:0});
+        assert_eq!(original_location(&journal,&request(json!({"v":1,"op":"modify","id":"file"}))).unwrap(),("root".into(),"indexed".into(),"indexed".into()));
+        assert_eq!(original_location(&journal,&request(json!({"v":1,"op":"create","name":"new"}))).unwrap().2,"new");
+        assert!(original_location(&journal,&request(json!({"v":1,"op":"modify","id":"absent"}))).is_err());
+        assert!(original_location(&journal,&request(json!({"v":1,"op":"create","parent_id":"missing","name":"new"}))).is_err());
+    }
+    #[tokio::test]
+    async fn invalid_resolution_states_are_stopped_before_any_connection_or_credential_lookup() {
+        let (_temporary,store,domain,mut queue,mutation)=setup();
+        assert!(plan(&store,&domain,&mut queue,&mutation,ConflictStrategy::KeepBoth,true).await.unwrap_err().to_string().contains("stopped"));
+        let failed=queue.fail(&mutation.id,crate::smart::FailureKind::Conflict,"synthetic conflict").unwrap();
+        let mut resolved=failed.clone();resolved.resolution=Some(decision());
+        assert!(plan(&store,&domain,&mut queue,&resolved,ConflictStrategy::KeepBoth,false).await.unwrap_err().to_string().contains("already attempted"));
+        let mut deleted=failed.clone();deleted.request["op"]=json!("delete");
+        assert!(plan(&store,&domain,&mut queue,&deleted,ConflictStrategy::KeepBoth,true).await.unwrap_err().to_string().contains("only file"));
+        assert!(plan(&store,&domain,&mut queue,&failed,ConflictStrategy::KeepBoth,true).await.unwrap_err().to_string().contains("no longer indexed"));
+        let no_contents=queue.enqueue(json!({"v":1,"op":"modify","domain":domain.id,"id":"another","request_id":"no-content","base_content_version":"base","base_metadata_version":"metadata"}),None).unwrap();
+        let no_contents=queue.fail(&no_contents.id,crate::smart::FailureKind::Conflict,"metadata only").unwrap();
+        assert!(plan(&store,&domain,&mut queue,&no_contents,ConflictStrategy::KeepBoth,true).await.unwrap_err().to_string().contains("retained file contents"));
+        let mut journal=checked_journal(&store.home,&store.config,&domain).unwrap();let mut item=root_item(&domain);item.id="file".into();item.kind="file".into();item.name="original".into();
+        journal.items.insert("file".into(),Record{path:"original".into(),item,entry:None,strong:None,client_id:None,metadata_known:false,metadata_checked:0});save_journal(&store,&domain.id,&journal).unwrap();
+        let mut renamed=failed;renamed.request["name"]=json!("new-name");
+        assert!(plan(&store,&domain,&mut queue,&renamed,ConflictStrategy::Replace,true).await.unwrap_err().to_string().contains("pending rename"));
+    }
+    #[tokio::test]
+    async fn responses_only_add_resolution_receipts_and_no_version_needs_no_network() {
+        let (_temporary,store,domain,_queue,mut mutation)=setup();
+        let home=store.home.clone();assert!(planned_version(&store,&domain,&request(json!({"v":1,"op":"modify"}))).unwrap().is_none());
+        assert_eq!(response_with_resolution(&mutation,json!({"item":"confirmed"})),json!({"item":"confirmed"}));
+        mutation.resolution=Some(decision());
+        assert_eq!(response_with_resolution(&mutation,json!({"item":"confirmed"}))["resolved_path"],"saved-copy");
+        assert_eq!(response_with_resolution(&mutation,json!(null)),json!(null));
+        drop(store);finish_resolution(&home,&domain,&mutation).await.unwrap();
+        let mut managed=domain.clone();managed.repository=true;finish_resolution(&home,&managed,&mutation).await.unwrap();
+    }
+    async fn remote_fixture() -> (tempfile::TempDir,Store,Domain,Queue,Mutation,Arc<super::super::test_backend::Disk>) {
+        let (temporary,store,domain,mut queue,mutation)=setup();let disk=super::super::test_backend::Disk::new(temporary.path().join("remote"));fs::write(disk.root.join("file"),b"remote original").unwrap();
+        let entry=disk.stat("file").await.unwrap().unwrap();let mut journal=checked_journal(&store.home,&store.config,&domain).unwrap();let mut item=root_item(&domain);item.id="file".into();item.kind="file".into();item.name="file".into();item.size=entry.size;item.content_version=version(&entry).unwrap();
+        journal.items.insert("file".into(),Record{path:"file".into(),item,entry:Some(entry.clone()),strong:Some(entry),client_id:None,metadata_known:false,metadata_checked:0});save_journal(&store,&domain.id,&journal).unwrap();
+        let failed=queue.fail(&mutation.id,crate::smart::FailureKind::Conflict,"synthetic external edit").unwrap();(temporary,store,domain,queue,failed,disk)
+    }
+    #[tokio::test]
+    async fn keep_both_plans_content_recovery_and_replace_archives_exact_remote_revision() {
+        use super::super::test_backend::Connected;
+        for strategy in [ConflictStrategy::KeepBoth,ConflictStrategy::Replace] {
+            let (_temporary,store,domain,mut queue,failed,disk)=remote_fixture().await;let connector=Connected(disk.clone());
+            let planned=plan_with(&store,&domain,&mut queue,&failed,strategy,true,&connector).await.unwrap();let decision=planned.resolution.as_ref().unwrap();assert_eq!(decision.strategy,strategy);
+            assert_eq!(fs::read(disk.root.join("file")).unwrap(),b"remote original","a decision must not publish the local edit");
+            if strategy==ConflictStrategy::KeepBoth {assert_eq!(decision.request["op"],"create");assert!(decision.target_path.contains("conflict-"));assert!(decision.version.is_none());}
+            else {let version=decision.version.clone().unwrap();assert_eq!(version.path,"file");let req:Request=serde_json::from_value(decision.request.clone()).unwrap();assert_eq!(planned_version(&store,&domain,&req).unwrap().unwrap().id,version.id);}
+            let home=store.home.clone();drop(store);finish_resolution_with(&home,&domain,&planned,&connector).await.unwrap();
+            assert!(disk.connections.load(std::sync::atomic::Ordering::SeqCst)>=1);
+        }
+    }
+    #[tokio::test]
+    async fn stop_missing_target_and_unsupported_replacement_do_not_publish_any_bytes() {
+        use super::super::test_backend::Connected;
+        let (_temporary,store,domain,mut queue,failed,mut disk)=remote_fixture().await;Arc::get_mut(&mut disk).unwrap().conditional=false;let connector=Connected(disk.clone());
+        assert!(plan_with(&store,&domain,&mut queue,&failed,ConflictStrategy::Stop,true,&connector).await.unwrap_err().to_string().contains("choose keep-both"));
+        assert!(plan_with(&store,&domain,&mut queue,&failed,ConflictStrategy::Replace,true,&connector).await.unwrap_err().to_string().contains("cannot guard"));
+        fs::remove_file(disk.root.join("file")).unwrap();assert!(plan_with(&store,&domain,&mut queue,&failed,ConflictStrategy::Replace,true,&connector).await.unwrap_err().to_string().contains("target is absent"));
+        assert!(queue.get(&failed.id).unwrap().resolution.is_none());
+    }
+
 }

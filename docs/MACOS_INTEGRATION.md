@@ -1,24 +1,21 @@
-# Native Finder and File Provider integration
+# macOS 原生集成
 
-The 0.4.0/build6 companion contains three real macOS extensions. The replicated
-File Provider supplies metadata, dataless files, native status decorations and
-file actions. File Provider UI presents the selected item's synchronization
-status. A separate Finder Sync extension supplies menus for explicitly mapped
-ordinary folders. macOS creates the dataless files and calls the provider when
-an application needs their contents; the implementation does not create empty
-files and call them placeholders.
+当前源码版本为 **RDrive 0.8.0**。可选伴随 App 包含菜单栏宿主和三个 macOS 扩展：replicated File Provider 提供元数据、系统占位文件、按需下载和文件操作；File Provider UI 显示所选项目的同步状态；独立 Finder Sync 扩展为显式映射的普通目录提供菜单。
 
-## Build
+占位文件由 macOS 创建；应用读取正文时，系统调用 File Provider 下载内容。CLI 文件操作和普通系统 SMB/WebDAV 网络卷与这套集成分别运行。构建、签名核验、扩展启用、注册域和实际 Finder 显示是不同步骤，源码检出不会自动完成这些步骤。
+
+从源码构建和签名选择见[安装指南](INSTALLATION.md#可选构建-macos-伴随-app)，功能区别见[完整功能](FEATURES.md)。本页后半部分保留历史构建与系统观察；其中的版本、运行进程和本机路径描述当时的验证环境，不代表当前机器或新克隆已经部署。
+
+## 构建与签名
 
 Command Line Tools, Swift, and the macOS SDK are sufficient to compile these
 targets; the build does not require a full Xcode installation:
 
 ```sh
-cargo build --locked
-python3 macos/build.py
+cargo build --release --locked
 ```
 
-The result is `macos/build/RDrive.app`, with the following embedded components:
+然后选择下节的显式开发 IPC，或使用获授权的签名身份与 App Group 构建。构建结果为 `macos/build/RDrive.app`，包含：
 
 - `Contents/MacOS/RDriveCompanion`: native menu-bar app and domain controller.
 - `Contents/PlugIns/RDriveFinder.appex`: Finder Sync extension.
@@ -34,19 +31,18 @@ verification succeeds. It never installs or activates the app automatically.
 entitlements mode, CLI version, original CLI SHA256 before signing the copied
 executable, embedded CLI SHA256 after signing, and whether activation occurred.
 
-Without `--identity`, the result uses an ad-hoc signature. A production build can
-specify `--identity` and `--team-id`; the same authorized App Group must be
-available to the host and all three extensions:
+默认身份为 ad-hoc 开发签名。具备 App Group 授权的签名构建可以指定 `--identity` 和 `--team-id`；宿主和三个扩展必须使用同一个获授权的 App Group：
 
 ```sh
-python3 macos/build.py --identity 'Apple Development: your identity' --team-id YOURTEAMID
+python3 macos/build.py --cli target/release/rdrive \
+  --identity 'YOUR_SIGNING_IDENTITY' --team-id YOURTEAMID
 ```
 
 The default production group is `<TeamID>.io.rdrive.shared`. `--app-group` can
 override it. An ad-hoc signature passing local code verification does not imply
 App Group authorization, notarization, or distribution readiness.
 
-## Explicit local development IPC
+## 显式开发 IPC
 
 The development Mac accepted ad-hoc extension registration and a synthetic File
 Provider domain. However, its container manager rejected access to the protected
@@ -55,15 +51,13 @@ The development build option scopes a temporary sandbox file exception to one
 explicit, user-owned private directory:
 
 ```sh
-python3 macos/build.py --development-ipc-root /private/tmp/rdrive-native-ipc-501
+RDRIVE_DEV_IPC="$(mktemp -d "${TMPDIR%/}/rdrive-native-ipc.XXXXXX")"
+chmod 700 "$RDRIVE_DEV_IPC"
+python3 macos/build.py --cli target/release/rdrive \
+  --development-ipc-root "$RDRIVE_DEV_IPC"
 ```
 
-Use the actual user's UID or another dedicated directory. This mode omits the App
-Group entitlement entirely and embeds `RDriveDevelopmentIPCRoot` in each bundle.
-The extensions retain App Sandbox and receive only the explicit directory's
-read/write exception and network-client permission. No home directory exception,
-Full Disk Access, system-wide File Provider testing mode, or security setting is
-used. The directory must have owner-only permissions.
+保留本次选择的专用目录，后续宿主与桥接必须使用同一路径，不要复用另一实例的 IPC。此模式省略 App Group entitlement，并在各包中嵌入 `RDriveDevelopmentIPCRoot`。扩展保留 App Sandbox，只获得该专用目录的读写例外和网络客户端权限；不添加主目录访问例外，不要求 Full Disk Access，也不启用系统级 File Provider 测试模式或修改安全设置。目录必须仅允许当前所有者访问。
 
 An actual sandboxed provider test showed that the file exception alone does not
 permit an outbound Unix socket outside an authorized App Group: `connect`
@@ -81,14 +75,14 @@ format.
 This is a local development build, not a distributable production entitlement
 configuration. The build report identifies it accordingly.
 
-## Controls and lifecycle
+## 控制命令与生命周期
 
 For CLI-only use, run the Rust service and the foreground native watcher in
 separate terminals. Use the authorized App Group directory in production, or
 the exact private IPC directory embedded in a development build:
 
 ```sh
-NATIVE_IPC=/private/tmp/rdrive-native-ipc-501
+NATIVE_IPC="$RDRIVE_DEV_IPC"
 rdrive provider serve --socket "$NATIVE_IPC/bridge.sock" \
   --staging "$NATIVE_IPC/Transfers" --development-tcp
 rdrive provider native -- --group-directory "$NATIVE_IPC" --watch-domains
@@ -103,8 +97,9 @@ cache accounting. This is necessary for reliable updates while macOS has
 unloaded an idle provider extension. It rereads the IPC descriptor for every
 request, so a restarted broker's fresh nonce is picked up. Ctrl-C or SIGTERM
 stops it; an already scheduled OS download may continue. Keep both processes
-running for background Smart synchronization. No login item or launch agent is
-installed.
+running for background Smart synchronization. These foreground commands do not
+install a login item or LaunchAgent. Optional `rdrive service` supervision is
+configured separately; see [Smart 操作与管理](SMART_OPERATIONS.md).
 
 The optional menu-bar app starts its own bridge subprocess and reuses the same
 watcher. Quitting stops only that owned service. Existing profile and credential
@@ -151,13 +146,13 @@ extensions use only the path embedded in their reviewed bundle or their
 authorized App Group. Passing a different host override does not grant an
 extension access to that directory.
 
-## Finder actions and availability
+## Finder 动作与可用性
 
 The native File Provider menu provides Show Sync Status, Keep Offline, Allow
 Automatic Removal and Download Now; macOS also provides Remove Download. These
-menus and the pinned badge/label were actually observed in Finder. The separate
-Finder Sync menu has all five commands and was also observed in an ordinary
-mapped synthetic folder. Custom Finder Sync badge rendering in ordinary folders
+menus and the pinned badge/label were observed in the historical system runs
+recorded below. The separate Finder Sync menu has all five commands and was
+observed in an ordinary mapped synthetic folder in those runs. Custom Finder Sync badge rendering in ordinary folders
 remains unverified. File Provider and Finder Sync are separate mechanisms.
 
 Native item/domain IDs come from public File Provider URL/identifier APIs.
@@ -192,7 +187,7 @@ metadata and a matching `provider domain-add ... --local-root PATH` mapping.
 That mapping alone does not start a folder synchronization loop or turn a raw
 SMB/WebDAV mount into a placeholder-based Smart view.
 
-## Combined clean-cache budget
+## 清洁缓存联合预算
 
 The configured budget covers completed clean Rust cache payloads and their
 reservations plus reported native materialized payloads and native reservations.
@@ -238,7 +233,7 @@ rdrive cache config --max-bytes MAX_TOTAL_BYTES
 Review each result. Protected data can make these commands refuse the requested
 target; a failed lowering does not silently change the configured setting.
 
-## Provider behavior
+## File Provider 行为
 
 Metadata enumeration and content transfer are separate. Directory enumeration
 returns real remote item names, sizes, versions, parents, and capabilities.
@@ -285,7 +280,7 @@ record of already confirmed operations when a caller disconnects. The OS retains
 pending local changes when the provider reports errors and retries according to
 File Provider's synchronization rules.
 
-## Bridge contract
+## 桥接协议
 
 Each Unix-socket connection sends one newline-delimited JSON request containing
 `v: 1`, `request_id`, `op`, and operation fields. Replies are `{ok:true,...}` or
@@ -305,9 +300,29 @@ are version/domain scoped, chunked at 512 items, and do not replace physical
 byte accounting. Native versions are bounded to 128 UTF-8 bytes. The special
 wire IDs are `root` and `working_set`.
 
-## Validation and limits
+## 当前测试方式与适用边界
 
-The current 0.4.0/build6 development app embeds `rdrive 0.4.0`. Its original
+原生宿主测试使用真实 SDK 数据对象与回调接口，并在测试进程内替换域管理、通知、界面和进程边界；所有生产 Swift 源都保留在覆盖率范围内。测试使用私有临时 Unix/TCP 服务，不注册真实域、不显示窗口、不启动应用事件循环，也不请求真实内容驱逐：
+
+```sh
+python3 macos/tests/run.py
+python3 macos/tests/run.py --coverage --output-dir target/native-tests-coverage
+```
+
+第二条命令输出 `coverage.lcov`、`coverage.json`、`coverage-manifest.json` 和 `coverage-summary.json`。manifest 记录十个生产源的 SHA-256；覆盖率按 LCOV 唯一 `(文件, 行)` 计算，不能直接把泛型/闭包重复计数的 LLVM summary 当作物理行数。完整口径与逐语言验收命令见[测试说明](TESTING.md)。
+
+这些测试证明客户端逻辑、参数和错误处理按预期调用接口，不证明系统已接受某个签名包或 Finder 已实际显示菜单、图标和占位文件。`tests/provider_native_workflows.py`、`macos/tests/activation_probe.py` 会接触真实扩展和域；仅在独立测试账户或专用环境、明确待测 App 与 IPC 路径后执行。历史命令中的测试路径不能直接套用到正在运行的个人域。
+
+## 历史构建与系统观察
+
+以下保留对应版本当时的验证事实、产物路径和限制。测试组数不是当前源码的覆盖率；“保持运行”“已经升级”等状态只属于对应记录，不代表当前仍在运行，也不是首次安装步骤。历史 JSON/版本验证文件保持独立。
+
+<details>
+<summary>展开 0.4.0–0.8.0 的历史记录</summary>
+
+### 0.4.0/build6
+
+The 0.4.0/build6 development app embeds `rdrive 0.4.0`. Its original
 Rust executable SHA256 is
 `e51818bb29b81e638bdaecadd48aed99fa1375c08ce6b2e8eca7ab2ddb1f5215`.
 The embedded executable is re-signed, so its SHA256 differs; both hashes are
@@ -383,7 +398,25 @@ removed. `macos/build/native-cleanup-report-0.4.json` records the observed state
 The user's real 123pan mount, profile and routes were unchanged. Permanent
 extension enablement is not claimed.
 
-## Apple references
+### 0.4.1 real-service reconnection
+
+The 0.4.1/build7 bundle re-embeds the final Rust CLI. Native Swift behavior is unchanged. The Rust broker now indexes ordinary Smart domains one requested directory at a time, so a large remote tree no longer prevents the first namespace snapshot from appearing.
+
+The user's real 123pan connection was restored and its original native WebDAV volume retained. The additional Smart domain displayed 23 root items, a browsed child directory, Online only labels, dataless cloud buttons and the five custom actions in actual Finder. The final release broker and foreground native watcher remain running as requested. Cache capacity is 5 GiB; no real remote mutation test was performed. Live connection reports and all credentials remain in ignored private runtime state and are excluded from artifacts.
+
+The synthetic cleanup report above describes the completed 0.4 test fixtures. It does not mean this newly requested real domain or its services should be removed. The separate FinderSync badge limitation remains unchanged.
+
+### 0.7 构建验证
+
+0.7.0/build9 已在隔离目录编译并通过 ad-hoc 签名检查，嵌入同一份最终 CLI。未注册或激活该包，现有 Finder 实例仍使用原已安装版本。新命名操作的桥接协议测试通过不等同于 Finder 实机回调验证。详见 [0.7 验证](VALIDATION_0.7.0.md)及[Smart 操作与服务管理](SMART_OPERATIONS.md)。
+
+### 0.8 实际升级
+
+0.8.0/build10 已沿用原域和 IPC 路径切换现有原生包、Rust 桥接与通知助手。核对了扩展注册版本、新进程及原域目录；使用现有凭据完成远端只读根目录验证。0.7 阶段已实际观察 Finder 文件列表和在线云图标。缓存目录保持默认，没有对真实云盘做文件写入/删除测试；原生下载位置仍由 macOS 管理。详见 [0.8 激活记录](NATIVE_ACTIVATION_0.8.0.json)。
+
+</details>
+
+## Apple 接口文档
 
 - [Replicated File Provider extension](https://developer.apple.com/documentation/fileprovider/replicated-file-provider-extension)
 - [NSFileProviderReplicatedExtension](https://developer.apple.com/documentation/fileprovider/nsfileproviderreplicatedextension)
@@ -392,20 +425,3 @@ extension enablement is not claimed.
 - [App Groups entitlement and IPC requirements](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.application-groups)
 - Installed SDK headers: `NSFileProviderReplicatedExtension.h`,
   `NSFileProviderItem.h`, `NSFileProviderEnumerating.h`, and `FinderSync.h`.
-
-
-## 0.4.1 real-service reconnection
-
-The 0.4.1/build7 bundle re-embeds the final Rust CLI. Native Swift behavior is unchanged. The Rust broker now indexes ordinary Smart domains one requested directory at a time, so a large remote tree no longer prevents the first namespace snapshot from appearing.
-
-The user's real 123pan connection was restored and its original native WebDAV volume retained. The additional Smart domain displayed 23 root items, a browsed child directory, Online only labels, dataless cloud buttons and the five custom actions in actual Finder. The final release broker and foreground native watcher remain running as requested. Cache capacity is 5 GiB; no real remote mutation test was performed. Live connection reports and all credentials remain in ignored private runtime state and are excluded from artifacts.
-
-The synthetic cleanup report above describes the completed 0.4 test fixtures. It does not mean this newly requested real domain or its services should be removed. The separate FinderSync badge limitation remains unchanged.
-
-## 0.7 构建验证
-
-0.7.0/build9 已在隔离目录编译并通过 ad-hoc 签名检查，嵌入同一份最终 CLI。未注册或激活该包，现有 Finder 实例仍使用原已安装版本。新命名操作的桥接协议测试通过不等同于 Finder 实机回调验证。详见 [0.7 验证](VALIDATION_0.7.0.md)及[Smart 操作与服务管理](SMART_OPERATIONS.md)。
-
-## 0.8 实际升级
-
-0.8.0/build10 已沿用原域和 IPC 路径切换现有原生包、Rust 桥接与通知助手。核对了扩展注册版本、新进程及原域目录；使用现有凭据完成远端只读根目录验证。0.7 阶段已实际观察 Finder 文件列表和在线云图标。缓存目录保持默认，没有对真实云盘做文件写入/删除测试；原生下载位置仍由 macOS 管理。详见 [0.8 激活记录](NATIVE_ACTIVATION_0.8.0.json)。

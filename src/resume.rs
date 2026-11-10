@@ -167,6 +167,21 @@ fn local_hash(path: &Path) -> Result<Option<String>> {
     }
 }
 fn commit(path: &Path, cp: &mut DownloadCheckpoint) -> Result<Option<PathBuf>> {
+    commit_with(path, cp, &LocalPublication)
+}
+
+trait Publication {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn link(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn fingerprint(&self, path: &Path) -> Result<String>;
+}
+struct LocalPublication;
+impl Publication for LocalPublication {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> { fs::rename(from, to) }
+    fn link(&self, from: &Path, to: &Path) -> std::io::Result<()> { fs::hard_link(from, to) }
+    fn fingerprint(&self, path: &Path) -> Result<String> { state::fingerprint(path) }
+}
+fn commit_with(path: &Path, cp: &mut DownloadCheckpoint, filesystem: &dyn Publication) -> Result<Option<PathBuf>> {
     let partial = cp.directory.join("partial");
     let previous = cp.directory.join("previous");
     cp.phase = "publishing".into();
@@ -176,12 +191,12 @@ fn commit(path: &Path, cp: &mut DownloadCheckpoint) -> Result<Option<PathBuf>> {
         // The prior process may have linked the completed file and then died.
         return Ok(previous.exists().then_some(previous));
     }
-    if !partial.is_file() || state::fingerprint(&partial)? != cp.sha256 {
+    if !partial.is_file() || filesystem.fingerprint(&partial)? != cp.sha256 {
         bail!("completed partial is missing or corrupt; local destination was preserved");
     }
     if let Some(expected) = &cp.original_sha256 {
         if previous.exists() {
-            if state::fingerprint(&previous)? != *expected || current.is_some() {
+            if filesystem.fingerprint(&previous)? != *expected || current.is_some() {
                 bail!("destination changed during interrupted commit; prior local contents retained at {}",previous.display());
             }
         } else {
@@ -189,10 +204,10 @@ fn commit(path: &Path, cp: &mut DownloadCheckpoint) -> Result<Option<PathBuf>> {
                 bail!("local destination changed since download started; partial data retained");
             }
             state::atomic_json(&cp.directory.join("RECOVERY.json"), cp)?;
-            fs::rename(&cp.destination, &previous)?;
+            filesystem.rename(&cp.destination, &previous)?;
             File::open(cp.destination.parent().context("missing parent")?)?.sync_all()?;
             File::open(&cp.directory)?.sync_all()?;
-            if state::fingerprint(&previous)? != *expected {
+            if filesystem.fingerprint(&previous)? != *expected {
                 bail!(
                     "local destination changed during commit; contents retained at {}",
                     previous.display()
@@ -203,7 +218,7 @@ fn commit(path: &Path, cp: &mut DownloadCheckpoint) -> Result<Option<PathBuf>> {
         bail!("local destination appeared during download; it was preserved");
     }
     File::open(&partial)?.sync_all()?;
-    fs::hard_link(&partial, &cp.destination).context(
+    filesystem.link(&partial, &cp.destination).context(
         "destination appeared during commit; completed partial and any prior local copy retained",
     )?;
     File::open(cp.destination.parent().context("missing parent")?)?.sync_all()?;
@@ -479,6 +494,10 @@ mod tests {
         offsets: Mutex<Vec<u64>>,
         fail: AtomicBool,
         pause: AtomicBool,
+        weak: AtomicBool,
+        wrong_hash: AtomicBool,
+        short: AtomicBool,
+        change_after: AtomicBool,
     }
     impl RangeServer {
         fn new() -> Self {
@@ -487,6 +506,10 @@ mod tests {
                 offsets: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(true),
                 pause: AtomicBool::new(false),
+                weak: AtomicBool::new(false),
+                wrong_hash: AtomicBool::new(false),
+                short: AtomicBool::new(false),
+                change_after: AtomicBool::new(false),
             }
         }
         fn entry(&self) -> Entry {
@@ -496,12 +519,15 @@ mod tests {
                 is_dir: false,
                 size: b.len() as u64,
                 modified: Some(1),
-                etag: Some(format!("\"{:x}\"", Sha256::digest(&*b))),
+                etag: Some(if self.weak.load(Ordering::SeqCst) { "W/revision".into() } else { format!("\"{:x}\"", Sha256::digest(&*b)) }),
             }
         }
     }
     #[async_trait]
     impl Backend for RangeServer {
+        fn content_sha256(&self, _: &Entry) -> Option<String> {
+            self.wrong_hash.load(Ordering::SeqCst).then(|| "wrong server fingerprint".into())
+        }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 protocol: "test",
@@ -543,11 +569,13 @@ mod tests {
                 if self.fail.swap(false, Ordering::SeqCst) {
                     bail!("simulated connection loss");
                 }
+                if self.short.load(Ordering::SeqCst) { return Ok(()); }
                 f.write_all(&bytes[halfway..])?;
             } else {
                 f.write_all(&bytes[offset as usize..])?;
             }
             f.sync_all()?;
+            if self.change_after.load(Ordering::SeqCst) { self.bytes.lock().unwrap()[0] ^= 1; }
             Ok(())
         }
         async fn upload(&self, _: &Path, _: &str, _: WriteCondition) -> Result<Entry> {
@@ -593,6 +621,177 @@ mod tests {
             .path();
         let cp = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         (path, cp)
+    }
+    fn checkpoint(root: &Path) -> DownloadCheckpoint {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = root.join(format!(".rdrive-partial-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(directory.join("partial"), b"new").unwrap();
+        DownloadCheckpoint { version: 1, id: "a".repeat(64), profile: "dav".into(), identity: "identity".into(), remote: "file".into(), destination: root.join("destination"), directory, expected: Entry { path: "file".into(), is_dir: false, size: 3, modified: Some(1), etag: Some("revision".into()) }, bytes: 3, sha256: format!("{:x}", Sha256::digest(b"new")), overwrite: true, original_sha256: None, phase: "downloading".into() }
+    }
+
+    #[test]
+    fn invalid_checkpoint_paths_permissions_and_prefix_lengths_fail_closed() {
+        use std::os::unix::{ffi::OsStringExt, fs::{PermissionsExt, symlink}};
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let good = checkpoint(&root); validate(&good).unwrap();
+        let mut bad = good.clone(); bad.version = 2; assert!(validate(&bad).is_err());
+        let mut bad = good.clone(); bad.directory = root.join("unexpected"); assert!(validate(&bad).is_err());
+        let mut bad = good.clone(); bad.directory = root.join(".rdrive-partial-not-a-uuid"); assert!(validate(&bad).is_err());
+        let mut bad = good.clone(); bad.destination = root.join("other").join("destination"); assert!(validate(&bad).is_err());
+        let mut bad = good.clone(); bad.directory = PathBuf::from("/"); assert!(validate(&bad).is_err());
+        fs::set_permissions(&good.directory, fs::Permissions::from_mode(0o755)).unwrap(); assert!(validate(&good).is_err());
+        fs::set_permissions(&good.directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.join("alias"); symlink(&good.directory, &link).unwrap(); assert!(private_directory(&link).is_err());
+        assert!(private_directory(&good.directory.join("partial")).is_err());
+        assert!(regular(&good.directory, false).is_err());
+        assert!(local_hash(&good.directory).is_err());
+        assert!(local_hash(&good.directory.join("partial/child")).is_err());
+        assert!(canonical_destination(Path::new("/")).is_err());
+        let invalid = root.join(std::ffi::OsString::from_vec(vec![255])); assert!(canonical_destination(&invalid).is_err());
+        let mut prefix = Prefix::new(); let mut file = regular(&good.directory.join("partial"), false).unwrap();
+        prefix.extend(&mut file, 3).unwrap(); assert!(prefix.extend(&mut file, 1).is_err());
+        let mut prefix = Prefix::new(); assert!(prefix.extend(&mut file, 4).is_err());
+        let mut oversized = good.clone(); oversized.expected.size = 2;
+        assert!(save_progress(&root.join("checkpoint.json"), &mut oversized, &mut Prefix::new()).is_err());
+    }
+
+    #[test]
+    fn interrupted_publication_preserves_destinations_and_retains_prior_recovery() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let mut cp = checkpoint(&root); let path = root.join("receipt.json");
+        fs::write(&cp.destination, b"appeared").unwrap();
+        assert!(commit(&path, &mut cp).unwrap_err().to_string().contains("appeared"));
+        assert_eq!(fs::read(&cp.destination).unwrap(), b"appeared");
+        fs::remove_file(&cp.destination).unwrap();
+        fs::write(cp.directory.join("partial"), b"corrupt").unwrap();
+        assert!(commit(&path, &mut cp).unwrap_err().to_string().contains("corrupt"));
+        fs::write(cp.directory.join("partial"), b"new").unwrap();
+        cp.original_sha256 = Some(format!("{:x}", Sha256::digest(b"old")));
+        fs::write(cp.directory.join("previous"), b"wrong prior copy").unwrap();
+        assert!(commit(&path, &mut cp).unwrap_err().to_string().contains("prior local"));
+        fs::write(cp.directory.join("previous"), b"old").unwrap();
+        let previous = commit(&path, &mut cp).unwrap().unwrap();
+        assert_eq!(fs::read(previous).unwrap(), b"old");
+        assert_eq!(fs::read(&cp.destination).unwrap(), b"new");
+        assert!(commit(&path, &mut cp).unwrap().is_some(), "commit replay must accept its own published bytes");
+    }
+
+    struct RacingPublication { change_after_rename: bool, create_before_link: bool }
+    impl Publication for RacingPublication {
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            LocalPublication.rename(from, to)?;
+            if self.change_after_rename { fs::write(to, b"concurrent local write")?; }
+            Ok(())
+        }
+        fn link(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.create_before_link { fs::write(to, b"appeared at link time")?; }
+            LocalPublication.link(from, to)
+        }
+        fn fingerprint(&self, path: &Path) -> Result<String> { LocalPublication.fingerprint(path) }
+    }
+    #[test]
+    fn publication_races_and_cleanup_errors_keep_all_recovery_bytes() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let mut cp = checkpoint(&root); let path = root.join("receipt.json");
+        fs::write(&cp.destination, b"old").unwrap(); cp.original_sha256 = Some(format!("{:x}", Sha256::digest(b"old")));
+        let error = commit_with(&path, &mut cp, &RacingPublication { change_after_rename: true, create_before_link: false }).unwrap_err();
+        assert!(error.to_string().contains("changed during commit"));
+        assert_eq!(fs::read(cp.directory.join("previous")).unwrap(), b"concurrent local write");
+        assert_eq!(fs::read(cp.directory.join("partial")).unwrap(), b"new");
+        assert!(!cp.destination.exists());
+        let mut cp = checkpoint(&root);
+        assert!(commit_with(&path, &mut cp, &RacingPublication { change_after_rename: false, create_before_link: true }).unwrap_err().to_string().contains("appeared during commit"));
+        assert_eq!(fs::read(&cp.destination).unwrap(), b"appeared at link time");
+        assert_eq!(fs::read(cp.directory.join("partial")).unwrap(), b"new");
+        let s = store(&root); let checkpoint_path = checkpoint_path(&s, &cp.id);
+        fs::create_dir(&checkpoint_path).unwrap();
+        assert!(remove_checkpoint(&s, &cp).is_err());
+        fs::remove_dir(checkpoint_path).unwrap();
+        fs::remove_file(cp.directory.join("partial")).unwrap(); fs::create_dir(cp.directory.join("partial")).unwrap();
+        assert!(remove_checkpoint(&s, &cp).is_err());
+        assert!(cp.directory.exists());
+        fs::remove_dir(cp.directory.join("partial")).unwrap();
+        remove_checkpoint(&s, &cp).unwrap();
+        assert!(!cp.directory.exists(), "cleanup must recover when the partial was already removed");
+    }
+
+    #[test]
+    fn upload_checkpoints_report_confirmed_chunks_and_missing_receipts_without_writes() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let mut s = store(&root); let source = root.join("source"); fs::write(&source, b"payload").unwrap();
+        let job = crate::operations::enqueue_with_resume(&mut s, "dav", &source, "remote", false, None, false, true).unwrap();
+        let path = s.home.join("spool").join(format!("{}.upload.json", job.id));
+        assert!(list(&s).unwrap()[0]["progress"].is_null());
+        state::atomic_json(&path, &serde_json::json!({"phase":"uploading","confirmed_bytes":4})).unwrap();
+        assert_eq!(list(&s).unwrap()[0]["progress"]["confirmed_bytes"], 4);
+        state::atomic_json(&path, &serde_json::json!({"phase":"chunks","chunks":{"one":{"etag":"ok","size":3},"two":{"etag":"ok","size":4},"pending":{"size":50},"invalid":{"etag":true,"size":100}}})).unwrap();
+        assert_eq!(list(&s).unwrap()[0]["progress"]["confirmed_bytes"], 7);
+        state::atomic_json(&path, &serde_json::json!({"phase":"starting"})).unwrap();
+        assert!(list(&s).unwrap()[0]["progress"]["confirmed_bytes"].is_null());
+        fs::write(s.home.join("transfers").join("unrelated.txt"), b"not a checkpoint").unwrap();
+        fs::create_dir(s.home.join("transfers").join("directory.json")).unwrap();
+        assert_eq!(list(&s).unwrap().len(), 1);
+        assert!(discard(&s, "not-an-id").is_err());
+        let mut cp = checkpoint(&root); cp.id = "b".repeat(64);
+        let forged_path = checkpoint_path(&s, &"a".repeat(64)); state::atomic_json(&forged_path, &cp).unwrap();
+        assert!(discard(&s, &"a".repeat(64)).unwrap_err().to_string().contains("identity mismatch"));
+        fs::remove_file(forged_path).unwrap();
+        cp.id = "c".repeat(64); let cp_path = checkpoint_path(&s, &cp.id); state::atomic_json(&cp_path, &cp).unwrap();
+        state::atomic_json(&cp.directory.join("RECOVERY.json"), &cp).unwrap();
+        assert!(discard(&s, &cp.id).unwrap().is_none());
+        assert!(!cp.directory.exists());
+    }
+
+    #[tokio::test]
+    async fn resuming_refuses_changed_flags_short_partial_and_incomplete_publication() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let server = RangeServer::new(); let destination = root.join("out"); let mut s = store(&root);
+        assert!(get(&mut s, &server, "dav", "file", &destination, false).await.is_err());
+        assert!(get(&mut s, &server, "dav", "file", &destination, true).await.unwrap_err().to_string().contains("arguments differ"));
+        let (path, mut cp) = saved(&s);
+        fs::write(cp.directory.join("partial"), b"short").unwrap();
+        assert!(get(&mut s, &server, "dav", "file", &destination, false).await.unwrap_err().to_string().contains("shorter"));
+        cp.phase = "publishing".into(); state::atomic_json(&path, &cp).unwrap();
+        assert!(get(&mut s, &server, "dav", "file", &destination, false).await.unwrap_err().to_string().contains("incomplete publishing"));
+        cp.bytes = cp.expected.size; state::atomic_json(&path, &cp).unwrap();
+        assert!(get(&mut s, &server, "dav", "file", &destination, false).await.unwrap_err().to_string().contains("checksum mismatch"));
+    }
+
+    #[tokio::test]
+    async fn download_refuses_weak_revisions_short_success_and_changed_or_misidentified_content() {
+        for case in ["existing", "weak", "short", "changed", "checksum"] {
+            let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+            let server = RangeServer::new(); server.fail.store(false, Ordering::SeqCst);
+            let destination = root.join("out"); let mut s = store(&root);
+            let expected = match case {
+                "existing" => { fs::write(&destination, b"preserve").unwrap(); "destination exists" },
+                "weak" => { server.weak.store(true, Ordering::SeqCst); "strong server revision" },
+                "short" => { server.short.store(true, Ordering::SeqCst); "expected length" },
+                "changed" => { server.change_after.store(true, Ordering::SeqCst); "revision changed after" },
+                "checksum" => { server.wrong_hash.store(true, Ordering::SeqCst); "server content fingerprint" },
+                _ => unreachable!(),
+            };
+            let error = get(&mut s, &server, "dav", "file", &destination, false).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "case {case}: {error:#}");
+            if case == "existing" { assert_eq!(fs::read(&destination).unwrap(), b"preserve"); } else { assert!(!destination.exists()); }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_postpublication_history_write_retains_a_replayable_complete_checkpoint() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().canonicalize().unwrap();
+        let mut s = store(&root); let destination = root.join("out"); let server = RangeServer::new();
+        server.fail.store(false, Ordering::SeqCst);
+        let state = s.home.join("state.json"); if state.exists() { fs::remove_file(&state).unwrap(); } fs::create_dir(&state).unwrap();
+        assert!(get(&mut s, &server, "dav", "file", &destination, false).await.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), *server.bytes.lock().unwrap());
+        let (_, saved) = saved(&s); assert_eq!(saved.phase, "complete");
+        fs::remove_dir(&state).unwrap();
+        let report = get(&mut s, &server, "dav", "file", &destination, false).await.unwrap();
+        assert_eq!(report.transferred, 0); assert_eq!(server.offsets.lock().unwrap().len(), 1);
+        assert!(list(&s).unwrap().is_empty());
     }
     #[tokio::test]
     async fn interruption_restart_resumes_exact_verified_prefix_and_commits() {

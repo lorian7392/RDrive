@@ -363,4 +363,21 @@ mod tests {
         assert!(name.ends_with(".txt"));
         assert!(conflict_name("../escape", "x").is_err());
     }
+
+    #[test]
+    fn invalid_strategies_profiles_patterns_and_names_are_rejected() {
+        assert!("merge".parse::<ConflictStrategy>().unwrap_err().to_string().contains("conflict strategy"));
+        let mut policy = VersionPolicy::default(); policy.include = vec!["*".into(); 513];
+        assert!(policy.validate().unwrap_err().to_string().contains("too many"));
+        for pattern in ["", "control\n", &"a".repeat(4097)] {
+            policy.include = vec![pattern.into()];
+            assert!(policy.validate().unwrap_err().to_string().contains("invalid version filename"));
+        }
+        let mut config = PolicyConfig::default(); config.profiles.insert("".into(), ProfilePolicy::default());
+        assert!(config.validate().unwrap_err().to_string().contains("invalid policy profile"));
+        assert!(conflict_name("", "identity").unwrap_err().to_string().contains("invalid conflict item"));
+        assert!(conflict_name("file", "").is_err());
+        assert!(conflict_name("dotless", "identity").unwrap().starts_with("dotless (conflict-"));
+        assert!(conflict_name(".hidden", "identity").unwrap().starts_with(".hidden (conflict-"));
+    }
 }

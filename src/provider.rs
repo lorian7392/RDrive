@@ -11,6 +11,19 @@ mod index_scheduler;
 mod namespace;
 mod resolution;
 pub use resolution::resolve_smart;
+#[async_trait::async_trait]
+trait Connector: Send + Sync {
+    async fn connect(&self, profile: &config::Profile, name: &str, context: crate::transfer::TransferContext) -> Result<Arc<dyn Backend>>;
+}
+struct NetworkConnector;
+#[async_trait::async_trait]
+impl Connector for NetworkConnector {
+    async fn connect(&self, profile: &config::Profile, name: &str, context: crate::transfer::TransferContext) -> Result<Arc<dyn Backend>> { crate::factory::connect(profile,name,context).await }
+}
+#[cfg(test)]
+#[path = "provider/test_backend.rs"]
+mod test_backend;
+
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct Domain {pub id:String,pub profile:String,pub remote:String,pub display_name:String,#[serde(default)]pub repository:bool,#[serde(default)]pub local_root:Option<PathBuf>,#[serde(default)]pub smart:bool}
@@ -66,11 +79,8 @@ fn checked_journal(home:&Path,config:&config::Config,domain:&Domain)->Result<Jou
     let path=home.join("provider").join(format!("{}.json",state::key(&domain.id)));
     let expected=journal_binding(config,domain)?;
     let mut journal=index::load(home,&domain.id,&expected,&path)?.context("provider index initialization failed")?;
-    match &journal.binding {
-        Some(binding)if binding==&expected=>(),
-        None if journal.items.is_empty()&&journal.requests.is_empty()&&journal.events.is_empty()&&journal.anchor==0=>journal.binding=Some(expected),
-        _=>bail!("version_conflict: provider domain/backend scope changed or journal is unbound; existing state was preserved, use a new domain ID or explicitly repair the journal"),
-    }
+    // index::load validates the stored binding and binds empty legacy state
+    // before returning a snapshot; account validation has one authoritative path.
     if !journal.pins_migrated { journal.pins=journal.items.iter().filter(|(_,r)|r.item.pinned).map(|(id,_)|id.clone()).collect();journal.pins_migrated=true; }
     for record in journal.items.values_mut(){record.metadata_known|=record.item.tag_data_hex.is_some()||!record.item.extended_attributes.is_empty();}
     Ok(journal)
@@ -84,7 +94,11 @@ pub fn domains(home:&Path)->Result<Vec<Domain>> {
 pub fn add_domain(store:&Store,domain:Domain)->Result<()> {
     if domain.id.is_empty()||domain.id.len()>120||domain.id.chars().any(|c|c.is_control())||domain.display_name.is_empty(){bail!("invalid provider domain identity");}
     if !store.config.profiles.contains_key(&domain.profile)||backend::normalize(&domain.remote)?!=domain.remote{bail!("unknown domain profile or unsafe root");}
-    if let Some(root)=&domain.local_root{if !root.is_absolute()||fs::symlink_metadata(root)?.file_type().is_symlink(){bail!("Finder root must be an absolute real directory");}}
+    if let Some(root)=&domain.local_root {
+        if !root.is_absolute(){bail!("Finder root must be an absolute real directory");}
+        let metadata=fs::symlink_metadata(root)?;
+        if !metadata.is_dir()||metadata.file_type().is_symlink(){bail!("Finder root must be an absolute real directory");}
+    }
     let mut all=domains(&store.home)?;if all.iter().any(|d|d.id==domain.id){bail!("provider domain already exists");}all.push(domain);state::atomic_json(&store.home.join("provider-domains.json"),&all)
 }
 pub fn remove_domain(store:&Store,id:&str)->Result<()> {let mut all=domains(&store.home)?;let n=all.len();all.retain(|d|d.id!=id);if all.len()==n{bail!("domain does not exist");}state::atomic_json(&store.home.join("provider-domains.json"),&all)}
@@ -115,7 +129,7 @@ fn require_mutation_paths(store:&Store,d:&Domain,j:&Journal,req:&Request)->Resul
 }
 fn version(e:&Entry)->Result<String>{Ok(state::key(&serde_json::to_string(&(e.is_dir,e.size,&e.etag,if e.etag.is_none(){e.modified}else{None}))?))}
 fn keep_internal(path:&str)->bool{!path.split('/').any(|p|p.starts_with(".rdrive-")||p==".rdrive-repository")}
-fn metadata_version(path:&str,tags:&Option<String>,attributes:&BTreeMap<String,String>,pinned:bool)->Result<String>{Ok(state::key(&serde_json::to_string(&(path,tags,attributes,pinned))?))}
+fn metadata_version(path:&str,tags:&Option<String>,attributes:&BTreeMap<String,String>,pinned:bool)->String{state::key(&serde_json::to_string(&(path,tags,attributes,pinned)).expect("metadata version contains only JSON strings, maps and a boolean"))}
 fn extended(record:&crate::metadata::MetadataRecord)->BTreeMap<String,String>{record.attributes.iter().filter(|(name,_)|name.as_str()!="com.apple.metadata:_kMDItemUserTags").map(|(k,v)|(k.clone(),v.clone())).collect()}
 fn apply_xattrs(mut record:crate::metadata::MetadataRecord,attributes:Option<&BTreeMap<String,String>>)->Result<crate::metadata::MetadataRecord>{
     if let Some(values)=attributes{let policy=crate::metadata::MetadataPolicy::default();record.attributes.retain(|name,_|!name.ends_with("#S")||!policy.allows(name));for(name,value)in values{if !policy.allows(name)||!name.ends_with("#S")||name=="com.apple.metadata:_kMDItemUserTags"{bail!("unsupported extended attribute; Finder tags use tag_data_hex");}record.attributes.insert(name.clone(),value.clone());}}
@@ -214,7 +228,7 @@ async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,
         let tags=previous.and_then(|r|r.item.tag_data_hex.clone());
         let attributes=previous.map(|r|r.item.extended_attributes.clone()).unwrap_or_default();
         let capabilities=raw_capabilities(b,&entry);
-        let item=Item{id:id.clone(),parent_id:parent_id.into(),name:path.rsplit('/').next().unwrap().into(),kind:if entry.is_dir{"directory"}else{"file"}.into(),size:entry.size,modified:entry.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|value|value.to_rfc3339()),content_version:version(&entry)?,metadata_version:metadata_version(&path,&tags,&attributes,false)?,pinned:false,capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
+        let item=Item{id:id.clone(),parent_id:parent_id.into(),name:path.rsplit('/').next().unwrap().into(),kind:if entry.is_dir{"directory"}else{"file"}.into(),size:entry.size,modified:entry.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|value|value.to_rfc3339()),content_version:version(&entry)?,metadata_version:metadata_version(&path,&tags,&attributes,false),pinned:false,capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
         next.insert(id,Record{path,item,entry:Some(entry),strong,client_id:previous.and_then(|r|r.client_id.clone()),metadata_known:previous.is_some_and(|r|r.metadata_known),metadata_checked:previous.filter(|_|same).map_or(0,|r|r.metadata_checked)});
     }
     let mut candidate=j.clone();candidate.directory_scans.insert(parent_id.into(),chrono::Utc::now().timestamp_millis());
@@ -226,7 +240,7 @@ fn check_fresh_metadata_base(req:&Request,path:&str,pinned:bool,prior:Option<&cr
     // caller's metadata version to match the freshly observed record.
     if let Some(prior)=prior {
         let tags=prior.attributes.get("com.apple.metadata:_kMDItemUserTags").cloned();let attributes=extended(prior);
-        let observed=metadata_version(path,&tags,&attributes,pinned)?;
+        let observed=metadata_version(path,&tags,&attributes,pinned);
         if req.base_metadata_version.as_ref().is_some_and(|version|metadata_base(version)!=metadata_base(&observed)){bail!("version_conflict: Finder tags changed after enumeration");}
     }Ok(())
 }
@@ -288,7 +302,7 @@ async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<O
             let tags=entry.metadata.as_ref().and_then(|v|v.get("attributes")).and_then(|a|a.get("com.apple.metadata:_kMDItemUserTags")).and_then(|v|v.as_str()).map(str::to_owned);
             let attributes: BTreeMap<String,String>=entry.metadata.as_ref().and_then(|v|v.get("attributes")).and_then(|v|v.as_object()).map(|attrs|attrs.iter().filter(|(name,_)|name.as_str()!="com.apple.metadata:_kMDItemUserTags").filter_map(|(k,v)|v.as_str().map(|v|(k.clone(),v.to_owned()))).collect()).unwrap_or_default();
             let pinned=old.get(&entry.id).is_some_and(|r|r.item.pinned);
-            let mv=metadata_version(path,&tags,&attributes,pinned)?;
+            let mv=metadata_version(path,&tags,&attributes,pinned);
             let item=Item{id:entry.id.clone(),parent_id,name:path.rsplit('/').next().unwrap().into(),kind:entry.kind.clone(),size:entry.size,modified:Some(entry.modified.clone()),content_version:entry.blob.clone().unwrap_or_else(||"directory".into()),metadata_version:mv,pinned,capabilities:vec!["read","write","add","rename","reparent","delete"].into_iter().map(str::to_owned).collect(),tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
             next.insert(entry.id.clone(),Record{path:path.clone(),item,entry:None,strong:None,client_id:old.get(&entry.id).and_then(|r|r.client_id.clone()),metadata_known:entry.metadata.is_some(),metadata_checked:0});
         }
@@ -305,7 +319,7 @@ async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<O
             let mut attributes=old.get(&id).map(|r|r.item.extended_attributes.clone()).unwrap_or_default();
             if !e.is_dir{if let Some(verified)=&strong{if let Some(meta)=crate::metadata_remote::load(b,&e.path,verified).await?{tags=meta.attributes.get("com.apple.metadata:_kMDItemUserTags").cloned();attributes=extended(&meta);}}}
             let capabilities=raw_capabilities(b,&e);
-            let item=Item{id:id.clone(),parent_id,name:path.rsplit('/').next().unwrap().into(),kind:if e.is_dir{"directory"}else{"file"}.into(),size:e.size,modified:e.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|t|t.to_rfc3339()),content_version:version(&e)?,metadata_version:metadata_version(&path,&tags,&attributes,old.get(&id).is_some_and(|r|r.item.pinned))?,pinned:old.get(&id).is_some_and(|r|r.item.pinned),capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
+            let item=Item{id:id.clone(),parent_id,name:path.rsplit('/').next().unwrap().into(),kind:if e.is_dir{"directory"}else{"file"}.into(),size:e.size,modified:e.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|t|t.to_rfc3339()),content_version:version(&e)?,metadata_version:metadata_version(&path,&tags,&attributes,old.get(&id).is_some_and(|r|r.item.pinned)),pinned:old.get(&id).is_some_and(|r|r.item.pinned),capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
             next.insert(id.clone(),Record{path,item,entry:Some(e),strong,client_id:old.get(&id).and_then(|r|r.client_id.clone()),metadata_known:old.get(&id).is_some_and(|r|r.metadata_known),metadata_checked:old.get(&id).map_or(0,|r|r.metadata_checked)});
         }
     }
@@ -381,7 +395,7 @@ fn apply_policies(store:&Store,d:&Domain,j:&Journal,records:&mut BTreeMap<String
         let (state,message)=if hidden {("queued_delete",pending.and_then(|m|m.error.clone()))}else if let Some(m)=pending {use crate::smart::MutationState::*;let state=match m.state {Conflict=>"conflict",Failed=>"error",Running=>"syncing",_=>"queued"};(state,m.error.clone())}
             else if let Some(error)=j.native_errors.get(id).filter(|e|e.version==record.item.content_version){("error",Some(error.message.clone()))}else if record.item.pinned {("pinned",None)}else if native.get(id)==Some(&record.item.content_version){("cached",None)}else {("online",None)};
         record.item.sync_state=Some(state.into());record.item.sync_message=message;
-        let base=metadata_version(&record.path,&record.item.tag_data_hex,&record.item.extended_attributes,record.item.pinned)?;
+        let base=metadata_version(&record.path,&record.item.tag_data_hex,&record.item.extended_attributes,record.item.pinned);
         record.item.metadata_version=format!("{base}:{}",&state::key(&serde_json::to_string(&(&record.item.sync_state,&record.item.sync_message,record.item.has_unsynced_changes,record.item.native_materialized))?)[..32]);
     }Ok(())
 }
@@ -725,13 +739,16 @@ fn local_pin(home:&Path,req:&Request)->Result<Value>{
     save_journal(&store,&domain.id,&j)?;Ok(json!({"item":item}))
 }
 async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,context:crate::transfer::TransferContext)->Result<Value>{
+    online_process_with(home,staging,staging_fd,req,context,&NetworkConnector).await
+}
+async fn online_process_with(home:&Path,staging:&Path,staging_fd:&File,req:Request,context:crate::transfer::TransferContext,connector:&dyn Connector)->Result<Value>{
     if req.v!=1{bail!("unsupported bridge protocol version");}
     if ["domains","status","resolve","cache_budget"].contains(&req.op.as_str()){return quick(home,&req);}
     if req.op=="pin"{return local_pin(home,&req);}
     if req.op=="native_error"{return local_native_error(home,&req);}
     let store=Store::open(home.to_path_buf())?;let d=domains(home)?.into_iter().find(|d|d.id==req.domain).context("no_such_item: domain missing")?;
     let profile=store.config.profiles.get(&d.profile).context("not_authenticated: domain profile missing")?.clone();
-    let mut j=checked_journal(home,&store.config,&d)?;require_mutation_paths(&store,&d,&j,&req)?;let b=crate::factory::connect(&profile,&d.profile,context.clone()).await?;
+    let mut j=checked_journal(home,&store.config,&d)?;require_mutation_paths(&store,&d,&j,&req)?;let b=connector.connect(&profile,&d.profile,context.clone()).await?;
     if !d.repository&&(namespace::requested(&j,&req)||namespace::pending(&j,&d,&req)){
         if !namespace::pending(&j,&d,&req){refresh_request(&store,b.as_ref(),&d,&mut j,&req,None).await?;}
         return namespace::process(store,b.as_ref(),&d,&mut j,staging,staging_fd,&req,context).await;
@@ -849,8 +866,7 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
                 let condition=if let Some(record)=&existing{WriteCondition::Match(record.strong.clone().context("unsupported: fetch this file before editing to establish its content guard")?)}else{WriteCondition::CreateNew};
                 if let WriteCondition::Match(expected)=&condition{if j.requests.get(&key).and_then(|p|p.version.as_ref()).is_none(){let archived=if let Some(planned)=resolution::planned_version(&store,&d,&req)?{if planned.path!=dest||!planned.original.same_revision(expected){bail!("version_conflict: saved replacement version does not match the guarded target");}Some(planned)}else{crate::policies::prepare_version(&store,b.as_ref(),&d.profile,&dest,expected,&key,false).await?};j.requests.get_mut(&key).unwrap().version=archived;save_journal(&store,&d.id,&j)?;}}
                 b.upload(source,&dest,condition).await?
-            }else if let Some(old)=&existing {old.strong.clone().context("unsupported: fetch this file before editing metadata")?}
-            else{let empty=store.home.join("provider").join(format!("empty-{}",state::key(&key)));state::atomic_write(&empty,b"")?;b.upload(&empty,&dest,WriteCondition::CreateNew).await?};
+            }else{existing.as_ref().expect("content-free modifications always have an existing item").strong.clone().context("unsupported: fetch this file before editing metadata")?};
             j.requests.get_mut(&key).unwrap().confirmed=Some(entry.clone());save_journal(&store,&d.id,&j)?;
             if metadata.is_none()&&source.is_none()&&(req.tag_data_hex.is_some()||req.extended_attributes.is_some()) {
                 if let Some(saved)=j.requests.get(&key).and_then(|pending|pending.metadata.clone()) {
@@ -902,7 +918,7 @@ async fn online_process(home:&Path,staging:&Path,staging_fd:&File,req:Request,co
             if corrected!=previous {push_event(&mut j,Some(corrected),None);}
         }
     }
-    let response=if req.op=="delete"{json!({})}else{let record=j.items.get_mut(response_id.as_deref().context("created item not enumerated")?).context("updated item missing")?;if req.op=="create"{record.client_id=req.client_item_id.clone();}let mut item=record.item.clone();if d.smart{item.has_unsynced_changes=false;item.native_materialized=false;item.sync_state=Some(if item.pinned{"pinned"}else{"online"}.into());item.sync_message=None;let base=metadata_version(&record.path,&item.tag_data_hex,&item.extended_attributes,item.pinned)?;item.metadata_version=format!("{base}:{}",&state::key(&serde_json::to_string(&(&item.sync_state,&item.sync_message,false,false))?)[..32]);}json!({"item":item})};
+    let response=if req.op=="delete"{json!({})}else{let record=j.items.get_mut(response_id.as_deref().context("created item not enumerated")?).context("updated item missing")?;if req.op=="create"{record.client_id=req.client_item_id.clone();}let mut item=record.item.clone();if d.smart{item.has_unsynced_changes=false;item.native_materialized=false;item.sync_state=Some(if item.pinned{"pinned"}else{"online"}.into());item.sync_message=None;let base=metadata_version(&record.path,&item.tag_data_hex,&item.extended_attributes,item.pinned);item.metadata_version=format!("{base}:{}",&state::key(&serde_json::to_string(&(&item.sync_state,&item.sync_message,false,false))?)[..32]);}json!({"item":item})};
     j.requests.get_mut(&key).unwrap().response=Some(response.clone());save_journal(&store,&d.id,&j)?;
     if !d.repository{if let Some(version)=j.requests.get(&key).and_then(|p|p.version.as_ref()){if let Err(error)=crate::policies::finish_version(&store,b.as_ref(),&d.profile,&remote(&d,&target)?,version).await{eprintln!("version retention deferred: {error:#}");}}}Ok(response)
 }
@@ -1048,3 +1064,15 @@ async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S
 #[cfg(test)]
 #[path = "provider_scopes_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+#[path = "provider/coverage_tests.rs"]
+mod coverage_tests;
+
+#[cfg(test)]
+#[path = "provider/final_local_tests.rs"]
+mod final_local_tests;
+
+#[cfg(test)]
+#[path = "provider/final_coverage_tests.rs"]
+mod final_coverage_tests;

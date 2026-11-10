@@ -119,12 +119,31 @@ async fn remote_hash(b: &dyn Backend, remote: &str, entry: &Entry) -> Result<Str
     }
     state::fingerprint(&temp.path)
 }
+// Selection order and duplicate patterns do not change the metadata snapshot.
+fn equivalent_records(left: &MetadataRecord, right: &MetadataRecord) -> bool {
+    left.version == right.version
+        && left.content_sha256 == right.content_sha256
+        && left.attributes == right.attributes
+        && left.excluded == right.excluded
+        && left.selection.iter().collect::<BTreeSet<_>>()
+            == right.selection.iter().collect::<BTreeSet<_>>()
+}
 async fn save_checked(
     b: &dyn Backend,
     remote: &str,
     entry: &Entry,
     record: &MetadataRecord,
     previous: Option<&Loaded>,
+) -> Result<SaveReport> {
+    save_checked_with(b, remote, entry, record, previous, state::atomic_json).await
+}
+async fn save_checked_with(
+    b: &dyn Backend,
+    remote: &str,
+    entry: &Entry,
+    record: &MetadataRecord,
+    previous: Option<&Loaded>,
+    write: impl FnOnce(&Path, &Envelope) -> Result<()>,
 ) -> Result<SaveReport> {
     record.validate()?;
     let path = sidecar_path(remote, entry)?;
@@ -144,7 +163,7 @@ async fn save_checked(
         ),
     }
     let publication = merge_record(record, previous.map(|loaded| &loaded.record))?;
-    if previous.is_some_and(|old| old.record == publication) {
+    if previous.is_some_and(|old| equivalent_records(&old.record, &publication)) {
         return Ok(SaveReport {
             sidecar: path,
             changed: false,
@@ -155,7 +174,7 @@ async fn save_checked(
     let parent = path.rsplit_once('/').unwrap().0;
     backend::mkdir_all(b, parent).await?;
     let temp = Temporary::new()?;
-    state::atomic_json(
+    write(
         &temp.path,
         &Envelope {
             version: 1,
@@ -177,7 +196,7 @@ async fn save_checked(
     let loaded = load_inner(b, remote, entry)
         .await?
         .context("metadata publication was not confirmed")?;
-    if loaded.record != publication {
+    if !equivalent_records(&loaded.record, &publication) {
         bail!("published metadata changed before confirmation");
     }
     Ok(SaveReport {
@@ -193,10 +212,11 @@ pub async fn save_record(
     entry: &Entry,
     record: &MetadataRecord,
 ) -> Result<SaveReport> {
+    record.validate()?;
     let current = load_inner(b, remote, entry).await?;
     if current
         .as_ref()
-        .is_some_and(|current| current.record == *record)
+        .is_some_and(|current| equivalent_records(&current.record, record))
     {
         return Ok(SaveReport {
             sidecar: sidecar_path(remote, entry)?,
@@ -234,7 +254,10 @@ fn merge_record(
     previous: Option<&MetadataRecord>,
 ) -> Result<MetadataRecord> {
     let Some(previous) = previous else {
-        return Ok(incoming.clone());
+        let mut publication = incoming.clone();
+        publication.selection.sort();
+        publication.selection.dedup();
+        return Ok(publication);
     };
     if previous.content_sha256 != incoming.content_sha256 {
         bail!("previous sidecar has a different content binding; metadata was preserved for explicit repair");
@@ -348,7 +371,7 @@ pub async fn save_record_if_fingerprint(
     let publication = merge_record(record, current.as_ref().map(|loaded| &loaded.record))?;
     if current
         .as_ref()
-        .is_some_and(|loaded| loaded.record == publication)
+        .is_some_and(|loaded| equivalent_records(&loaded.record, &publication))
     {
         return Ok(SaveReport {
             sidecar: sidecar_path(remote, entry)?,
@@ -376,7 +399,7 @@ pub async fn sync_with_policy(
     if is_internal(&remote_root) {
         bail!("metadata internal directory cannot be a sync root");
     }
-    let baseline_abs = std::path::absolute(baseline_path)?;
+    let baseline_abs = crate::state::resolve_location(baseline_path)?;
     if baseline_abs.starts_with(&tree.path) {
         bail!("metadata baseline must be outside local sync tree");
     }
@@ -706,18 +729,25 @@ impl LocalTree {
             }
             return Ok(file);
         }
-        #[allow(unreachable_code)]
+        #[cfg(not(unix))]
         {
             let _ = (directory, name);
             bail!("metadata sync requires Unix descriptors")
         }
     }
     fn scan(&self, policy: &MetadataPolicy) -> Result<(BTreeMap<String, LocalNode>, Vec<String>)> {
+        self.scan_with(policy, directory_names)
+    }
+    fn scan_with(
+        &self,
+        policy: &MetadataPolicy,
+        enumerate: impl Fn(&File) -> Result<Vec<String>>,
+    ) -> Result<(BTreeMap<String, LocalNode>, Vec<String>)> {
         let mut pending = vec![String::new()];
         let mut result = BTreeMap::new();
         let mut all = Vec::new();
         while let Some(parent) = pending.pop() {
-            for name in directory_names(&self.directory(&parent)?)? {
+            for name in enumerate(&self.directory(&parent)?)? {
                 let path = if parent.is_empty() {
                     name
                 } else {
@@ -776,61 +806,7 @@ fn file_identity(file: &File) -> Result<String> {
 fn file_identity(_: &File) -> Result<String> {
     bail!("unsupported metadata platform")
 }
-#[cfg(unix)]
-fn directory_names(directory: &File) -> Result<Vec<String>> {
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        unsafe { libc::close(fd) };
-        return Err(std::io::Error::last_os_error().into());
-    }
-    struct Guard(*mut libc::DIR);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-    let guard = Guard(stream);
-    let mut names = Vec::new();
-    loop {
-        #[cfg(target_os = "macos")]
-        unsafe {
-            *libc::__error() = 0;
-        }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        let item = unsafe { libc::readdir(guard.0) };
-        if item.is_null() {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(0) {
-                return Err(error.into());
-            }
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*item).d_name.as_ptr()) }
-            .to_str()?
-            .to_owned();
-        if name != "." && name != ".." {
-            names.push(name);
-        }
-    }
-    Ok(names)
-}
-#[cfg(not(unix))]
-fn directory_names(_: &File) -> Result<Vec<String>> {
-    bail!("unsupported metadata platform")
-}
+use crate::sync::directory_names;
 fn is_internal(path: &str) -> bool {
     path.split('/').any(|part| {
         [
@@ -906,9 +882,16 @@ mod tests {
         bytes: Option<Vec<u8>>,
         revision: u64,
     }
+    type Hook = Box<dyn FnOnce(&Memory, &str, &Path) -> Result<()> + Send>;
     struct Memory {
         nodes: Mutex<BTreeMap<String, Node>>,
         reject_replace: AtomicBool,
+        stat_overrides: Mutex<BTreeMap<String, Entry>>,
+        download_overrides: Mutex<BTreeMap<String, Vec<u8>>>,
+        after_download: Mutex<Option<Hook>>,
+        after_upload: Mutex<Option<Hook>>,
+        hash_override: Mutex<Option<String>>,
+        listed: Mutex<Option<Vec<Entry>>>,
     }
     impl Memory {
         fn new() -> Self {
@@ -930,6 +913,12 @@ mod tests {
                     ),
                 ])),
                 reject_replace: AtomicBool::new(false),
+                stat_overrides: Mutex::new(BTreeMap::new()),
+                download_overrides: Mutex::new(BTreeMap::new()),
+                after_download: Mutex::new(None),
+                after_upload: Mutex::new(None),
+                hash_override: Mutex::new(None),
+                listed: Mutex::new(None),
             }
         }
         fn entry(path: &str, node: &Node) -> Entry {
@@ -944,6 +933,9 @@ mod tests {
     }
     #[async_trait]
     impl Backend for Memory {
+        fn content_sha256(&self, _: &Entry) -> Option<String> {
+            self.hash_override.lock().unwrap().clone()
+        }
         fn capabilities(&self) -> crate::backend::Capabilities {
             crate::backend::Capabilities {
                 protocol: "memory",
@@ -954,6 +946,9 @@ mod tests {
             }
         }
         async fn stat(&self, path: &str) -> Result<Option<Entry>> {
+            if let Some(entry) = self.stat_overrides.lock().unwrap().get(path) {
+                return Ok(Some(entry.clone()));
+            }
             Ok(self
                 .nodes
                 .lock()
@@ -962,6 +957,9 @@ mod tests {
                 .map(|node| Self::entry(path, node)))
         }
         async fn list(&self, path: &str) -> Result<Vec<Entry>> {
+            if let Some(entries) = self.listed.lock().unwrap().take() {
+                return Ok(entries);
+            }
             Ok(self
                 .nodes
                 .lock()
@@ -975,19 +973,26 @@ mod tests {
                 .collect())
         }
         async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-            let bytes = self
+            let mut bytes = self
                 .nodes
                 .lock()
                 .unwrap()
                 .get(remote)
                 .and_then(|node| node.bytes.clone())
                 .context("missing file")?;
+            if let Some(override_bytes) = self.download_overrides.lock().unwrap().get(remote) {
+                bytes = override_bytes.clone();
+            }
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(local)?;
             std::io::Write::write_all(&mut file, &bytes)?;
             file.sync_all()?;
+            let hook = self.after_download.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, remote, local)?;
+            }
             Ok(())
         }
         async fn upload(
@@ -1017,6 +1022,11 @@ mod tests {
             };
             let entry = Self::entry(remote, &node);
             nodes.insert(remote.into(), node);
+            drop(nodes);
+            let hook = self.after_upload.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, remote, local)?;
+            }
             Ok(entry)
         }
         async fn mkdir(&self, path: &str) -> Result<()> {
@@ -1077,6 +1087,7 @@ mod tests {
         let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
         let mut first = changed(&original, "first");
         first.selection.push("com.example.*".into());
+        first.selection.sort();
         first
             .attributes
             .insert("com.example.keep".into(), "00ff".into());
@@ -1225,5 +1236,840 @@ mod tests {
             .unwrap()
             .keys()
             .any(|name| name.starts_with(ROOT)));
+    }
+    #[tokio::test]
+    async fn invalid_or_changed_sidecars_never_apply_partial_local_metadata() {
+        let (_guard, _root, file) = fixture();
+        let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        let entry = Memory::new().stat("file").await.unwrap().unwrap();
+        for remote in ["", "wrong"] {
+            assert!(sidecar_path(remote, &entry)
+                .unwrap_err()
+                .to_string()
+                .contains("non-root file"));
+        }
+        let mut directory = entry.clone();
+        directory.is_dir = true;
+        assert!(sidecar_path("file", &directory).is_err());
+        for case in [
+            "directory",
+            "advertised-size",
+            "actual-size",
+            "changed",
+            "version",
+            "path",
+            "entry",
+        ] {
+            let backend = Memory::new();
+            let sidecar = sidecar_path("file", &entry).unwrap();
+            let mut envelope = Envelope {
+                version: 1,
+                path: "file".into(),
+                entry: entry.clone(),
+                record: changed(&original, "remote"),
+            };
+            match case {
+                "version" => envelope.version = 2,
+                "path" => envelope.path = "other".into(),
+                "entry" => envelope.entry.etag = Some("different".into()),
+                _ => (),
+            }
+            backend.nodes.lock().unwrap().insert(
+                sidecar.clone(),
+                Node {
+                    bytes: Some(serde_json::to_vec(&envelope).unwrap()),
+                    revision: 1,
+                },
+            );
+            let expected = match case {
+                "directory" => {
+                    backend
+                        .nodes
+                        .lock()
+                        .unwrap()
+                        .get_mut(&sidecar)
+                        .unwrap()
+                        .bytes = None;
+                    "invalid or oversized"
+                }
+                "advertised-size" => {
+                    let mut entry = backend.stat(&sidecar).await.unwrap().unwrap();
+                    entry.size = MAX_SIDECAR + 1;
+                    backend
+                        .stat_overrides
+                        .lock()
+                        .unwrap()
+                        .insert(sidecar.clone(), entry);
+                    "invalid or oversized"
+                }
+                "actual-size" => {
+                    backend
+                        .download_overrides
+                        .lock()
+                        .unwrap()
+                        .insert(sidecar.clone(), vec![0; MAX_SIDECAR as usize + 1]);
+                    "oversized"
+                }
+                "changed" => {
+                    *backend.after_download.lock().unwrap() = Some(Box::new(|peer, path, _| {
+                        peer.nodes.lock().unwrap().get_mut(path).unwrap().revision += 1;
+                        Ok(())
+                    }));
+                    "changed while reading"
+                }
+                _ => "bound to another",
+            };
+            assert!(
+                apply(&backend, "file", &entry, &file, &MetadataPolicy::default())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "{case}"
+            );
+            assert_eq!(
+                metadata::capture(&file, &MetadataPolicy::default())
+                    .unwrap()
+                    .fingerprint()
+                    .unwrap(),
+                original.fingerprint().unwrap()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn metadata_source_hash_and_publication_receipt_guards_reject_peer_races() {
+        let (_guard, _root, file) = fixture();
+        let record = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        let entry = Memory::new().stat("file").await.unwrap().unwrap();
+        let backend = Memory::new();
+        *backend.hash_override.lock().unwrap() = Some(record.content_sha256.clone());
+        assert_eq!(
+            remote_hash(&backend, "file", &entry).await.unwrap(),
+            record.content_sha256
+        );
+        *backend.hash_override.lock().unwrap() = None;
+        backend
+            .download_overrides
+            .lock()
+            .unwrap()
+            .insert("file".into(), b"short".to_vec());
+        assert!(remote_hash(&backend, "file", &entry)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("length changed"));
+        backend.download_overrides.lock().unwrap().clear();
+        let mut wrong = record.clone();
+        wrong.content_sha256 = "0".repeat(64);
+        assert!(save_record(&backend, "file", &entry, &wrong)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("source content differs"));
+        assert!(merge_record(&record, Some(&wrong))
+            .unwrap_err()
+            .to_string()
+            .contains("different content binding"));
+        for remove in [false, true] {
+            let backend = Memory::new();
+            *backend.after_upload.lock().unwrap() = Some(Box::new(move |peer, path, _| {
+                if remove {
+                    peer.nodes.lock().unwrap().remove(path);
+                } else {
+                    let mut nodes = peer.nodes.lock().unwrap();
+                    let node = nodes.get_mut(path).unwrap();
+                    let mut envelope: Envelope =
+                        serde_json::from_slice(node.bytes.as_ref().unwrap())?;
+                    envelope.record = changed(&envelope.record, "external");
+                    node.bytes = Some(serde_json::to_vec(&envelope)?);
+                    node.revision += 1;
+                }
+                Ok(())
+            }));
+            let error = save_record(&backend, "file", &entry, &changed(&record, "ours"))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if remove {
+                    "not confirmed"
+                } else {
+                    "changed before confirmation"
+                }),
+                "{error:#}"
+            );
+            assert_eq!(
+                backend.nodes.lock().unwrap()["file"].bytes.as_deref(),
+                Some(b"content".as_slice())
+            );
+        }
+    }
+    #[tokio::test]
+    async fn narrow_or_repeated_saves_keep_unselected_attributes_without_republication() {
+        let (_guard, _root, file) = fixture();
+        let backend = Memory::new();
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        let mut previous = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        previous.selection = vec!["user.*".into(), "com.example.*".into()];
+        previous.attributes = BTreeMap::from([
+            ("user.a".into(), "00".into()),
+            ("com.example.keep".into(), "01".into()),
+        ]);
+        previous.excluded = vec![metadata::ExcludedAttribute {
+            name: "com.example.omitted".into(),
+            reason: "excluded by source policy".into(),
+        }];
+        save_record(&backend, "file", &entry, &previous)
+            .await
+            .unwrap();
+        assert!(
+            !save_record(&backend, "file", &entry, &previous)
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !save_record_if_fingerprint(&backend, "file", &entry, &previous, None)
+                .await
+                .unwrap()
+                .changed
+        );
+        let loaded = load_inner(&backend, "file", &entry).await.unwrap().unwrap();
+        previous = loaded.record.clone();
+        let mut narrow = previous.clone();
+        narrow.selection = vec!["user.*".into()];
+        narrow.attributes.remove("com.example.keep");
+        narrow.excluded.clear();
+        assert!(
+            !save_checked(&backend, "file", &entry, &narrow, Some(&loaded))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            load(&backend, "file", &entry).await.unwrap().unwrap(),
+            previous
+        );
+        backend
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut(&sidecar_path("file", &entry).unwrap())
+            .unwrap()
+            .revision += 1;
+        assert!(save_checked(
+            &backend,
+            "file",
+            &entry,
+            &changed(&narrow, "new"),
+            Some(&loaded)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("changed after planning"));
+        assert!(save_checked(&backend, "file", &entry, &narrow, None)
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn baseline_roots_and_invalid_remote_enumeration_fail_before_metadata_changes() {
+        use std::os::unix::fs::symlink;
+        let (_guard, root, file) = fixture();
+        let local = file.parent().unwrap();
+        let backend = Memory::new();
+        let options = SyncOptions {
+            apply: true,
+            direction: crate::sync::Direction::Both,
+        };
+        let baseline = root.join("baseline");
+        assert!(sync(&backend, local, ROOT, &baseline, &options)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("internal directory"));
+        assert!(sync(&backend, local, "", &local.join("baseline"), &options)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("outside local"));
+        fs::create_dir(&baseline).unwrap();
+        assert!(sync(&backend, local, "", &baseline, &options)
+            .await
+            .is_err());
+        fs::remove_dir(&baseline).unwrap();
+        let mut old = Baseline {
+            version: 2,
+            local_root: local.to_path_buf(),
+            remote_root: String::new(),
+            policy: MetadataPolicy::default().include,
+            entries: BTreeMap::new(),
+        };
+        state::atomic_json(&baseline, &old).unwrap();
+        assert!(sync(&backend, local, "", &baseline, &options)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("another root or selection"));
+        old.version = 1;
+        old.policy = vec!["user.different".into()];
+        state::atomic_json(&baseline, &old).unwrap();
+        assert!(sync(&backend, local, "", &baseline, &options)
+            .await
+            .is_err());
+        fs::remove_file(&baseline).unwrap();
+        let alias = root.join("alias");
+        symlink(local, &alias).unwrap();
+        assert!(LocalTree::open(&alias)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cannot be a symlink"));
+        let tree = LocalTree::open(local).unwrap();
+        assert!(tree.file("").is_err());
+        assert!(tree.file("missing/file").is_err());
+        assert!(tree.file("missing").is_err());
+        fs::create_dir(local.join("directory")).unwrap();
+        assert!(tree.file("directory").is_err());
+        let own = backend.stat("").await.unwrap().unwrap();
+        let file_entry = backend.stat("file").await.unwrap().unwrap();
+        for entries in [
+            vec![own],
+            vec![Entry {
+                path: "outside/file".into(),
+                ..file_entry.clone()
+            }],
+            vec![file_entry.clone(), file_entry],
+        ] {
+            *backend.listed.lock().unwrap() = Some(entries);
+            assert!(remote_files(&backend, "", &mut vec![]).await.is_err());
+        }
+        assert!(remote_files(&backend, "file", &mut vec![])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must be a directory"));
+    }
+
+    #[tokio::test]
+    async fn legacy_unsorted_sidecar_selection_is_an_idempotent_receipt_and_invalid_input_is_rejected(
+    ) {
+        let (_guard, _root, file) = fixture();
+        let backend = Memory::new();
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        let mut record = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        record.selection = vec!["user.*".into(), "com.example.*".into(), "user.*".into()];
+        let path = sidecar_path("file", &entry).unwrap();
+        backend.nodes.lock().unwrap().insert(
+            path.clone(),
+            Node {
+                revision: 1,
+                bytes: Some(
+                    serde_json::to_vec(&Envelope {
+                        version: 1,
+                        path: "file".into(),
+                        entry: entry.clone(),
+                        record: record.clone(),
+                    })
+                    .unwrap(),
+                ),
+            },
+        );
+        assert!(
+            !save_record_if_fingerprint(&backend, "file", &entry, &record, None)
+                .await
+                .unwrap()
+                .changed
+        );
+        record.selection.sort();
+        record.selection.dedup();
+        assert!(
+            !save_record(&backend, "file", &entry, &record)
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(backend.nodes.lock().unwrap()[&path].revision, 1);
+        record.selection = vec!["user.*".into(); 129];
+        assert!(save_record(&backend, "file", &entry, &record)
+            .await
+            .is_err());
+        assert_eq!(backend.nodes.lock().unwrap()[&path].revision, 1);
+    }
+
+    fn after_nth_download(count: usize, action: Hook) -> Hook {
+        Box::new(move |peer, path, local| {
+            if count == 1 {
+                action(peer, path, local)
+            } else {
+                *peer.after_download.lock().unwrap() = Some(after_nth_download(count - 1, action));
+                Ok(())
+            }
+        })
+    }
+    #[tokio::test]
+    async fn metadata_sync_pull_directions_baselines_and_empty_sources_keep_explicit_intent() {
+        for case in [
+            "pull-new",
+            "pull-baseline",
+            "pull-skipped",
+            "push-only",
+            "pull-only",
+            "local-outside-direction",
+            "remote-outside-direction",
+            "same-both",
+            "different-both",
+            "missing-remote",
+            "different-content",
+        ] {
+            let (_guard, root, file) = fixture();
+            let backend = Memory::new();
+            let local = file.parent().unwrap();
+            let baseline = root.join("baseline.json");
+            let empty = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+            let entry = backend.stat("file").await.unwrap().unwrap();
+            if [
+                "pull-baseline",
+                "local-outside-direction",
+                "remote-outside-direction",
+                "same-both",
+            ]
+            .contains(&case)
+            {
+                sync(
+                    &backend,
+                    local,
+                    "",
+                    &baseline,
+                    &SyncOptions {
+                        apply: true,
+                        direction: crate::sync::Direction::Both,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            if [
+                "pull-only",
+                "local-outside-direction",
+                "same-both",
+                "different-both",
+            ]
+            .contains(&case)
+            {
+                metadata::apply(&file, &changed(&empty, "local"), &MetadataPolicy::default())
+                    .unwrap();
+            }
+            if [
+                "pull-new",
+                "pull-baseline",
+                "push-only",
+                "remote-outside-direction",
+                "same-both",
+                "different-both",
+            ]
+            .contains(&case)
+            {
+                save_record(
+                    &backend,
+                    "file",
+                    &entry,
+                    &changed(
+                        &empty,
+                        if case == "same-both" {
+                            "local"
+                        } else {
+                            "remote"
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            if case == "pull-skipped" {
+                let mut record = empty.clone();
+                record.selection = vec!["com.example.*".into()];
+                record.attributes = BTreeMap::from([("com.example.skip".into(), "01".into())]);
+                record.excluded.push(metadata::ExcludedAttribute {
+                    name: "security.omitted".into(),
+                    reason: "never copied".into(),
+                });
+                save_record(&backend, "file", &entry, &record)
+                    .await
+                    .unwrap();
+            }
+            if case == "missing-remote" {
+                backend.nodes.lock().unwrap().remove("file");
+            }
+            if case == "different-content" {
+                backend.nodes.lock().unwrap().get_mut("file").unwrap().bytes =
+                    Some(b"different".to_vec());
+            }
+            let direction = if ["push-only", "remote-outside-direction"].contains(&case) {
+                crate::sync::Direction::Push
+            } else if ["pull-only", "local-outside-direction"].contains(&case) {
+                crate::sync::Direction::Pull
+            } else {
+                crate::sync::Direction::Both
+            };
+            let report = sync(
+                &backend,
+                local,
+                "",
+                &baseline,
+                &SyncOptions {
+                    apply: true,
+                    direction,
+                },
+            )
+            .await
+            .unwrap();
+            match case {
+                "pull-new" | "pull-baseline" => {
+                    assert_eq!(report.actions[0].direction, "pull");
+                    assert_eq!(
+                        metadata::capture(&file, &MetadataPolicy::default())
+                            .unwrap()
+                            .attributes["user.rdrive.tag"],
+                        "72656d6f7465"
+                    );
+                }
+                "pull-skipped" => {
+                    assert!(report
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("skipped")));
+                    assert!(!metadata::capture(&file, &MetadataPolicy::default())
+                        .unwrap()
+                        .attributes
+                        .contains_key("com.example.skip"));
+                }
+                "different-both" => assert_eq!(report.conflicts.len(), 1),
+                "same-both" => {
+                    assert!(report.actions.is_empty());
+                    assert!(report.baseline_updated);
+                }
+                _ => assert!(!report.warnings.is_empty(), "{case}"),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn changed_content_with_two_empty_metadata_sources_retains_prior_nonempty_baseline() {
+        let (_guard, root, file) = fixture();
+        let backend = Memory::new();
+        let baseline = root.join("baseline");
+        let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        metadata::apply(
+            &file,
+            &changed(&original, "old"),
+            &MetadataPolicy::default(),
+        )
+        .unwrap();
+        let options = SyncOptions {
+            apply: true,
+            direction: crate::sync::Direction::Both,
+        };
+        sync(&backend, file.parent().unwrap(), "", &baseline, &options)
+            .await
+            .unwrap();
+        let before = fs::read(&baseline).unwrap();
+        fs::write(&file, b"new content").unwrap();
+        let mut cleared = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        cleared.attributes.clear();
+        metadata::apply(&file, &cleared, &MetadataPolicy::default()).unwrap();
+        let mut nodes = backend.nodes.lock().unwrap();
+        let remote = nodes.get_mut("file").unwrap();
+        remote.bytes = Some(b"new content".to_vec());
+        remote.revision += 1;
+        drop(nodes);
+        let report = sync(&backend, file.parent().unwrap(), "", &baseline, &options)
+            .await
+            .unwrap();
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("both metadata sources are empty")));
+        assert_eq!(fs::read(&baseline).unwrap(), before);
+    }
+    #[tokio::test]
+    async fn local_replacement_or_attribute_changes_during_planning_keep_prior_baseline_and_remote()
+    {
+        for case in ["replacement", "attributes", "completion"] {
+            let (_guard, root, file) = fixture();
+            let backend = Memory::new();
+            let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+            if case != "completion" {
+                metadata::apply(
+                    &file,
+                    &changed(&original, "local"),
+                    &MetadataPolicy::default(),
+                )
+                .unwrap();
+            }
+            let target = file.clone();
+            let changed_record = changed(&original, "concurrent");
+            let replace = case == "replacement";
+            *backend.after_download.lock().unwrap() = Some(Box::new(move |_, _, _| {
+                if replace {
+                    fs::rename(&target, target.with_extension("previous"))?;
+                    fs::write(&target, b"content")?;
+                } else {
+                    metadata::apply(&target, &changed_record, &MetadataPolicy::default())?;
+                }
+                Ok(())
+            }));
+            let baseline = root.join("baseline");
+            let error = sync(
+                &backend,
+                file.parent().unwrap(),
+                "",
+                &baseline,
+                &SyncOptions {
+                    apply: true,
+                    direction: crate::sync::Direction::Both,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(match case {
+                    "replacement" => "replaced after planning",
+                    "attributes" => "changed after planning",
+                    _ => "changed before completion",
+                }),
+                "{error:#}"
+            );
+            assert!(!baseline.exists());
+            assert_eq!(
+                backend.nodes.lock().unwrap()["file"].bytes.as_deref(),
+                Some(b"content".as_slice())
+            );
+        }
+    }
+    #[tokio::test]
+    async fn remote_metadata_changes_between_plan_and_pull_never_overwrite_local_attributes() {
+        for remove in [false, true] {
+            let (_guard, root, file) = fixture();
+            let backend = Memory::new();
+            let original = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+            let entry = backend.stat("file").await.unwrap().unwrap();
+            save_record(&backend, "file", &entry, &changed(&original, "remote"))
+                .await
+                .unwrap();
+            let sidecar = sidecar_path("file", &entry).unwrap();
+            *backend.after_download.lock().unwrap() = Some(after_nth_download(
+                2,
+                Box::new(move |peer, _, _| {
+                    if remove {
+                        peer.nodes.lock().unwrap().remove(&sidecar);
+                    } else {
+                        let mut nodes = peer.nodes.lock().unwrap();
+                        let node = nodes.get_mut(&sidecar).unwrap();
+                        let mut envelope: Envelope =
+                            serde_json::from_slice(node.bytes.as_ref().unwrap())?;
+                        envelope.record = changed(&envelope.record, "second writer");
+                        node.bytes = Some(serde_json::to_vec(&envelope)?);
+                        node.revision += 1;
+                    }
+                    Ok(())
+                }),
+            ));
+            let baseline = root.join("baseline");
+            let error = sync(
+                &backend,
+                file.parent().unwrap(),
+                "",
+                &baseline,
+                &SyncOptions {
+                    apply: true,
+                    direction: crate::sync::Direction::Pull,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if remove {
+                    "disappeared after planning"
+                } else {
+                    "changed after planning"
+                }),
+                "{error:#}"
+            );
+            assert!(!baseline.exists());
+            assert_eq!(
+                metadata::capture(&file, &MetadataPolicy::default())
+                    .unwrap()
+                    .fingerprint()
+                    .unwrap(),
+                original.fingerprint().unwrap()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn nested_internal_unsafe_and_colliding_metadata_paths_are_handled_conservatively() {
+        let (_guard, root, file) = fixture();
+        let backend = Memory::new();
+        let local = file.parent().unwrap();
+        fs::create_dir(local.join("folder")).unwrap();
+        fs::write(local.join("folder/file"), b"content").unwrap();
+        fs::create_dir(local.join(ROOT)).unwrap();
+        fs::write(local.join(ROOT).join("private"), b"internal").unwrap();
+        backend.nodes.lock().unwrap().insert(
+            "folder".into(),
+            Node {
+                bytes: None,
+                revision: 1,
+            },
+        );
+        backend.nodes.lock().unwrap().insert(
+            "folder/file".into(),
+            Node {
+                bytes: Some(b"content".to_vec()),
+                revision: 1,
+            },
+        );
+        let options = SyncOptions {
+            apply: true,
+            direction: crate::sync::Direction::Both,
+        };
+        assert!(
+            sync(&backend, local, "", &root.join("baseline"), &options)
+                .await
+                .unwrap()
+                .baseline_updated
+        );
+        assert_eq!(
+            remote_files(&backend, "folder", &mut vec![])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(local.join("bad\n"), b"unsafe").unwrap();
+        assert!(sync(&backend, local, "", &root.join("baseline"), &options)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe metadata filename"));
+        fs::remove_file(local.join("bad\n")).unwrap();
+        backend.nodes.lock().unwrap().insert(
+            "FILE".into(),
+            Node {
+                bytes: Some(b"content".to_vec()),
+                revision: 1,
+            },
+        );
+        assert!(sync(&backend, local, "", &root.join("baseline"), &options)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("filename collision"));
+    }
+
+    #[tokio::test]
+    async fn public_save_apply_and_guarded_edit_complete_idempotently() {
+        let (_guard, root, file) = fixture();
+        let backend = Memory::new();
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        let policy = MetadataPolicy::default();
+        assert!(apply(&backend, "file", &entry, &file, &policy)
+            .await
+            .unwrap()
+            .applied
+            .is_empty());
+        let empty = metadata::capture(&file, &policy).unwrap();
+        metadata::apply(&file, &changed(&empty, "local"), &policy).unwrap();
+        assert!(
+            save(&backend, &file, "file", &entry, &policy)
+                .await
+                .unwrap()
+                .changed
+        );
+        let previous = metadata::capture(&file, &policy).unwrap();
+        let updated = changed(&previous, "edited");
+        assert!(
+            save_record_if_fingerprint(
+                &backend,
+                "file",
+                &entry,
+                &updated,
+                Some(&previous.fingerprint().unwrap())
+            )
+            .await
+            .unwrap()
+            .changed
+        );
+        assert_eq!(
+            apply(&backend, "file", &entry, &file, &policy)
+                .await
+                .unwrap()
+                .applied,
+            vec!["user.rdrive.tag"]
+        );
+        assert_eq!(
+            metadata::capture(&file, &policy).unwrap().attributes["user.rdrive.tag"],
+            "656469746564"
+        );
+        let options = SyncOptions {
+            apply: true,
+            direction: crate::sync::Direction::Both,
+        };
+        let baseline = root.join("baseline");
+        sync(&backend, file.parent().unwrap(), "", &baseline, &options)
+            .await
+            .unwrap();
+        let old_baseline = fs::read(&baseline).unwrap();
+        let repeat = sync(&backend, file.parent().unwrap(), "", &baseline, &options)
+            .await
+            .unwrap();
+        assert!(repeat.actions.is_empty());
+        assert!(repeat.baseline_updated);
+        assert_eq!(fs::read(&baseline).unwrap(), old_baseline);
+    }
+
+    #[tokio::test]
+    async fn failed_staging_does_not_publish_a_metadata_sidecar() {
+        let (_guard, _root, file) = fixture();
+        let backend = Memory::new();
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        let record = metadata::capture(&file, &MetadataPolicy::default()).unwrap();
+        let error = save_checked_with(&backend, "file", &entry, &record, None, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "synthetic staging disk full",
+            )
+            .into())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("staging disk full"));
+        assert!(backend
+            .stat(&sidecar_path("file", &entry).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            backend.nodes.lock().unwrap()["file"].bytes.as_deref(),
+            Some(b"content".as_slice())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disappearing_local_metadata_source_fails_the_scan() {
+        let (_guard, _root, file) = fixture();
+        let tree = LocalTree::open(file.parent().unwrap()).unwrap();
+        let error = tree
+            .scan_with(&MetadataPolicy::default(), |directory| {
+                let names = directory_names(directory)?;
+                fs::remove_file(&file)?;
+                Ok(names)
+            })
+            .err()
+            .expect("the disappeared entry must not be treated as an empty source");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!file.exists());
     }
 }

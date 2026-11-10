@@ -24,6 +24,29 @@ pub fn key(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+/// Resolve existing ancestors before comparing locations, including macOS
+/// /var aliases and parent symlinks. Missing descendants need not exist yet.
+/// Dangling links and unreadable ancestors are errors, never lexical fallbacks.
+pub fn resolve_location(path: &Path) -> Result<PathBuf> {
+    let mut candidate = std::path::absolute(path)?;
+    let mut tail = Vec::new();
+    let mut resolved = loop {
+        match fs::canonicalize(&candidate) {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(&candidate).is_ok() {
+                    return Err(error).context("cannot resolve existing path");
+                }
+                tail.push(candidate.file_name().context("cannot resolve path ancestor")?.to_os_string());
+                if !candidate.pop() { return Err(error).context("cannot resolve path ancestor"); }
+            }
+            Err(error) => return Err(error).context("cannot resolve path location"),
+        }
+    };
+    for part in tail.into_iter().rev() { resolved.push(part); }
+    Ok(resolved)
+}
+
 pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }
@@ -315,6 +338,10 @@ impl Store {
 
 /// Copy a caller file into private storage, then fsync it before advertising it.
 pub fn snapshot(source: &Path, dest: &Path) -> Result<(String, u64)> {
+    snapshot_with(source, dest, std::io::copy)
+}
+
+fn snapshot_with(source: &Path, dest: &Path, copy: impl FnOnce(&mut File, &mut File) -> std::io::Result<u64>) -> Result<(String, u64)> {
     let before = fingerprint(source)?;
     let mut srcopts = OpenOptions::new();
     srcopts.read(true);
@@ -326,7 +353,7 @@ pub fn snapshot(source: &Path, dest: &Path) -> Result<(String, u64)> {
     #[cfg(unix)]
     dstopts.mode(0o600);
     let mut target = dstopts.open(dest)?;
-    let bytes = std::io::copy(&mut source_file, &mut target)?;
+    let bytes = copy(&mut source_file, &mut target)?;
     target.sync_all()?;
     File::open(dest.parent().context("snapshot has no parent")?)?.sync_all()?;
     let hash = fingerprint(dest)?;
@@ -340,6 +367,9 @@ pub fn snapshot(source: &Path, dest: &Path) -> Result<(String, u64)> {
 /// Commit a completed temporary download without replacing an existing target
 /// unless overwrite was explicitly requested. hard_link is atomic no-clobber.
 pub fn commit_download(temp: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+    commit_download_with(temp, destination, overwrite, |path| File::open(path))
+}
+fn commit_download_with(temp: &Path, destination: &Path, overwrite: bool, open_parent: impl FnOnce(&Path) -> std::io::Result<File>) -> Result<()> {
     File::open(temp)?.sync_all()?;
     if overwrite {
         if destination
@@ -354,7 +384,7 @@ pub fn commit_download(temp: &Path, destination: &Path, overwrite: bool) -> Resu
             .context("destination exists or cannot be committed atomically")?;
         fs::remove_file(temp)?;
     }
-    File::open(
+    open_parent(
         destination
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -415,5 +445,80 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _one = Store::open(dir.path().join("state")).unwrap();
         assert!(Store::open(dir.path().join("state")).is_err());
+    }
+
+    #[test]
+    fn unsafe_state_roots_and_corrupt_ledgers_preserve_user_data() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private"); fs::create_dir(&private).unwrap(); fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("link"); symlink(&private, &link).unwrap();
+        assert!(Store::open(link).err().unwrap().to_string().contains("symlink"));
+        let public = temp.path().join("public"); fs::create_dir(&public).unwrap(); fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Store::open(public).err().unwrap().to_string().contains("private"));
+        symlink(&private, private.join("cache")).unwrap();
+        assert!(Store::open(private.clone()).err().unwrap().to_string().contains("subdirectory cannot be a symlink"));
+        fs::remove_file(private.join("cache")).unwrap();
+        let store = Store::open(private.clone()).unwrap(); store.save().unwrap(); drop(store);
+        let ledger = private.join("state.json");
+        let baseline: serde_json::Value = read_json(&ledger).unwrap();
+        let invalid = [
+            (serde_json::json!({"jobs":[{"id":"bad/path","profile":"p","remote":"file","snapshot":"bad/path","sha256":"","size":0,"created":"","status":"pending","attempts":0,"error":null,"expected":null,"overwrite":false,"version":false}]}), "invalid upload queue state"),
+            (serde_json::json!({"cache":{"bad":{"profile":"p","remote":"file","object":"object","entry":{"path":"file","is_dir":false,"size":0,"modified":null,"etag":null},"sha256":"invalid","pinned":false,"accessed":""}}}), "invalid cache state"),
+            (serde_json::json!({"cache_reservations":{"not-uuid":{"size":1,"created":""}}}), "invalid cache reservation state"),
+            (serde_json::json!({"cache_garbage":["../escape"]}), "invalid obsolete cache object state"),
+        ];
+        for (patch, expected) in invalid {
+            let mut value = baseline.clone(); for (key, field) in patch.as_object().unwrap() { value[key] = field.clone(); }
+            atomic_json(&ledger, &value).unwrap(); let before = fs::read(&ledger).unwrap();
+            assert!(Store::open(private.clone()).err().unwrap().to_string().contains(expected), "{expected}"); assert_eq!(fs::read(&ledger).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn atomic_failure_download_overwrite_and_snapshot_race_are_observable() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path();
+        let directory = root.join("directory"); fs::create_dir(&directory).unwrap();
+        assert!(atomic_write(&directory, b"data").is_err());
+        assert_eq!(fs::read_dir(root).unwrap().count(), 1, "failed atomic writes clean their own temporary file");
+        assert!(read_json::<serde_json::Value>(&directory).is_err()); assert!(fingerprint(&directory).is_err());
+        let source = root.join("source"); let target = root.join("target"); fs::write(&source, b"original").unwrap();
+        let raced = snapshot_with(&source, &target, |input, output| { let size = std::io::copy(input, output)?; fs::write(&source, b"external edit")?; Ok(size) });
+        assert!(raced.unwrap_err().to_string().contains("changed while")); assert!(!target.exists());
+        fs::write(&target, b"old").unwrap(); commit_download(&source, &target, true).unwrap(); assert_eq!(fs::read(&target).unwrap(), b"external edit");
+        let link = root.join("link"); symlink(&target, &link).unwrap(); fs::write(&source, b"must survive").unwrap();
+        assert!(commit_download(&source, &link, true).unwrap_err().to_string().contains("symlink"));
+        assert_eq!(fs::read(&target).unwrap(), b"external edit"); assert!(source.exists());
+    }
+
+    #[test]
+    fn history_retention_keeps_the_latest_thousand_events() {
+        let temp = tempfile::tempdir().unwrap(); let mut store = Store::open(temp.path().join("state")).unwrap();
+        store.db.history = (0..1000).map(|number| Event { time: number.to_string(), operation: "test".into(), profile: "p".into(), path: "file".into(), detail: "fixture".into() }).collect();
+        store.event("test", "p", "file", "latest").unwrap(); assert_eq!(store.db.history.len(), 1000); assert_eq!(store.db.history[0].time, "1"); assert_eq!(store.db.history.last().unwrap().detail, "latest");
+        drop(store); assert_eq!(Store::open(temp.path().join("state")).unwrap().db.history.len(), 1000);
+    }
+
+    #[test]
+    fn location_comparisons_resolve_aliases_and_reject_dangling_links() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap(); let real = temp.path().join("real"); fs::create_dir(&real).unwrap();
+        let alias = temp.path().join("alias"); symlink(&real, &alias).unwrap();
+        assert_eq!(resolve_location(&alias.join("new/file")).unwrap(), real.canonicalize().unwrap().join("new/file"));
+        let dangling = temp.path().join("dangling"); symlink(temp.path().join("absent"), &dangling).unwrap();
+        assert!(resolve_location(&dangling.join("new/file")).unwrap_err().to_string().contains("cannot resolve existing"));
+        let file = real.join("file"); fs::write(&file, b"body").unwrap();
+        assert!(resolve_location(&file.join("child")).unwrap_err().to_string().contains("cannot resolve path location"));
+    }
+    #[test]
+    fn known_obsolete_payload_is_recovered_and_failed_directory_open_keeps_published_bytes() {
+        let temp=tempfile::tempdir().unwrap(); let home=temp.path().join("state"); let mut store=Store::open(home.clone()).unwrap();
+        let object=uuid::Uuid::new_v4().to_string(); let obsolete=home.join("cache").join(&object); fs::write(&obsolete,b"obsolete clean bytes").unwrap();
+        store.db.cache_garbage.insert(object); store.save().unwrap(); drop(store);
+        let recovered=Store::open(home).unwrap(); assert!(recovered.db.cache_garbage.is_empty()); assert!(!obsolete.exists());
+        let source=temp.path().join("source"); let destination=temp.path().join("published"); fs::write(&source,b"verified bytes").unwrap();
+        let error=commit_download_with(&source,&destination,false,|_|Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"synthetic parent open failed"))).unwrap_err();
+        assert!(error.to_string().contains("synthetic parent open failed")); assert_eq!(fs::read(&destination).unwrap(),b"verified bytes"); assert!(!source.exists());
     }
 }

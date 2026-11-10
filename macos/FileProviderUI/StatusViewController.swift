@@ -3,11 +3,33 @@ import AppKit
 import FileProvider
 import FileProviderUI
 
+/// File Provider identity and completion are injectable without creating a domain.
+struct NativeStatusIntegration {
+    var makeBridge: () throws -> BackendBridge
+    var readItem: (BackendBridge, [String: Any], SocketOperation) throws -> WireItem
+    var domain: (RDriveStatusViewController) -> NSFileProviderDomainIdentifier?
+    var manager: (NSFileProviderDomain) -> NativeDomainManaging?
+    var identify: (URL, @escaping (NSFileProviderItemIdentifier?, NSFileProviderDomainIdentifier?, Error?) -> Void) -> Void
+    var complete: (RDriveStatusViewController) -> Void
+    var timeout: TimeInterval = 20
+
+    static var live: NativeStatusIntegration {
+        NativeStatusIntegration(
+            makeBridge: { try BackendBridge(bundle: Bundle(for: RDriveStatusViewController.self)) },
+            readItem: { try $0.item($1, operation: $2) },
+            domain: { $0.extensionContext.domainIdentifier },
+            manager: { NativeSystemManager().manager(for: $0) },
+            identify: { NSFileProviderManager.getIdentifierForUserVisibleFile(at: $0, completionHandler: $1) },
+            complete: { $0.extensionContext.completeRequest() })
+    }
+}
+
 @objc(RDriveStatusViewController)
 final class RDriveStatusViewController: FPUIActionExtensionViewController {
     private let heading = NSTextField(labelWithString: "Sync Status")
     private let details = NSTextField(wrappingLabelWithString: "Checking file availability…")
     private var operation: SocketOperation?
+    var integration: NativeStatusIntegration = .live
 
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 260))
@@ -31,7 +53,7 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
 
     override func prepare(forAction actionIdentifier: String, itemIdentifiers: [NSFileProviderItemIdentifier]) {
         _ = view
-        guard actionIdentifier == "rdrive.status", let domain = extensionContext.domainIdentifier,
+        guard actionIdentifier == "rdrive.status", let domain = integration.domain(self),
               !itemIdentifiers.isEmpty, itemIdentifiers.count <= 128 else {
             details.stringValue = "Select RDrive files to view their sync status."
             return
@@ -40,12 +62,12 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         let operation = SocketOperation(); self.operation = operation
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let bridge = try BackendBridge(bundle: Bundle(for: RDriveStatusViewController.self))
+                let bridge = try self.integration.makeBridge()
                 var lines: [String] = []
                 for identifier in itemIdentifiers.prefix(10) {
                     try operation.check()
                     let canonical = try self.canonicalIdentifier(identifier, domain: domain)
-                    let item = try bridge.item(["op": "item", "domain": domain.rawValue, "id": wireID(canonical)], operation: operation)
+                    let item = try self.integration.readItem(bridge, ["op": "item", "domain": domain.rawValue, "id": wireID(canonical)], operation)
                     let state = NativeSyncState.item(item)
                     var line = item.name + ": " + state.title
                     if item.smart == true { line += " · Smart Synchronization" }
@@ -60,14 +82,14 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         }
     }
 
-    private func canonicalIdentifier(_ identifier: NSFileProviderItemIdentifier, domain: NSFileProviderDomainIdentifier) throws -> NSFileProviderItemIdentifier {
+    func canonicalIdentifier(_ identifier: NSFileProviderItemIdentifier, domain: NSFileProviderDomainIdentifier) throws -> NSFileProviderItemIdentifier {
         guard identifier.rawValue.hasPrefix("__fp/fs/") else { return identifier }
         let nativeDomain = NSFileProviderDomain(identifier: domain, displayName: domain.rawValue)
-        guard let manager = NSFileProviderManager(for: nativeDomain) else { throw NativeFailure.invalid("The selected native domain is unavailable.") }
+        guard let manager = integration.manager(nativeDomain) else { throw NativeFailure.invalid("The selected native domain is unavailable.") }
         let located = DispatchSemaphore(value: 0)
         var url: URL?; var failure: Error?
         manager.getUserVisibleURL(for: identifier) { url = $0; failure = $1; located.signal() }
-        guard located.wait(timeout: .now() + 20) == .success else { throw NativeFailure.bridge("The selected file could not be located in time.") }
+        guard located.wait(timeout: .now() + integration.timeout) == .success else { throw NativeFailure.bridge("The selected file could not be located in time.") }
         if let failure = failure { throw failure }
         guard let url = url else { throw NativeFailure.invalid("The selected file is unavailable.") }
         let scoped = url.startAccessingSecurityScopedResource()
@@ -75,10 +97,10 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         let identified = DispatchSemaphore(value: 0)
         var item: NSFileProviderItemIdentifier?; var resolvedDomain: NSFileProviderDomainIdentifier?
         failure = nil
-        NSFileProviderManager.getIdentifierForUserVisibleFile(at: url) {
+        integration.identify(url) {
             item = $0; resolvedDomain = $1; failure = $2; identified.signal()
         }
-        guard identified.wait(timeout: .now() + 20) == .success else { throw NativeFailure.bridge("The selected file's identity request timed out.") }
+        guard identified.wait(timeout: .now() + integration.timeout) == .success else { throw NativeFailure.bridge("The selected file's identity request timed out.") }
         if let failure = failure { throw failure }
         guard resolvedDomain == domain, let item = item, !item.rawValue.hasPrefix("__fp/fs/") else {
             throw NativeFailure.invalid("The selected file could not be matched to this storage connection.")
@@ -91,9 +113,9 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         details.stringValue = (error as NSError).localizedDescription
     }
 
-    @objc private func finish() {
+    @objc func finish() {
         operation?.cancel(); operation = nil
-        extensionContext.completeRequest()
+        integration.complete(self)
     }
     deinit { operation?.cancel() }
 }

@@ -4,9 +4,39 @@ import FinderSync
 import FileProvider
 import Darwin
 
+/// The OS boundary stays explicit so host tests never configure Finder or open UI.
+struct NativeFinderIntegration {
+    var registerBadge: (String, String, String) -> Void
+    var setRoots: (Set<URL>) -> Void
+    var selection: () -> [URL]?
+    var target: () -> URL?
+    var identify: (URL, @escaping (NSFileProviderItemIdentifier?, NSFileProviderDomainIdentifier?, Error?) -> Void) -> Void
+    var manager: (NSFileProviderDomain) -> NativeDomainManaging?
+    var open: (URL) -> Void
+
+    static var live: NativeFinderIntegration {
+        NativeFinderIntegration(
+            registerBadge: { id, symbol, label in
+                if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label) {
+                    FIFinderSyncController.default().setBadgeImage(image, label: label, forBadgeIdentifier: id)
+                }
+            },
+            setRoots: { FIFinderSyncController.default().directoryURLs = $0 },
+            selection: { FIFinderSyncController.default().selectedItemURLs() },
+            target: { FIFinderSyncController.default().targetedURL() },
+            identify: { NSFileProviderManager.getIdentifierForUserVisibleFile(at: $0, completionHandler: $1) },
+            manager: { NativeSystemManager().manager(for: $0) },
+            open: { NSWorkspace.shared.open($0) })
+    }
+    var setBadge: (String, URL) -> Void = { FIFinderSyncController.default().setBadgeIdentifier($0, for: $1) }
+    var request: (BackendBridge, [String: Any]) throws -> [String: Any] = { try $0.request($1) }
+    var dataless: (URL) -> Bool? = { RDriveFinderSync.isDatalessRegularFile($0) }
+}
+
 @objc(RDriveFinderSync)
 final class RDriveFinderSync: FIFinderSync {
     private var bridge: BackendBridge?
+    private let integration: NativeFinderIntegration
     private var roots: [WatchedRoot] = []
     private var visible: Set<URL> = []
     private var pending: Set<URL> = []
@@ -14,22 +44,26 @@ final class RDriveFinderSync: FIFinderSync {
     private var monitored: Set<URL> = []
     private let queue = DispatchQueue(label: "io.rdrive.finder.badges", qos: .utility)
 
-    override init() {
-        super.init()
+    override convenience init() {
+        let bridge: BackendBridge?
         do { bridge = try BackendBridge(bundle: Bundle(for: RDriveFinderSync.self)) }
-        catch { nativeDevelopmentLog("Finder Sync bridge initialization: \(error)") }
+        catch { bridge = nil; nativeDevelopmentLog("Finder Sync bridge initialization: \(error)") }
+        self.init(bridge: bridge, integration: .live)
+    }
+
+    init(bridge: BackendBridge?, integration: NativeFinderIntegration, startTimer: Bool = true) {
+        self.bridge = bridge; self.integration = integration
+        super.init()
         nativeDevelopmentLog("Finder Sync initialized")
-        let controller = FIFinderSyncController.default()
         for (id, symbol, label) in [
             ("online", "icloud", "Online only"), ("cached", "checkmark.circle", "Downloaded"),
             ("pinned", "pin.circle.fill", "Kept offline"), ("syncing", "arrow.triangle.2.circlepath", "Syncing"),
             ("error", "exclamationmark.circle", "Needs attention")
         ] {
-            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label) {
-                controller.setBadgeImage(image, label: label, forBadgeIdentifier: id)
-            }
+            integration.registerBadge(id, symbol, label)
         }
         reloadRoots()
+        guard startTimer else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 1, repeating: 5)
         timer.setEventHandler { [weak self] in
@@ -41,18 +75,18 @@ final class RDriveFinderSync: FIFinderSync {
     }
     deinit { timer?.cancel() }
 
-    private func reloadRoots() {
+    func reloadRoots() {
         guard let path = bridge?.paths.roots,
               let data = try? Data(contentsOf: path), let roots = try? JSONDecoder().decode([WatchedRoot].self, from: data) else {
             self.roots = []
-            if !monitored.isEmpty { monitored = []; FIFinderSyncController.default().directoryURLs = [] }
+            if !monitored.isEmpty { monitored = []; integration.setRoots([]) }
             return
         }
         self.roots = roots
         let next = Set(roots.map { URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL })
         if next != monitored {
             monitored = next
-            FIFinderSyncController.default().directoryURLs = next
+            integration.setRoots(next)
             nativeDevelopmentLog("Finder Sync monitored root count=\(next.count)")
         }
     }
@@ -64,9 +98,9 @@ final class RDriveFinderSync: FIFinderSync {
         if visible.count < 10000 { visible.insert(url) }
         updateBadge(url)
     }
-    private func resolve(_ url: URL, completion: @escaping (Result<(String, String, Bool), Error>) -> Void) {
+    func resolve(_ url: URL, completion: @escaping (Result<(String, String, Bool), Error>) -> Void) {
         let configuredDomains = Set(roots.map { $0.domain })
-        NSFileProviderManager.getIdentifierForUserVisibleFile(at: url) { item, domain, _ in
+        integration.identify(url) { item, domain, _ in
             if let item = item, let domain = domain, configuredDomains.contains(domain.rawValue) {
                 completion(.success((domain.rawValue, wireID(item), true)))
                 return
@@ -74,7 +108,7 @@ final class RDriveFinderSync: FIFinderSync {
             self.queue.async {
                 do {
                     guard let bridge = self.bridge else { throw NativeFailure.bridge("The companion is unavailable.") }
-                    let reply = try bridge.request(["op": "resolve", "file_url": url.absoluteString])
+                    let reply = try self.integration.request(bridge, ["op": "resolve", "file_url": url.absoluteString])
                     guard let domain = reply["domain"] as? String, let id = reply["id"] as? String else {
                         throw NativeFailure.invalid("This path is not mapped to an RDrive connection.")
                     }
@@ -94,25 +128,26 @@ final class RDriveFinderSync: FIFinderSync {
                 var badge = "error"
                 var nativeDomain = false
                 if case .success(let (domain, id, isNative)) = result,
-                   let reply = try? self.bridge?.request(["op": "status", "domain": domain, "id": id]),
+                   let bridge = self.bridge,
+                   let reply = try? self.integration.request(bridge, ["op": "status", "domain": domain, "id": id]),
                    let state = reply["state"] as? String,
                    let value = NativeSyncState(rawValue: state) {
                     badge = value == .queued ? "syncing" : (value == .conflict ? "error" : value.rawValue)
                     nativeDomain = isNative
                 }
-                if nativeDomain, let dataless = self.isDatalessRegularFile(url) {
+                if nativeDomain, let dataless = self.integration.dataless(url) {
                     if badge == "pinned" && dataless { badge = "syncing" }
                     else if badge == "cached" && dataless { badge = "online" }
                     else if badge == "online" && !dataless { badge = "cached" }
                 }
                 DispatchQueue.main.async {
                     self.pending.remove(url)
-                    if self.visible.contains(url) { FIFinderSyncController.default().setBadgeIdentifier(badge, for: url) }
+                    if self.visible.contains(url) { self.integration.setBadge(badge, url) }
                 }
             }
         }
     }
-    private func isDatalessRegularFile(_ url: URL) -> Bool? {
+    static func isDatalessRegularFile(_ url: URL) -> Bool? {
         url.withUnsafeFileSystemRepresentation { path -> Bool? in
             guard let path = path else { return nil }
             var metadata = stat()
@@ -121,8 +156,7 @@ final class RDriveFinderSync: FIFinderSync {
         }
     }
     override func menu(for menuKind: FIMenuKind) -> NSMenu? {
-        let controller = FIFinderSyncController.default()
-        let selected = controller.selectedItemURLs() ?? controller.targetedURL().map { [$0] } ?? []
+        let selected = integration.selection() ?? integration.target().map { [$0] } ?? []
         guard !selected.isEmpty else { return nil }
         let menu = NSMenu(title: "RDrive")
         for (title, action) in [
@@ -145,7 +179,7 @@ final class RDriveFinderSync: FIFinderSync {
     @objc private func evict(_ sender: NSMenuItem) { act(sender, action: "evict") }
     @objc private func status(_ sender: NSMenuItem) { act(sender, action: "status") }
 
-    private func act(_ sender: NSMenuItem, action: String) {
+    func act(_ sender: NSMenuItem, action: String) {
         guard let urls = sender.representedObject as? [URL] else { return }
         for url in urls {
             resolve(url) { result in
@@ -153,14 +187,14 @@ final class RDriveFinderSync: FIFinderSync {
                     do {
                         let (domain, id, isNative) = try result.get()
                         let providerDomain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(domain), displayName: domain)
-                        let manager = NSFileProviderManager(for: providerDomain)
+                        let manager = self.integration.manager(providerDomain)
                         if action == "status" { self.showCompanion(arguments: ["--show-status", domain, id]); return }
                         guard isNative else {
                             throw NativeFailure.invalid("Use the Smart Finder view for offline storage. A network-mounted file cannot be kept offline by changing its RDrive policy.")
                         }
                         if action == "pin" || action == "unpin" {
                             guard let bridge = self.bridge else { throw NativeFailure.bridge("The companion is unavailable.") }
-                            _ = try bridge.request(["op": "pin", "domain": domain, "id": id, "pinned": action == "pin"])
+                            _ = try self.integration.request(bridge, ["op": "pin", "domain": domain, "id": id, "pinned": action == "pin"])
                             manager?.signalEnumerator(for: .workingSet) { _ in }
                             self.updateBadge(url)
                         } else if action == "download" {
@@ -180,7 +214,7 @@ final class RDriveFinderSync: FIFinderSync {
         }
     }
     private func showError(_ error: Error) { showCompanion(arguments: ["--show-message", (error as NSError).localizedDescription]) }
-    private func showCompanion(arguments: [String]) {
+    func showCompanion(arguments: [String]) {
         var components = URLComponents()
         components.scheme = "rdrive-native"
         if arguments.first == "--show-status", arguments.count == 3 {
@@ -190,7 +224,7 @@ final class RDriveFinderSync: FIFinderSync {
         }
         guard let url = components.url else { return }
         DispatchQueue.main.async {
-            NSWorkspace.shared.open(url)
+            self.integration.open(url)
         }
     }
 }

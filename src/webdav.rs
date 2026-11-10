@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Component, Path},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -32,6 +32,32 @@ const MAX_XML_BYTES: usize = 16 * 1024 * 1024;
 const MIN_NEXTCLOUD_CHUNK: u64 = 5 * 1024 * 1024;
 const MAX_NEXTCLOUD_CHUNK: u64 = 4 * 1024 * 1024 * 1024;
 
+fn loopback_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+fn nextcloud_chunk_size(source_size: u64) -> Result<u64> {
+    let chunk_size = source_size.div_ceil(10_000).max(MIN_NEXTCLOUD_CHUNK);
+    if chunk_size > MAX_NEXTCLOUD_CHUNK {
+        bail!("file exceeds the supported Nextcloud chunk count/size limits");
+    }
+    Ok(chunk_size)
+}
+
+#[async_trait]
+trait PartialInspection: Send + Sync {
+    async fn length(&self, file: &tokio::fs::File) -> std::io::Result<u64>;
+}
+struct FileInspection;
+#[async_trait]
+impl PartialInspection for FileInspection {
+    async fn length(&self, file: &tokio::fs::File) -> std::io::Result<u64> { Ok(file.metadata().await?.len()) }
+}
+
 pub struct WebDav {
     client: Client,
     root: Url,
@@ -42,6 +68,7 @@ pub struct WebDav {
     owned_locks: Mutex<BTreeMap<String, String>>,
     nextcloud_upload_url: Option<Url>,
     transfer: crate::transfer::TransferContext,
+    partial_inspection: Arc<dyn PartialInspection>,
 }
 
 impl WebDav {
@@ -65,12 +92,7 @@ impl WebDav {
         // hyper-util's macOS proxy discovery does not import ExceptionsList.
         // Local services must never receive credentials through a proxy; remote
         // hosts, including private-network addresses, retain configured routing.
-        let loopback = match root.host() {
-            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(address)) => address.is_loopback(),
-            Some(url::Host::Ipv6(address)) => address.is_loopback(),
-            None => false,
-        };
+        let loopback = loopback_host(root.host());
         if loopback {
             client = client.no_proxy();
         }
@@ -101,6 +123,7 @@ impl WebDav {
             owned_locks: Mutex::new(BTreeMap::new()),
             nextcloud_upload_url,
             transfer: crate::transfer::global(),
+            partial_inspection: Arc::new(FileInspection),
         })
     }
 
@@ -770,10 +793,7 @@ impl WebDav {
             Some(bytes) => serde_json::from_slice::<NextcloudUpload>(&bytes)
                 .context("invalid Nextcloud upload checkpoint; no upload was resumed")?,
             None => {
-                let chunk_size = source_size.div_ceil(10_000).max(MIN_NEXTCLOUD_CHUNK);
-                if chunk_size > MAX_NEXTCLOUD_CHUNK {
-                    bail!("file exceeds the supported Nextcloud chunk count/size limits");
-                }
+                let chunk_size = nextcloud_chunk_size(source_size)?;
                 NextcloudUpload {
                     version: 1,
                     session: format!("rdrive-{}", uuid::Uuid::new_v4()),
@@ -1027,26 +1047,7 @@ impl WebDav {
             bail!("partial download is larger than the remote file");
         }
         reject_symlink_components(local)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
-        }
-        let file = if offset == 0 {
-            match options.clone().create_new(true).open(local) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    options.open(local)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            options
-                .open(local)
-                .context("partial download file is missing")?
-        };
+        let file = open_partial(local, offset, |options, path| options.open(path))?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() != offset {
             bail!("partial download length differs from its checkpoint; file was preserved");
@@ -1118,7 +1119,7 @@ impl WebDav {
         {
             bail!("range response length differs from the requested suffix; partial file was preserved");
         }
-        if file.metadata().await?.len() != offset {
+        if self.partial_inspection.length(&file).await? != offset {
             bail!("partial file changed while requesting the next range");
         }
         file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -1142,7 +1143,7 @@ impl WebDav {
         let synced = file.sync_all().await;
         transfer?;
         synced?;
-        if file.metadata().await?.len() != expected.size {
+        if self.partial_inspection.length(&file).await? != expected.size {
             bail!("partial file length changed during transfer");
         }
         progress.finish();
@@ -1375,6 +1376,27 @@ struct UploadMetadata {
     etag: Option<String>,
 }
 
+fn open_partial(local: &Path, offset: u64, mut open: impl FnMut(&std::fs::OpenOptions, &Path) -> std::io::Result<std::fs::File>) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let file = if offset == 0 {
+        let mut creation=options.clone(); creation.create_new(true);
+        match open(&creation,local) {
+            Ok(file) => file,
+            Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists => open(&options,local)?,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        open(&options,local).context("partial download file is missing")?
+    };
+    Ok(file)
+}
+
 fn upload_response_etag(response: &Response) -> Option<String> {
     response
         .headers()
@@ -1382,6 +1404,12 @@ fn upload_response_etag(response: &Response) -> Option<String> {
         .or_else(|| response.headers().get("OC-Etag"))
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+trait SegmentFile: std::io::Read + std::io::Seek {
+    fn info(&self) -> std::io::Result<std::fs::Metadata>;
+}
+impl SegmentFile for std::fs::File {
+    fn info(&self) -> std::io::Result<std::fs::Metadata> { self.metadata() }
 }
 fn file_segment_sha256(path: &Path, offset: u64, length: u64) -> Result<String> {
     let mut options = std::fs::OpenOptions::new();
@@ -1392,7 +1420,10 @@ fn file_segment_sha256(path: &Path, offset: u64, length: u64) -> Result<String> 
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path)?;
-    let before = file.metadata()?;
+    hash_segment(&mut file, offset, length)
+}
+fn hash_segment(file: &mut impl SegmentFile, offset: u64, length: u64) -> Result<String> {
+    let before = file.info()?;
     if !before.is_file()
         || offset
             .checked_add(length)
@@ -1400,20 +1431,20 @@ fn file_segment_sha256(path: &Path, offset: u64, length: u64) -> Result<String> 
     {
         bail!("upload source is shorter than the expected chunk");
     }
-    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))?;
+    std::io::Seek::seek(file, std::io::SeekFrom::Start(offset))?;
     let mut remaining = length;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
     while remaining != 0 {
         let capacity = (remaining.min(buffer.len() as u64)) as usize;
-        let count = std::io::Read::read(&mut file, &mut buffer[..capacity])?;
+        let count = std::io::Read::read(file, &mut buffer[..capacity])?;
         if count == 0 {
             bail!("upload source ended within a chunk");
         }
         hash.update(&buffer[..count]);
         remaining -= count as u64;
     }
-    let after = file.metadata()?;
+    let after = file.info()?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         bail!("upload source changed while hashing a chunk");
     }
@@ -1592,6 +1623,9 @@ fn dav_name(namespace: ResolveResult<'_>, local: &[u8]) -> Vec<u8> {
 fn parse_multistatus(xml: &[u8]) -> Result<Vec<Row>> {
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(false);
+    parse_multistatus_reader(reader)
+}
+fn parse_multistatus_reader(mut reader: NsReader<&[u8]>) -> Result<Vec<Row>> {
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut rows = Vec::new();
     let mut current = None::<Row>;
@@ -1613,11 +1647,11 @@ fn parse_multistatus(xml: &[u8]) -> Result<Vec<Row>> {
                     found_root = true;
                 }
                 match name.as_slice() {
-                    b"response" if is_path(&stack, &[b"multistatus"]) => {
+                    b"response" => {
                         if current.is_some() {
                             bail!("nested WebDAV response");
                         }
-                        current = Some(Row::default());
+                        if is_path(&stack, &[b"multistatus"]) { current = Some(Row::default()); }
                     }
                     b"propstat" if is_path(&stack, &[b"multistatus", b"response"]) => {
                         props = Some(Properties::default());
@@ -1662,6 +1696,8 @@ fn parse_multistatus(xml: &[u8]) -> Result<Vec<Row>> {
                     found_root = true;
                 }
                 match name.as_slice() {
+                    b"response" if current.is_some() => bail!("nested WebDAV response"),
+                    b"response" if is_path(&stack, &[b"multistatus"]) => bail!("WebDAV response omitted href"),
                     b"getcontentlength"
                         if is_path(
                             &stack,
@@ -1825,8 +1861,22 @@ fn parse_multistatus(xml: &[u8]) -> Result<Vec<Row>> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/webdav.rs"]
+#[allow(dead_code)]
+mod test_peer;
+
+#[cfg(test)]
+#[path = "../tests/support/webdav_upload_faults.rs"]
+mod upload_faults;
+
+#[cfg(test)]
+#[path = "../tests/support/webdav_guard_faults.rs"]
+mod guard_faults;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_peer::*;
     fn profile() -> Profile {
         Profile {
             protocol: crate::config::Protocol::Webdav,
@@ -1888,5 +1938,189 @@ mod tests {
         }
         assert!(validate_token("opaquelocktoken:a-b").is_ok());
         assert!(validate_token("x\r\nInjected: yes").is_err());
+    }
+
+    #[test]
+    fn checkpoint_validation_rejects_invalid_identity_layout_and_completion() {
+        let checkpoint = || NextcloudUpload {
+            version: 1, session: format!("rdrive-{}", uuid::Uuid::new_v4()),
+            root: "https://example.invalid/root/".into(), endpoint: "https://example.invalid/uploads/".into(),
+            username: None, remote: "file".into(), source_path: "/unused-test-source".into(),
+            source_size: 3, source_sha256: "a".repeat(64), guard: UploadGuard::CreateNew,
+            chunk_size: MIN_NEXTCLOUD_CHUNK, phase: UploadPhase::Preparing, chunks: BTreeMap::new(), committed: None,
+        };
+        assert!(checkpoint().validate().is_ok());
+        let mut value = checkpoint(); value.version = 9; assert!(value.validate().is_err());
+        let mut value = checkpoint(); value.guard = UploadGuard::Match { etag: "W/\"weak\"".into() }; assert!(value.validate().is_err());
+        let mut value = checkpoint(); value.chunks.insert(0, ChunkReceipt { size: 3, sha256: "a".repeat(64), etag: None }); assert!(value.validate().is_err());
+        let mut value = checkpoint(); value.phase = UploadPhase::Complete; assert!(value.validate().is_err());
+        let mut value = checkpoint(); value.committed = Some(Entry { path: "file".into(), is_dir: false, size: 3, modified: None, etag: None }); assert!(value.validate().is_err());
+        value.phase = UploadPhase::Complete; assert!(value.validate().is_ok());
+        assert!(matches!(UploadGuard::from_condition(WriteCondition::Any, "file").unwrap(), UploadGuard::Any));
+        assert!(UploadGuard::from_condition(WriteCondition::Match(value.committed.clone().unwrap()), "other").is_err());
+        value.committed.as_mut().unwrap().etag = Some("\"strong\"".into());
+        assert!(UploadGuard::from_condition(WriteCondition::Match(value.committed.unwrap()), "file").is_ok());
+    }
+
+    #[test]
+    fn paths_ranges_chunk_hashes_and_xml_are_strict() {
+        let root = Url::parse("https://example.invalid/uploads/").unwrap();
+        assert!(validate_href_at("https://example.invalid/uploads", &root, &root).is_ok());
+        assert!(validate_href_at("https://example.invalid", &root, &root).is_err());
+        assert!(validate_href_at("/uploads/?query=yes", &root, &root).is_err());
+        assert!(validate_href_at("/uploads/#fragment", &root, &root).is_err());
+        for range in ["bytes x-3/4", "bytes 0-3/*", "bytes 0-3/4junk", "bytes 1-3/4"] {
+            assert!(validate_suffix_range(range, 0, 4).is_err(), "{range}");
+        }
+        assert!(decode_segment("bad%").is_err());
+        assert!(decode_path("/a//b").is_err());
+        assert!(parse_status("broken").is_err());
+        assert!(parse_multistatus(b"text outside<multistatus xmlns=\"DAV:\"/>").is_err());
+        assert!(parse_multistatus(b"<multistatus xmlns=\"DAV:\"/><multistatus xmlns=\"DAV:\"/>").is_err());
+        assert!(parse_multistatus(b"<multistatus xmlns=\"DAV:\"><response/></multistatus>").is_err());
+        assert!(parse_multistatus(b"<multistatus xmlns=\"DAV:\"><response></response></multistatus>").is_err());
+        let xml = b"<multistatus xmlns=\"DAV:\"><response><href><![CDATA[/folder]]></href><status>HTTP/1.1 404 Not Found</status><propstat><prop><resourcetype><collection></collection></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+        let rows = parse_multistatus(xml).unwrap();
+        assert_eq!(rows[0].status, Some(404)); assert_eq!(rows[0].props.as_ref().unwrap().is_dir, Some(true));
+        let deep = format!("<multistatus xmlns=\"DAV:\">{}{}</multistatus>", "<x>".repeat(65), "</x>".repeat(65));
+        assert!(parse_multistatus(deep.as_bytes()).is_err());
+        let temp = tempfile::tempdir().unwrap(); let path = temp.path().join("body"); std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(file_segment_sha256(&path, 0, 3).unwrap(), crate::state::key("abc"));
+        assert!(file_segment_sha256(&path, 0, 4).is_err());
+        assert!(reject_symlink_components(&temp.path().join("../body")).is_err());
+        let link = temp.path().join("link"); std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(reject_symlink_components(&link).is_err());
+        assert!(reject_symlink_components(&path.join("child")).is_err());
+    }
+
+    #[test]
+    fn constructor_normalizes_endpoints_and_checks_backend_protocol() {
+        let mut value = profile(); value.url = "http://[::1]/dav".into(); value.nextcloud_upload_url = Some("http://[::1]/uploads".into());
+        let client = WebDav::new(&value, "synthetic").unwrap();
+        assert_eq!(client.root.path(), "/dav/"); assert_eq!(client.nextcloud_upload_url.unwrap().path(), "/uploads/");
+        value.protocol = crate::config::Protocol::Smb; value.url = "smb://host/share".into(); value.nextcloud_upload_url = None;
+        assert!(WebDav::new(&value, "").is_err());
+    }
+
+    #[test]
+    fn route_classification_chunk_limits_and_hash_races_fail_closed() {
+        assert!(!loopback_host(None));
+        assert!(loopback_host(Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))));
+        assert!(!loopback_host(Some(url::Host::Domain("example.invalid"))));
+        assert_eq!(nextcloud_chunk_size(0).unwrap(),MIN_NEXTCLOUD_CHUNK);
+        assert!(nextcloud_chunk_size(u64::MAX).unwrap_err().to_string().contains("chunk count"));
+        struct Segment { bytes:std::io::Cursor<Vec<u8>>, before:std::fs::Metadata, after:std::fs::Metadata, calls:std::cell::Cell<usize> }
+        impl std::io::Read for Segment { fn read(&mut self,out:&mut[u8])->std::io::Result<usize>{std::io::Read::read(&mut self.bytes,out)} }
+        impl std::io::Seek for Segment { fn seek(&mut self,at:std::io::SeekFrom)->std::io::Result<u64>{std::io::Seek::seek(&mut self.bytes,at)} }
+        impl SegmentFile for Segment { fn info(&self)->std::io::Result<std::fs::Metadata>{let first=self.calls.replace(self.calls.get()+1)==0;Ok(if first{self.before.clone()}else{self.after.clone()})} }
+        let temp=tempfile::tempdir().unwrap(); let root=temp.path().canonicalize().unwrap(); let path=root.join("file");
+        std::fs::write(&path,b"abc").unwrap(); let before=std::fs::metadata(&path).unwrap(); std::fs::write(&path,b"abcd").unwrap(); let after=std::fs::metadata(&path).unwrap();
+        let mut short=Segment{bytes:std::io::Cursor::new(b"a".to_vec()),before:before.clone(),after:before.clone(),calls:std::cell::Cell::new(0)};
+        assert!(hash_segment(&mut short,0,3).unwrap_err().to_string().contains("ended within"));
+        let mut changed=Segment{bytes:std::io::Cursor::new(b"abc".to_vec()),before,after,calls:std::cell::Cell::new(0)};
+        assert!(hash_segment(&mut changed,0,3).unwrap_err().to_string().contains("changed while hashing"));
+        assert!(reject_symlink_components(&path.join("child")).unwrap_err().to_string().contains("directory"));
+        let nested=b"<multistatus xmlns=\"DAV:\"><response><href>/root/file</href><response><href>/root/other</href></response></response></multistatus>";
+        assert!(parse_multistatus(nested).err().unwrap().to_string().contains("nested WebDAV response"));
+        let nested_empty=b"<multistatus xmlns=\"DAV:\"><response><href>/root/file</href><response/></response></multistatus>";
+        assert!(parse_multistatus(nested_empty).err().unwrap().to_string().contains("nested WebDAV response"));
+        assert!(parse_multistatus(b"<multistatus xmlns=\"DAV:\"><response>").err().unwrap().to_string().contains("truncated WebDAV XML"));
+        let malformed=b"<multistatus xmlns=\"DAV:\"><response></multistatus></response>";
+        let mut decoder=NsReader::from_reader(malformed.as_slice());decoder.config_mut().check_end_names=false;
+        assert!(parse_multistatus_reader(decoder).err().unwrap().to_string().contains("malformed WebDAV XML nesting"));
+        let absent=root.join("not-created");
+        assert!(open_partial(&absent,0,|_,_|Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"synthetic create failure"))).unwrap_err().to_string().contains("synthetic create failure"));
+        assert!(open_partial(&absent,1,|_,_|Err(std::io::ErrorKind::NotFound.into())).unwrap_err().to_string().contains("partial download file is missing"));
+        assert!(!absent.exists());
+    }
+
+    #[tokio::test]
+    async fn nextcloud_private_metadata_and_completion_checks_reject_ambiguous_replies() {
+        let temp=tempfile::tempdir().unwrap(); let root=temp.path().canonicalize().unwrap();
+        let metadata=upload_metadata_xml(true,0,Some("\"session\""));
+        for (response, expected) in [
+            (reply("404 Not Found",""),"missing"),
+            (reply("500 Failed",""),"500"),
+            (reply("207 Multi-Status",r#"<D:multistatus xmlns:D="DAV:"/>"#),"ambiguous Depth"),
+            (reply("207 Multi-Status",&metadata.replace("<D:propstat>","<D:status>HTTP/1.1 404 Missing</D:status><D:propstat>")),"missing"),
+            (reply("207 Multi-Status",&metadata.replace("<D:propstat>","<D:status>HTTP/1.1 500 Failed</D:status><D:propstat>")),"failed resource status"),
+        ] {
+            let (backend,_,task)=server_configured(vec![response],true).await; let endpoint=backend.nextcloud_upload_url.as_ref().unwrap();
+            let result=backend.nextcloud_stat(&endpoint.join("session/").unwrap(),endpoint).await;
+            if expected=="missing"{assert!(result.unwrap().is_none());}else{assert!(result.err().unwrap().to_string().contains(expected),"{expected}");}
+            task.await.unwrap();
+        }
+        let (backend,_,task)=server_configured(vec![],true).await;
+        assert!(backend.authenticated_url_request(Method::GET,Url::parse("https://other.invalid/file").unwrap()).unwrap_err().to_string().contains("escaped"));
+        let source=root.join("source");std::fs::write(&source,b"abc").unwrap();
+        assert!(backend.nextcloud_upload(&source,"",WriteCondition::CreateNew,&root.join("checkpoint")).await.unwrap_err().to_string().contains("remote root"));
+        let directory=root.join("directory");std::fs::create_dir(&directory).unwrap();
+        assert!(backend.nextcloud_upload(&source,"file",WriteCondition::CreateNew,&directory).await.unwrap_err().to_string().contains("directory"));
+        task.await.unwrap();
+        for (response, expected) in [(reply("404 Not Found",""),false),(reply("207 Multi-Status",&entry_xml("file",3).replace("<D:resourcetype/>","<D:resourcetype><D:collection/></D:resourcetype>")),false),(reply("207 Multi-Status",&entry_xml("file",3).replace("&quot;revision-1&quot;","W/&quot;weak&quot;")),true)] {
+            let (backend,_,task)=server(vec![response]).await;
+            let result=backend.verify_uploaded_destination("file",&crate::state::key("abc"),3,&root.join("checkpoint")).await;
+            if expected{assert!(result.unwrap_err().to_string().contains("strong ETag"));}else{assert!(result.unwrap().is_none());}
+            task.await.unwrap();
+        }
+        let responses=vec![reply("207 Multi-Status",&entry_xml("file",3)),reply("200 OK","abc"),reply("207 Multi-Status",&entry_xml("file",3).replace("revision-1","revision-2"))];
+        let (backend,_,task)=server(responses).await;
+        assert!(backend.verify_uploaded_destination("file",&crate::state::key("abc"),3,&root.join("checkpoint")).await.unwrap_err().to_string().contains("changed during checksum"));task.await.unwrap();
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().starts_with(".rdrive-upload-verify-")));
+    }
+
+    #[tokio::test]
+    async fn saved_upload_sessions_and_chunk_receipts_are_not_adopted_after_change() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let source=root.join("source");std::fs::write(&source,b"abc").unwrap();
+        for (phase,is_directory,bad_chunk,expected) in [(UploadPhase::Preparing,false,false,"session path is not a directory"),(UploadPhase::Uploading,false,false,"session changed type"),(UploadPhase::Preparing,true,true,"source chunk differs")] {
+            let (backend,_,task)=server_configured(vec![reply("207 Multi-Status",&upload_metadata_xml(is_directory,0,Some("\"session\"")))],true).await;
+            let checkpoint=root.join(format!("checkpoint-{}",uuid::Uuid::new_v4()));
+            let mut state=NextcloudUpload{version:1,session:format!("rdrive-{}",uuid::Uuid::new_v4()),root:backend.root.to_string(),endpoint:backend.nextcloud_upload_url.as_ref().unwrap().to_string(),username:backend.username.clone(),remote:"file".into(),source_path:source.to_string_lossy().into(),source_size:3,source_sha256:crate::state::key("abc"),guard:UploadGuard::CreateNew,chunk_size:MIN_NEXTCLOUD_CHUNK,phase,chunks:BTreeMap::new(),committed:None};
+            if bad_chunk{state.chunks.insert(1,ChunkReceipt{size:3,sha256:"0".repeat(64),etag:Some("\"chunk\"".into())});}
+            crate::state::atomic_json(&checkpoint,&state).unwrap();
+            assert!(backend.nextcloud_upload(&source,"file",WriteCondition::CreateNew,&checkpoint).await.unwrap_err().to_string().contains(expected),"{expected}");task.await.unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(),b"abc");assert!(checkpoint.exists());
+        }
+        let (backend,_,task)=server_configured(vec![reply("500 Failed","")],true).await;
+        assert!(backend.nextcloud_upload(&source,"file",WriteCondition::CreateNew,&root.join("fresh-failure")).await.unwrap_err().to_string().contains("Nextcloud MKCOL"));task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_length_metadata_is_bounded_before_xml_parsing() {
+        let payload="x".repeat(MAX_XML_BYTES+1);
+        let response=format!("HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{payload}\r\n0\r\n\r\n",payload.len());
+        let (backend,_,task)=server_with_disconnect_policy(vec![response],false,true).await;
+        assert!(backend.stat("file").await.unwrap_err().to_string().contains("metadata response exceeds 16 MiB"));task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_partial_changes_cannot_be_reported_as_completed_downloads() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let partial=root.join("partial");std::fs::write(&partial,b"a").unwrap();
+        let changed=partial.clone();
+        let hook=Arc::new(move |request:&[u8]| { assert!(request.starts_with(b"GET "));std::fs::write(&changed,b"a!").unwrap(); });
+        let (backend,_,task)=server_with_request_hook(vec![range_reply(1,2,3,"bc")],false,hook).await;
+        assert!(backend.download_resume("file",&partial,&resume_entry(3),1).await.unwrap_err().to_string().contains("changed while requesting"));task.await.unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(),b"a!");
+        struct ChangedMetadata(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl PartialInspection for ChangedMetadata {
+            async fn length(&self,file:&tokio::fs::File)->std::io::Result<u64>{let size=file.metadata().await?.len();Ok(size+u64::from(self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst)>0))}
+        }
+        std::fs::write(&partial,b"a").unwrap();let (mut backend,_,task)=server(vec![range_reply(1,2,3,"bc")]).await;
+        backend.partial_inspection=Arc::new(ChangedMetadata(std::sync::atomic::AtomicUsize::new(0)));
+        assert!(backend.download_resume("file",&partial,&resume_entry(3),1).await.unwrap_err().to_string().contains("length changed during transfer"));task.await.unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(),b"abc");
+    }
+
+    #[tokio::test]
+    async fn fresh_full_get_and_failed_progress_registration_preserve_download_contracts() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let partial=root.join("fresh");
+        let (backend,requests,task)=server(vec![reply("200 OK","abc")]).await;
+        backend.download_resume("file",&partial,&resume_entry(3),0).await.unwrap();task.await.unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(),b"abc");assert!(String::from_utf8_lossy(&requests.lock().unwrap()[0]).to_lowercase().contains("if-match: \"revision-1\""));
+        let context=crate::transfer::TransferContext::new(None,crate::transfer::ProgressOutput::Off).unwrap();context.poison_registry_for_test();
+        let (backend,_,task)=server(vec![reply("200 OK","abc")]).await;let output=root.join("not-advertised");
+        let error=backend.with_transfer_context(context).download("file",&output).await.unwrap_err();
+        assert!(error.to_string().contains("transfer registry is unavailable"),"{error}");task.await.unwrap();assert!(!output.exists());
     }
 }

@@ -648,3 +648,21 @@ pub fn catalog() -> Vec<Tool> {
     tool!("cache_clear","Preview clean-cache eviction, or apply to removable unpinned/inactive payloads. Does not delete pending edits, pinned content or macOS Finder downloads.",&["cache","clear"],vec![b("apply","--apply")],true);
     tools
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn strings_directions_profiles_and_empty_rule_replacement_are_validated() {
+        let tools=catalog();
+        let info=tools.iter().find(|tool|tool.name=="rdrive_info").unwrap();
+        for value in ["control\n", "", "invalid/profile", &"x".repeat(16385)] {
+            assert!(info.validate(&json!({"profile":value})).is_err(),"{value:?}");
+        }
+        let sync=tools.iter().find(|tool|tool.name=="rdrive_sync_plan").unwrap();
+        assert!(sync.validate(&json!({"profile":"p","local":"/synthetic/fixture","remote":"","direction":"sideways"})).unwrap_err().to_string().contains("direction"));
+        let filter=tools.iter().find(|tool|tool.name=="rdrive_filter_config").unwrap();
+        let arguments=json!({"include":[]}); filter.validate(&arguments).unwrap();
+        assert_eq!(filter.argv(&arguments),["filter","config","--clear-include"]);
+    }
+}

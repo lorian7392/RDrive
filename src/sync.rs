@@ -118,7 +118,7 @@ pub async fn run_with_metadata(
     if internal(&remote) {
         bail!("the internal version directory cannot be a sync root");
     }
-    let baseline_abs = std::path::absolute(baseline_path)?;
+    let baseline_abs = crate::state::resolve_location(baseline_path)?;
     if baseline_abs.starts_with(&root.path) {
         bail!("sync baseline must be stored outside the local sync tree");
     }
@@ -417,15 +417,26 @@ pub async fn run_with_metadata(
                     .context("local changed while downloading; local file was preserved")?;
                 let remote_attributes = if metadata {
                     crate::metadata_remote::load(backend, &remote_file, expected_remote).await?
-                } else { None };
-                let attributes = if let Some(record) = remote_attributes { Some(record) }
-                    else if p.local.is_some() {
-                        let mut record = root.selected_metadata(path)?;
-                        record.content_sha256 = downloaded.sha256.clone().context("download hash missing")?;
-                        Some(record)
-                    } else { None };
+                } else {
+                    None
+                };
+                let attributes = if let Some(record) = remote_attributes {
+                    Some(record)
+                } else if p.local.is_some() {
+                    let mut record = root.selected_metadata(path)?;
+                    record.content_sha256 =
+                        downloaded.sha256.clone().context("download hash missing")?;
+                    Some(record)
+                } else {
+                    None
+                };
                 if let Some(attributes) = attributes {
-                    crate::metadata::apply_with_recovery(&stage.path, &attributes, &Default::default(), &stage.directory.join("xattr-recovery.json"))?;
+                    crate::metadata::apply_with_recovery(
+                        &stage.path,
+                        &attributes,
+                        &Default::default(),
+                        &stage.directory.join("xattr-recovery.json"),
+                    )?;
                 }
                 if let Some(old) = &p.local {
                     let backup = root.archive(path, old)?;
@@ -458,10 +469,7 @@ pub async fn run_with_metadata(
             }
             ActionKind::DeleteRemote => {
                 let old = p.remote.as_ref().context("delete has no remote source")?;
-                if old.is_dir {
-                    bail!("remote directories cannot be conditionally deleted safely");
-                }
-                backend.remove_checked(&remote_file, old).await?;
+                delete_remote_file(backend, &remote_file, old).await?;
                 if backend.stat(&remote_file).await?.is_some() {
                     bail!("remote delete was not confirmed: {path}");
                 }
@@ -501,6 +509,13 @@ pub async fn run_with_metadata(
     Ok(report)
 }
 
+async fn delete_remote_file(backend: &dyn Backend, path: &str, expected: &Entry) -> Result<()> {
+    if expected.is_dir {
+        bail!("remote directories cannot be conditionally deleted safely");
+    }
+    backend.remove_checked(path, expected).await
+}
+
 fn operation_order(p: &Pending) -> (u8, usize, String) {
     let depth = p.action.path.matches('/').count();
     match p.action.kind {
@@ -522,7 +537,9 @@ fn remote_path(root: &str, relative: &str) -> String {
 }
 fn internal(path: &str) -> bool {
     path.split('/').any(|p| {
-        p == INTERNAL || p==".rdrive-metadata" || p==".rdrive-repository"
+        p == INTERNAL
+            || p == ".rdrive-metadata"
+            || p == ".rdrive-repository"
             || [
                 ".rdrive-commit-",
                 ".rdrive-upload-",
@@ -671,7 +688,9 @@ fn validate_collisions<'a>(paths: impl Iterator<Item = &'a String>) -> Result<()
     }
     Ok(())
 }
-pub(crate) fn validate_path_collisions<'a>(paths:impl Iterator<Item=&'a String>)->Result<()> {validate_collisions(paths)}
+pub(crate) fn validate_path_collisions<'a>(paths: impl Iterator<Item = &'a String>) -> Result<()> {
+    validate_collisions(paths)
+}
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn collision_key(value: &str) -> Result<String> {
@@ -686,64 +705,126 @@ pub(crate) fn collision_key(value: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithBytes(
+        a: *const std::ffi::c_void,
+        bytes: *const u8,
+        len: isize,
+        encoding: u32,
+        external: u8,
+    ) -> *const std::ffi::c_void;
+    fn CFStringCreateMutableCopy(
+        a: *const std::ffi::c_void,
+        capacity: isize,
+        source: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CFStringNormalize(string: *mut std::ffi::c_void, form: isize);
+    fn CFStringFold(string: *mut std::ffi::c_void, flags: usize, locale: *const std::ffi::c_void);
+    fn CFStringGetLength(string: *const std::ffi::c_void) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(
+        string: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_char,
+        size: isize,
+        encoding: u32,
+    ) -> u8;
+    fn CFRelease(value: *const std::ffi::c_void);
+}
+#[cfg(target_os = "macos")]
+trait FilenameFoldIo {
+    type String: Copy;
+    fn source(&self, value: &str) -> Self::String;
+    fn copy(&self, source: Self::String) -> Self::String;
+    fn invalid(&self, value: Self::String) -> bool;
+    fn release(&self, value: Self::String);
+    fn normalize(&self, value: Self::String);
+    fn maximum_utf8(&self, value: Self::String) -> isize;
+    fn encode(&self, value: Self::String, buffer: &mut [u8]) -> bool;
+}
+#[cfg(target_os = "macos")]
+struct CoreFoundationFold;
+#[cfg(target_os = "macos")]
+impl FilenameFoldIo for CoreFoundationFold {
+    type String = *const std::ffi::c_void;
+    fn source(&self, value: &str) -> Self::String {
+        unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                value.as_ptr(),
+                value.len() as isize,
+                0x0800_0100,
+                0,
+            )
+        }
+    }
+    fn copy(&self, value: Self::String) -> Self::String {
+        unsafe { CFStringCreateMutableCopy(std::ptr::null(), 0, value) }
+    }
+    fn invalid(&self, value: Self::String) -> bool {
+        value.is_null()
+    }
+    fn release(&self, value: Self::String) {
+        unsafe {
+            CFRelease(value);
+        }
+    }
+    fn normalize(&self, value: Self::String) {
+        unsafe {
+            CFStringNormalize(value.cast_mut(), 0);
+            CFStringFold(value.cast_mut(), 1, std::ptr::null());
+            CFStringNormalize(value.cast_mut(), 0);
+        }
+    }
+    fn maximum_utf8(&self, value: Self::String) -> isize {
+        unsafe { CFStringGetMaximumSizeForEncoding(CFStringGetLength(value), 0x0800_0100) }
+    }
+    fn encode(&self, value: Self::String, buffer: &mut [u8]) -> bool {
+        unsafe {
+            CFStringGetCString(
+                value,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as isize,
+                0x0800_0100,
+            ) != 0
+        }
+    }
+}
+#[cfg(target_os = "macos")]
 pub(crate) fn collision_key(value: &str) -> Result<String> {
-    use std::ffi::{c_char, c_void};
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFStringCreateWithBytes(
-            a: *const c_void,
-            bytes: *const u8,
-            len: isize,
-            encoding: u32,
-            external: u8,
-        ) -> *const c_void;
-        fn CFStringCreateMutableCopy(
-            a: *const c_void,
-            capacity: isize,
-            source: *const c_void,
-        ) -> *mut c_void;
-        fn CFStringNormalize(string: *mut c_void, form: isize);
-        fn CFStringFold(string: *mut c_void, flags: usize, locale: *const c_void);
-        fn CFStringGetLength(string: *const c_void) -> isize;
-        fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
-        fn CFStringGetCString(
-            string: *const c_void,
-            buffer: *mut c_char,
-            size: isize,
-            encoding: u32,
-        ) -> u8;
-        fn CFRelease(value: *const c_void);
+    collision_key_with(value, &CoreFoundationFold)
+}
+#[cfg(target_os = "macos")]
+fn collision_key_with<I: FilenameFoldIo>(value: &str, io: &I) -> Result<String> {
+    let source = io.source(value);
+    if io.invalid(source) {
+        bail!("cannot normalize filename");
     }
-    const UTF8: u32 = 0x0800_0100;
-    unsafe {
-        let source = CFStringCreateWithBytes(
-            std::ptr::null(),
-            value.as_ptr(),
-            value.len() as isize,
-            UTF8,
-            0,
-        );
-        if source.is_null() {
-            bail!("cannot normalize filename");
-        }
-        let normalized = CFStringCreateMutableCopy(std::ptr::null(), 0, source);
-        CFRelease(source);
-        if normalized.is_null() {
-            bail!("cannot normalize filename");
-        }
-        CFStringNormalize(normalized, 0); // canonical decomposition (NFD), as used by macOS filesystems
-        CFStringFold(normalized, 1, std::ptr::null()); // case insensitive, without stripping accents
-        CFStringNormalize(normalized, 0);
-        let capacity = CFStringGetMaximumSizeForEncoding(CFStringGetLength(normalized), UTF8) + 1;
-        let mut buffer = vec![0u8; capacity as usize];
-        let ok = CFStringGetCString(normalized, buffer.as_mut_ptr().cast(), capacity, UTF8);
-        CFRelease(normalized);
-        if ok == 0 {
-            bail!("cannot encode normalized filename");
-        }
-        let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
-        Ok(String::from_utf8(buffer[..end].to_vec())?)
+    let normalized = io.copy(source);
+    io.release(source);
+    if io.invalid(normalized) {
+        bail!("cannot normalize filename");
     }
+    io.normalize(normalized);
+    let Some(capacity) = io
+        .maximum_utf8(normalized)
+        .checked_add(1)
+        .filter(|capacity| *capacity > 0)
+    else {
+        io.release(normalized);
+        bail!("invalid normalized filename capacity");
+    };
+    let mut buffer = vec![0; capacity as usize];
+    let ok = io.encode(normalized, &mut buffer);
+    io.release(normalized);
+    if !ok {
+        bail!("cannot encode normalized filename");
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    Ok(String::from_utf8(buffer[..end].to_vec())?)
 }
 
 fn file_version(path: &Path) -> Result<LocalVersion> {
@@ -756,7 +837,13 @@ fn file_version(path: &Path) -> Result<LocalVersion> {
     }
     version_from_file(options.open(path)?)
 }
-fn version_from_file(mut file: File) -> Result<LocalVersion> {
+fn version_from_file(file: File) -> Result<LocalVersion> {
+    version_from_file_with(file, |file, bytes| file.read(bytes))
+}
+fn version_from_file_with(
+    mut file: File,
+    mut read: impl FnMut(&mut File, &mut [u8]) -> std::io::Result<usize>,
+) -> Result<LocalVersion> {
     let before = file.metadata()?;
     if !before.is_file() {
         bail!("expected regular file");
@@ -764,7 +851,7 @@ fn version_from_file(mut file: File) -> Result<LocalVersion> {
     let mut hasher = Sha256::new();
     let mut buffer = [0; 128 * 1024];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = read(&mut file, &mut buffer)?;
         if count == 0 {
             break;
         }
@@ -802,38 +889,51 @@ fn open_file_at(directory: &File, name: &std::ffi::CStr) -> Result<File> {
 }
 
 #[cfg(unix)]
-fn directory_names(directory: &File) -> Result<Vec<String>> {
-    use std::{ffi::CStr, os::fd::AsRawFd};
-    // A fresh open-file description avoids sharing readdir offsets with the root.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+trait DirectoryIo {
+    type Stream: Copy;
+    fn open(&self, directory: &File) -> std::os::fd::RawFd;
+    fn stream(&self, fd: std::os::fd::RawFd) -> Self::Stream;
+    fn invalid(&self, stream: Self::Stream) -> bool;
+    fn error(&self) -> std::io::Error;
+    fn close_fd(&self, fd: std::os::fd::RawFd);
+    fn close_stream(&self, stream: Self::Stream);
+    fn read(&self, stream: Self::Stream) -> (Option<Vec<u8>>, i32);
+}
+#[cfg(unix)]
+struct SystemDirectoryIo;
+#[cfg(unix)]
+impl DirectoryIo for SystemDirectoryIo {
+    type Stream = *mut libc::DIR;
+    fn open(&self, directory: &File) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        }
     }
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        let error = std::io::Error::last_os_error();
+    fn stream(&self, fd: std::os::fd::RawFd) -> Self::Stream {
+        unsafe { libc::fdopendir(fd) }
+    }
+    fn invalid(&self, stream: Self::Stream) -> bool {
+        stream.is_null()
+    }
+    fn error(&self) -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+    fn close_fd(&self, fd: std::os::fd::RawFd) {
         unsafe {
             libc::close(fd);
         }
-        return Err(error.into());
     }
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
+    fn close_stream(&self, stream: Self::Stream) {
+        unsafe {
+            libc::closedir(stream);
         }
     }
-    let stream = DirectoryStream(stream);
-    let mut result = Vec::new();
-    loop {
+    fn read(&self, stream: Self::Stream) -> (Option<Vec<u8>>, i32) {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         unsafe {
             *libc::__error() = 0;
@@ -842,26 +942,93 @@ fn directory_names(directory: &File) -> Result<Vec<String>> {
         unsafe {
             *libc::__errno_location() = 0;
         }
-        let entry = unsafe { libc::readdir(stream.0) };
+        let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(0) {
-                return Err(error.into());
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
-            .to_str()
-            .context("non-UTF-8 local filename")?;
-        if name != "." && name != ".." {
-            result.push(name.to_owned());
+            (
+                None,
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            )
+        } else {
+            (
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+                        .to_bytes()
+                        .to_vec(),
+                ),
+                0,
+            )
         }
     }
-    Ok(result)
+}
+/// A fresh open-file description keeps enumeration offsets independent of held
+/// root descriptors. Used by content and metadata sync through the same checks.
+#[cfg(unix)]
+pub(crate) fn directory_names(directory: &File) -> Result<Vec<String>> {
+    directory_names_with(directory, &SystemDirectoryIo)
+}
+#[cfg(unix)]
+fn directory_names_with<I: DirectoryIo>(directory: &File, io: &I) -> Result<Vec<String>> {
+    let fd = io.open(directory);
+    if fd < 0 {
+        return Err(io.error().into());
+    }
+    let stream = io.stream(fd);
+    if io.invalid(stream) {
+        let error = io.error();
+        io.close_fd(fd);
+        return Err(error.into());
+    }
+    struct Guard<'a, I: DirectoryIo>(&'a I, I::Stream);
+    impl<I: DirectoryIo> Drop for Guard<'_, I> {
+        fn drop(&mut self) {
+            self.0.close_stream(self.1);
+        }
+    }
+    let stream = Guard(io, stream);
+    let mut names = Vec::new();
+    loop {
+        let (name, error) = io.read(stream.1);
+        let Some(name) = name else {
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error).into());
+            }
+            break;
+        };
+        let name = String::from_utf8(name).context("non-UTF-8 local filename")?;
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+#[cfg(not(unix))]
+pub(crate) fn directory_names(_: &File) -> Result<Vec<String>> {
+    bail!("directory enumeration requires a supported Unix filesystem")
 }
 
-/// File descriptors anchor Unix local operations; symlink ancestors cannot
-/// redirect commits. Backends receive a genuine path in a private temp directory.
+#[cfg(unix)]
+fn rename_at(
+    from: &File,
+    source: &std::ffi::CStr,
+    to: &File,
+    target: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe {
+        libc::renameat(
+            from.as_raw_fd(),
+            source.as_ptr(),
+            to.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+/// File descriptors anchor local operations across ancestor replacements.
 struct LocalRoot {
     path: PathBuf,
     #[cfg(unix)]
@@ -1055,6 +1222,17 @@ impl LocalRoot {
         })
     }
     fn snapshot(&self, path: &str, expected: &LocalVersion, destination: &Path) -> Result<()> {
+        self.snapshot_with(path, expected, destination, |input, output| {
+            std::io::copy(input, output)
+        })
+    }
+    fn snapshot_with(
+        &self,
+        path: &str,
+        expected: &LocalVersion,
+        destination: &Path,
+        copy: impl FnOnce(&mut File, &mut File) -> std::io::Result<u64>,
+    ) -> Result<()> {
         self.ensure_version(path, Some(expected))?;
         #[cfg(unix)]
         let mut input = {
@@ -1071,7 +1249,7 @@ impl LocalRoot {
             options.mode(0o600);
         }
         let mut output = options.open(destination)?;
-        std::io::copy(&mut input, &mut output)?;
+        copy(&mut input, &mut output)?;
         output.flush()?;
         output.sync_all()?;
         if file_version(destination)? != *expected {
@@ -1079,9 +1257,17 @@ impl LocalRoot {
         }
         self.ensure_version(path, Some(expected))
     }
-    fn selected_metadata(&self,path:&str)->Result<crate::metadata::MetadataRecord>{
-        #[cfg(unix)] {let (directory,name)=self.parent(path)?;let file=open_file_at(&directory,&std::ffi::CString::new(name)?)?;crate::metadata::capture_file(&file,&Default::default())}
-        #[cfg(not(unix))] {crate::metadata::capture(&self.checked_path(path)?,&Default::default())}
+    fn selected_metadata(&self, path: &str) -> Result<crate::metadata::MetadataRecord> {
+        #[cfg(unix)]
+        {
+            let (directory, name) = self.parent(path)?;
+            let file = open_file_at(&directory, &std::ffi::CString::new(name)?)?;
+            crate::metadata::capture_file(&file, &Default::default())
+        }
+        #[cfg(not(unix))]
+        {
+            crate::metadata::capture(&self.checked_path(path)?, &Default::default())
+        }
     }
     fn mkdir(&self, path: &str) -> Result<()> {
         #[cfg(unix)]
@@ -1167,47 +1353,14 @@ impl LocalRoot {
         Ok(())
     }
     fn archive(&self, path: &str, expected: &LocalVersion) -> Result<String> {
-        self.ensure_version(path, Some(expected))?;
-        let backup = format!("{INTERNAL}/{}/original", uuid::Uuid::new_v4());
         #[cfg(unix)]
         {
-            use std::{ffi::CString, os::fd::AsRawFd};
-            let (source_dir, name) = self.parent(path)?;
-            let backup_dir = self.directory(backup.rsplit_once('/').unwrap().0, true)?;
-            let source = CString::new(name)?;
-            let target = c"original";
-            if unsafe {
-                libc::renameat(
-                    source_dir.as_raw_fd(),
-                    source.as_ptr(),
-                    backup_dir.as_raw_fd(),
-                    target.as_ptr(),
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            source_dir.sync_all()?;
-            backup_dir.sync_all()?;
-            let observed = open_file_at(&backup_dir, target).and_then(|file| {
-                file.sync_all()?;
-                version_from_file(file)
-            });
-            if !observed.is_ok_and(|version| version == *expected) {
-                unsafe {
-                    libc::linkat(
-                        backup_dir.as_raw_fd(),
-                        target.as_ptr(),
-                        source_dir.as_raw_fd(),
-                        source.as_ptr(),
-                        0,
-                    );
-                }
-                bail!("local changed during commit; preserved original at {backup}");
-            }
+            self.archive_with(path, expected, rename_at)
         }
         #[cfg(not(unix))]
         {
+            self.ensure_version(path, Some(expected))?;
+            let backup = format!("{INTERNAL}/{}/original", uuid::Uuid::new_v4());
             let source = self.checked_path(path)?;
             let target = self.path.join(&backup);
             fs::create_dir_all(target.parent().unwrap())?;
@@ -1216,6 +1369,41 @@ impl LocalRoot {
                 let _ = fs::hard_link(&target, &source);
                 bail!("local changed during commit; preserved original at {backup}");
             }
+            Ok(backup)
+        }
+    }
+    #[cfg(unix)]
+    fn archive_with(
+        &self,
+        path: &str,
+        expected: &LocalVersion,
+        rename: impl FnOnce(&File, &std::ffi::CStr, &File, &std::ffi::CStr) -> std::io::Result<()>,
+    ) -> Result<String> {
+        use std::{ffi::CString, os::fd::AsRawFd};
+        self.ensure_version(path, Some(expected))?;
+        let backup = format!("{INTERNAL}/{}/original", uuid::Uuid::new_v4());
+        let (source_dir, name) = self.parent(path)?;
+        let backup_dir = self.directory(backup.rsplit_once('/').unwrap().0, true)?;
+        let source = CString::new(name)?;
+        let target = c"original";
+        rename(&source_dir, &source, &backup_dir, target)?;
+        source_dir.sync_all()?;
+        backup_dir.sync_all()?;
+        let observed = open_file_at(&backup_dir, target).and_then(|file| {
+            file.sync_all()?;
+            version_from_file(file)
+        });
+        if !observed.is_ok_and(|version| version == *expected) {
+            unsafe {
+                libc::linkat(
+                    backup_dir.as_raw_fd(),
+                    target.as_ptr(),
+                    source_dir.as_raw_fd(),
+                    source.as_ptr(),
+                    0,
+                );
+            }
+            bail!("local changed during commit; preserved original at {backup}");
         }
         Ok(backup)
     }
@@ -1271,6 +1459,7 @@ mod tests {
         ChangeRemote(String, Vec<u8>),
         ChangeLocal(PathBuf, Vec<u8>),
     }
+    type Hook = Box<dyn FnOnce(&MemoryBackend, &str) -> Result<()> + Send>;
     struct MemoryBackend {
         nodes: Mutex<BTreeMap<String, Node>>,
         fail_list: Mutex<Option<String>>,
@@ -1279,6 +1468,13 @@ mod tests {
         conditional: bool,
         conditional_delete: bool,
         unfinished_receipt: Mutex<bool>,
+        fail_upload: Mutex<bool>,
+        download_bytes: Mutex<Option<Vec<u8>>>,
+        after_upload: Mutex<Option<Hook>>,
+        after_remove: Mutex<Option<Hook>>,
+        after_stat: Mutex<Option<(String, Hook)>>,
+        after_mkdir: Mutex<Option<Hook>>,
+        duplicate_list: Mutex<bool>,
     }
     impl MemoryBackend {
         fn new() -> Self {
@@ -1290,6 +1486,13 @@ mod tests {
                 conditional: true,
                 conditional_delete: true,
                 unfinished_receipt: Mutex::new(false),
+                fail_upload: Mutex::new(false),
+                download_bytes: Mutex::new(None),
+                after_upload: Mutex::new(None),
+                after_remove: Mutex::new(None),
+                after_stat: Mutex::new(None),
+                after_mkdir: Mutex::new(None),
+                duplicate_list: Mutex::new(false),
             }
         }
         fn file(&self, path: &str, bytes: &[u8]) {
@@ -1369,12 +1572,24 @@ mod tests {
                     etag: None,
                 }));
             }
-            Ok(self
+            let result = self
                 .nodes
                 .lock()
                 .unwrap()
                 .get(path)
-                .map(|n| Self::entry(path, n)))
+                .map(|n| Self::entry(path, n));
+            let hook = {
+                let mut pending = self.after_stat.lock().unwrap();
+                if pending.as_ref().is_some_and(|(target, _)| target == path) {
+                    pending.take().map(|(_, hook)| hook)
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = hook {
+                hook(self, path)?;
+            }
+            Ok(result)
         }
         async fn list(&self, path: &str) -> Result<Vec<Entry>> {
             if self.fail_list.lock().unwrap().as_deref() == Some(path) {
@@ -1383,17 +1598,29 @@ mod tests {
             if let Some(entry) = self.injected_entry.lock().unwrap().take() {
                 return Ok(vec![entry]);
             }
-            Ok(self
+            let mut result: Vec<_> = self
                 .nodes
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|(p, _)| p.rsplit_once('/').map(|x| x.0).unwrap_or("") == path)
                 .map(|(p, n)| Self::entry(p, n))
-                .collect())
+                .collect();
+            if *self.duplicate_list.lock().unwrap() {
+                if let Some(first) = result.first().cloned() {
+                    result.push(first);
+                }
+            }
+            Ok(result)
         }
         async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-            fs::write(local, self.bytes(remote))?;
+            let bytes = self
+                .download_bytes
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| self.bytes(remote));
+            fs::write(local, bytes)?;
             let mutation = self.during_download.lock().unwrap().take();
             match mutation {
                 Some(DuringDownload::ChangeRemote(p, bytes)) => self.file(&p, &bytes),
@@ -1408,6 +1635,9 @@ mod tests {
             remote: &str,
             condition: WriteCondition,
         ) -> Result<Entry> {
+            if *self.fail_upload.lock().unwrap() {
+                bail!("synthetic upload failure");
+            }
             let bytes = fs::read(local)?;
             let mut nodes = self.nodes.lock().unwrap();
             let existing = nodes.get(remote);
@@ -1429,6 +1659,11 @@ mod tests {
             };
             let result = Self::entry(remote, &node);
             nodes.insert(remote.into(), node);
+            drop(nodes);
+            let hook = self.after_upload.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, remote)?;
+            }
             Ok(result)
         }
         async fn mkdir(&self, path: &str) -> Result<()> {
@@ -1436,6 +1671,10 @@ mod tests {
                 bail!("directory already exists");
             }
             self.dir(path);
+            let hook = self.after_mkdir.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, path)?;
+            }
             Ok(())
         }
         async fn remove(&self, _: &str, _: bool) -> Result<()> {
@@ -1453,6 +1692,11 @@ mod tests {
                 bail!("delete revision mismatch");
             }
             nodes.remove(path);
+            drop(nodes);
+            let hook = self.after_remove.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, path)?;
+            }
             Ok(())
         }
         async fn rename(&self, _: &str, _: &str, _: bool) -> Result<()> {
@@ -1471,9 +1715,10 @@ mod tests {
     }
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let local = temp.path().join("local");
+        let root = temp.path().canonicalize().unwrap();
+        let local = root.join("local");
         fs::create_dir(&local).unwrap();
-        let baseline = temp.path().join("state/baseline.json");
+        let baseline = root.join("state/baseline.json");
         (temp, local, baseline)
     }
     async fn seed(backend: &MemoryBackend, local: &Path, baseline: &Path) {
@@ -2017,6 +2262,926 @@ mod tests {
             collision_key("CAFE\u{301}").unwrap()
         );
         let paths = ["folder/Caf\u{e9}".into(), "folder/CAFE\u{301}".into()];
-        assert!(validate_collisions(paths.iter()).is_err());
+        assert!(validate_path_collisions(paths.iter()).is_err());
+    }
+
+    #[tokio::test]
+    async fn baseline_identity_and_unsafe_roots_fail_before_any_sync() {
+        let (temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        let opts = options(Direction::Both, true);
+        assert!(run(&backend, &local, ".rdrive-versions", &baseline, &opts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("internal version"));
+        assert!(run(&backend, &local, "", &local.join("baseline"), &opts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("outside"));
+        fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+        fs::create_dir(&baseline).unwrap();
+        assert!(run(&backend, &local, "", &baseline, &opts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot read"));
+        fs::remove_dir(&baseline).unwrap();
+        let mut state = Baseline {
+            version: 2,
+            local_root: local.canonicalize().unwrap().to_string_lossy().into(),
+            remote_root: "".into(),
+            entries: BTreeMap::new(),
+        };
+        crate::state::atomic_json(&baseline, &state).unwrap();
+        assert!(run(&backend, &local, "", &baseline, &opts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different root"));
+        state.version = 1;
+        state.entries.insert(
+            "bad".into(),
+            Pair {
+                local: LocalVersion {
+                    is_dir: false,
+                    size: 1,
+                    sha256: Some("a".repeat(64)),
+                },
+                remote: Entry {
+                    path: "wrong".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified: Some(1),
+                    etag: None,
+                },
+            },
+        );
+        crate::state::atomic_json(&baseline, &state).unwrap();
+        assert!(run(&backend, &local, "", &baseline, &opts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid entry"));
+        let link = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(&local, &link).unwrap();
+        assert!(LocalRoot::open(&link).is_err());
+        let root = LocalRoot::open(&local).unwrap();
+        assert!(root.directory("missing", false).is_err());
+        assert!(validate_relative("x/./y").is_err());
+        assert!(validate_relative("control\n").is_err());
+        assert!(validate_relative(".RDRIVE-VERSIONS/file").is_err());
+    }
+
+    #[tokio::test]
+    async fn deletion_baselines_and_direction_warnings_preserve_changed_files() {
+        for scenario in [
+            "both_deleted",
+            "remote_deleted",
+            "remote_deleted_local_changed",
+            "local_deleted_remote_changed",
+            "local_change_pull",
+            "new_local_pull",
+        ] {
+            let (_temp, local, baseline) = fixture();
+            let backend = MemoryBackend::new();
+            if scenario != "new_local_pull" {
+                seed(&backend, &local, &baseline).await;
+            }
+            match scenario {
+                "both_deleted" => {
+                    fs::remove_file(local.join("a.txt")).unwrap();
+                    backend.nodes.lock().unwrap().remove("a.txt");
+                }
+                "remote_deleted" => {
+                    backend.nodes.lock().unwrap().remove("a.txt");
+                }
+                "remote_deleted_local_changed" => {
+                    backend.nodes.lock().unwrap().remove("a.txt");
+                    fs::write(local.join("a.txt"), b"local edit").unwrap();
+                }
+                "local_deleted_remote_changed" => {
+                    fs::remove_file(local.join("a.txt")).unwrap();
+                    backend.file("a.txt", b"remote edit");
+                }
+                _ => {
+                    fs::write(local.join("a.txt"), b"local edit").unwrap();
+                }
+            }
+            let direction = if scenario.ends_with("pull") {
+                Direction::Pull
+            } else {
+                Direction::Both
+            };
+            let result = run(&backend, &local, "", &baseline, &options(direction, false))
+                .await
+                .unwrap();
+            match scenario {
+                "both_deleted" => {
+                    assert!(result.baseline_updated);
+                    assert!(
+                        serde_json::from_slice::<Baseline>(&fs::read(&baseline).unwrap())
+                            .unwrap()
+                            .entries
+                            .is_empty()
+                    );
+                }
+                "remote_deleted_local_changed" | "local_deleted_remote_changed" => {
+                    assert_eq!(result.conflicts.len(), 1)
+                }
+                _ => assert!(!result.warnings.is_empty(), "{scenario}"),
+            }
+            if scenario.contains("local_changed") || scenario.ends_with("pull") {
+                assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"local edit");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn directories_changed_to_files_conflict_and_only_empty_local_deletions_apply() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        fs::create_dir(local.join("folder")).unwrap();
+        backend.dir("folder");
+        run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Both, true),
+        )
+        .await
+        .unwrap();
+        backend.nodes.lock().unwrap().remove("folder");
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, true),
+        )
+        .await
+        .unwrap();
+        assert!(result.baseline_updated);
+        assert!(!local.join("folder").exists());
+        fs::create_dir(local.join("folder")).unwrap();
+        backend.dir("folder");
+        run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Both, true),
+        )
+        .await
+        .unwrap();
+        fs::remove_dir(local.join("folder")).unwrap();
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Push, true),
+        )
+        .await
+        .unwrap();
+        assert!(!result.warnings.is_empty());
+        assert!(backend.nodes.lock().unwrap().contains_key("folder"));
+        fs::write(local.join("folder"), b"local").unwrap();
+        backend.file("folder", b"remote");
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Both, true),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .conflicts
+            .iter()
+            .any(|item| item.reason.contains("directory was replaced")));
+        fs::remove_file(&baseline).unwrap();
+        fs::remove_file(local.join("folder")).unwrap();
+        fs::create_dir(local.join("folder")).unwrap();
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Both, true),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .conflicts
+            .iter()
+            .any(|item| item.reason.contains("types differ")));
+    }
+
+    #[tokio::test]
+    async fn files_without_revisions_are_never_downloaded_and_nonchild_lists_fail() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        backend.file("a", b"remote");
+        *backend.injected_entry.lock().unwrap() = Some(Entry {
+            path: "a".into(),
+            is_dir: false,
+            size: 6,
+            modified: None,
+            etag: None,
+        });
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, false),
+        )
+        .await
+        .unwrap();
+        assert!(result.conflicts[0].reason.contains("no revision"));
+        assert!(!local.join("a").exists());
+        *backend.injected_entry.lock().unwrap() = Some(Entry {
+            path: "not/a-child".into(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+            etag: Some("x".into()),
+        });
+        assert!(run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, false)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unsafe/non-child"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn directory_reader_releases_owned_handles_on_open_stream_read_and_encoding_failures() {
+        use std::{
+            cell::{Cell, RefCell},
+            collections::VecDeque,
+        };
+        struct Peer {
+            fd: i32,
+            stream: usize,
+            items: RefCell<VecDeque<(Option<Vec<u8>>, i32)>>,
+            closed_fd: Cell<usize>,
+            closed_stream: Cell<usize>,
+        }
+        impl DirectoryIo for Peer {
+            type Stream = usize;
+            fn open(&self, _: &File) -> i32 {
+                self.fd
+            }
+            fn stream(&self, _: i32) -> usize {
+                self.stream
+            }
+            fn invalid(&self, stream: usize) -> bool {
+                stream == 0
+            }
+            fn error(&self) -> std::io::Error {
+                std::io::Error::other("synthetic directory syscall failure")
+            }
+            fn close_fd(&self, _: i32) {
+                self.closed_fd.set(self.closed_fd.get() + 1)
+            }
+            fn close_stream(&self, _: usize) {
+                self.closed_stream.set(self.closed_stream.get() + 1)
+            }
+            fn read(&self, _: usize) -> (Option<Vec<u8>>, i32) {
+                self.items.borrow_mut().pop_front().unwrap_or((None, 0))
+            }
+        }
+        let (temporary, local, _baseline) = fixture();
+        let directory = File::open(&local).unwrap();
+        for (fd, stream, items, expected_fd, expected_stream) in [
+            (-1, 1, vec![], 0, 0),
+            (33, 0, vec![], 1, 0),
+            (33, 1, vec![(None, libc::EIO)], 0, 1),
+            (33, 1, vec![(Some(vec![255]), 0)], 0, 1),
+        ] {
+            let peer = Peer {
+                fd,
+                stream,
+                items: RefCell::new(items.into()),
+                closed_fd: Cell::new(0),
+                closed_stream: Cell::new(0),
+            };
+            assert!(directory_names_with(&directory, &peer).is_err());
+            assert_eq!(peer.closed_fd.get(), expected_fd);
+            assert_eq!(peer.closed_stream.get(), expected_stream);
+        }
+        let peer = Peer {
+            fd: 33,
+            stream: 1,
+            items: RefCell::new(VecDeque::from([
+                (Some(b".".to_vec()), 0),
+                (Some(b"..".to_vec()), 0),
+                (Some(b"file".to_vec()), 0),
+            ])),
+            closed_fd: Cell::new(0),
+            closed_stream: Cell::new(0),
+        };
+        assert_eq!(
+            directory_names_with(&directory, &peer).unwrap(),
+            vec!["file"]
+        );
+        assert_eq!(peer.closed_stream.get(), 1);
+        let regular = temporary.path().join("regular");
+        fs::write(&regular, b"bytes").unwrap();
+        assert!(directory_names(&File::open(regular).unwrap()).is_err());
+        assert!(SystemDirectoryIo.invalid(SystemDirectoryIo.stream(-1)));
+        SystemDirectoryIo.close_fd(-1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normalization_failures_release_only_successfully_created_cf_objects() {
+        use std::cell::RefCell;
+        struct Peer {
+            source: usize,
+            copy: usize,
+            capacity: isize,
+            encode: bool,
+            bytes: Vec<u8>,
+            released: RefCell<Vec<usize>>,
+        }
+        impl FilenameFoldIo for Peer {
+            type String = usize;
+            fn source(&self, _: &str) -> usize {
+                self.source
+            }
+            fn copy(&self, _: usize) -> usize {
+                self.copy
+            }
+            fn invalid(&self, value: usize) -> bool {
+                value == 0
+            }
+            fn release(&self, value: usize) {
+                self.released.borrow_mut().push(value)
+            }
+            fn normalize(&self, _: usize) {}
+            fn maximum_utf8(&self, _: usize) -> isize {
+                self.capacity
+            }
+            fn encode(&self, _: usize, buffer: &mut [u8]) -> bool {
+                if self.encode {
+                    buffer[..self.bytes.len()].copy_from_slice(&self.bytes);
+                }
+                self.encode
+            }
+        }
+        for (source, copy, capacity, encode, bytes, released) in [
+            (0, 2, 8, true, b"ok\0".to_vec(), vec![]),
+            (1, 0, 8, true, b"ok\0".to_vec(), vec![1]),
+            (1, 2, 8, false, vec![], vec![1, 2]),
+            (1, 2, isize::MAX, true, vec![], vec![1, 2]),
+            (1, 2, -1, true, vec![], vec![1, 2]),
+            (1, 2, 8, true, vec![255, 0], vec![1, 2]),
+        ] {
+            let peer = Peer {
+                source,
+                copy,
+                capacity,
+                encode,
+                bytes,
+                released: RefCell::new(vec![]),
+            };
+            assert!(collision_key_with("input", &peer).is_err());
+            assert_eq!(*peer.released.borrow(), released);
+        }
+        let peer = Peer {
+            source: 1,
+            copy: 2,
+            capacity: 8,
+            encode: true,
+            bytes: b"folded\0".to_vec(),
+            released: RefCell::new(vec![]),
+        };
+        assert_eq!(collision_key_with("input", &peer).unwrap(), "folded");
+        assert_eq!(*peer.released.borrow(), vec![1, 2]);
+        assert_eq!(
+            collision_key("Caf\u{e9}").unwrap(),
+            collision_key("CAFE\u{301}").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_snapshots_reject_hashing_copy_and_archive_races() {
+        let (_temporary, local, _) = fixture();
+        let source = local.join("file");
+        fs::write(&source, b"original").unwrap();
+        let root = LocalRoot::open(&local).unwrap();
+        let expected = root.version("file").unwrap().unwrap();
+        let writer = OpenOptions::new().write(true).open(&source).unwrap();
+        let mut changed = false;
+        let error = version_from_file_with(File::open(&source).unwrap(), |input, buffer| {
+            let count = input.read(buffer)?;
+            if !changed {
+                writer.set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))?;
+                changed = true;
+            }
+            Ok(count)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed while hashing"));
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+        let stage = root.stage().unwrap();
+        let error = root
+            .snapshot_with("file", &expected, &stage.path, |_, output| {
+                output.write_all(b"tampered")?;
+                Ok(8)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("preparing upload"));
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+        let error = root
+            .archive_with("file", &expected, |from, name, to, target| {
+                rename_at(from, name, to, target)?;
+                let mut moved = open_file_at(to, target).unwrap();
+                moved.set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))?;
+                // A new writer changed the same inode after the rename.
+                use std::os::fd::{AsRawFd, FromRawFd};
+                let fd = unsafe {
+                    libc::openat(
+                        to.as_raw_fd(),
+                        target.as_ptr(),
+                        libc::O_WRONLY | libc::O_NOFOLLOW,
+                    )
+                };
+                assert!(fd >= 0);
+                let mut writable = unsafe { File::from_raw_fd(fd) };
+                writable.write_all(b"modified")?;
+                moved.flush()?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("preserved original"));
+        assert_eq!(fs::read(&source).unwrap(), b"modified");
+        let saved: Vec<_> = fs::read_dir(local.join(INTERNAL))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("original"))
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(fs::read(&saved[0]).unwrap(), b"modified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_operations_preserve_existing_files_on_permission_and_type_errors() {
+        use std::{ffi::CString, os::unix::fs::PermissionsExt};
+        let (_temporary, local, _) = fixture();
+        fs::write(local.join("file"), b"original").unwrap();
+        fs::create_dir(local.join("folder")).unwrap();
+        fs::write(local.join("folder/untracked"), b"keep").unwrap();
+        let root = LocalRoot::open(&local).unwrap();
+        let expected = root.version("file").unwrap().unwrap();
+        let stage = root.stage().unwrap();
+        fs::write(&stage.path, b"new bytes").unwrap();
+        assert!(version_from_file(File::open(&local).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        assert!(open_file_at(&root.directory, &CString::new("missing").unwrap()).is_err());
+        assert!(open_file_at(&root.directory, c"folder")
+            .unwrap_err()
+            .to_string()
+            .contains("non-regular"));
+        assert!(root
+            .install_new(&stage.path, "file")
+            .unwrap_err()
+            .to_string()
+            .contains("destination appeared"));
+        assert_eq!(fs::read(local.join("file")).unwrap(), b"original");
+        assert!(root
+            .remove_empty_directory("folder")
+            .unwrap_err()
+            .to_string()
+            .contains("untracked"));
+        assert_eq!(fs::read(local.join("folder/untracked")).unwrap(), b"keep");
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o500)).unwrap();
+        let directory_error = root.directory("missing", true).unwrap_err();
+        let mkdir_error = root.mkdir("new-folder").unwrap_err();
+        let install_error = root.install_new(&stage.path, "new-file").unwrap_err();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(directory_error.downcast_ref::<std::io::Error>().is_some());
+        assert!(mkdir_error.downcast_ref::<std::io::Error>().is_some());
+        assert!(install_error.downcast_ref::<std::io::Error>().is_some());
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o000)).unwrap();
+        let stat_error = root.version("file").unwrap_err();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            stat_error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let archive_error = root
+            .archive_with("file", &expected, |_, _, _, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic rename denied",
+                ))
+            })
+            .unwrap_err();
+        assert!(archive_error.to_string().contains("rename denied"));
+        assert_eq!(fs::read(local.join("file")).unwrap(), b"original");
+        assert!(rename_at(&root.directory, c"missing", &root.directory, c"new").is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_or_unconfirmed_uploads_keep_the_prior_baseline() {
+        for failure in ["upload", "disappeared", "revision", "local_completion"] {
+            let (_temporary, local, baseline) = fixture();
+            let backend = MemoryBackend::new();
+            seed(&backend, &local, &baseline).await;
+            let old_baseline = fs::read(&baseline).unwrap();
+            fs::write(local.join("a.txt"), b"new local").unwrap();
+            match failure {
+                "upload" => *backend.fail_upload.lock().unwrap() = true,
+                "disappeared" => {
+                    *backend.after_upload.lock().unwrap() = Some(Box::new(|backend, path| {
+                        backend.nodes.lock().unwrap().remove(path);
+                        Ok(())
+                    }))
+                }
+                "revision" => {
+                    *backend.after_upload.lock().unwrap() = Some(Box::new(|backend, path| {
+                        backend.file(path, b"concurrent");
+                        Ok(())
+                    }))
+                }
+                "local_completion" => {
+                    let file = local.join("a.txt");
+                    *backend.after_upload.lock().unwrap() = Some(Box::new(move |backend, path| {
+                        *backend.after_stat.lock().unwrap() = Some((
+                            path.into(),
+                            Box::new(move |_, _| {
+                                fs::write(file, b"concurrent local")?;
+                                Ok(())
+                            }),
+                        ));
+                        Ok(())
+                    }));
+                }
+                _ => unreachable!(),
+            }
+            let error = run(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                &options(Direction::Both, true),
+            )
+            .await
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(match failure {
+                    "upload" => "upload failed",
+                    "disappeared" => "disappeared",
+                    "revision" => "could not be confirmed",
+                    _ => "changed before sync completion",
+                }),
+                "{failure}: {error:#}"
+            );
+            assert_eq!(fs::read(&baseline).unwrap(), old_baseline);
+            assert_eq!(
+                fs::read(local.join("a.txt")).unwrap(),
+                if failure == "local_completion" {
+                    b"concurrent local".as_slice()
+                } else {
+                    b"new local".as_slice()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_download_lengths_and_fingerprints_never_install_content() {
+        for (local_bytes, downloaded, expected_message) in [
+            (None, b"bad length".as_slice(), "size differs"),
+            (None, b"bad".as_slice(), "protected remote fingerprint"),
+            (
+                Some(b"new".as_slice()),
+                b"bad".as_slice(),
+                "protected remote fingerprint",
+            ),
+        ] {
+            let (_temporary, local, baseline) = fixture();
+            let backend = MemoryBackend::new();
+            backend.file("file", b"new");
+            if let Some(bytes) = local_bytes {
+                fs::write(local.join("file"), bytes).unwrap();
+            }
+            *backend.download_bytes.lock().unwrap() = Some(downloaded.to_vec());
+            let error = run(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                &options(Direction::Pull, false),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected_message), "{error:#}");
+            assert!(!baseline.exists());
+            if let Some(bytes) = local_bytes {
+                assert_eq!(fs::read(local.join("file")).unwrap(), bytes);
+            } else {
+                assert!(!local.join("file").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_reappearance_and_directory_confirmation_fail_without_advancing_baselines() {
+        for failure in ["not_removed", "local_reappeared", "remote_reappeared"] {
+            let (_temporary, local, baseline) = fixture();
+            let backend = MemoryBackend::new();
+            seed(&backend, &local, &baseline).await;
+            let old_baseline = fs::read(&baseline).unwrap();
+            fs::remove_file(local.join("a.txt")).unwrap();
+            match failure {
+                "not_removed" => {
+                    *backend.after_remove.lock().unwrap() = Some(Box::new(|backend, path| {
+                        backend.file(path, b"concurrent");
+                        Ok(())
+                    }))
+                }
+                "local_reappeared" => {
+                    let file = local.join("a.txt");
+                    *backend.after_remove.lock().unwrap() = Some(Box::new(move |_, _| {
+                        fs::write(file, b"new local")?;
+                        Ok(())
+                    }));
+                }
+                "remote_reappeared" => {
+                    *backend.after_remove.lock().unwrap() = Some(Box::new(|backend, path| {
+                        *backend.after_stat.lock().unwrap() = Some((
+                            path.into(),
+                            Box::new(|backend, path| {
+                                backend.file(path, b"new remote");
+                                Ok(())
+                            }),
+                        ));
+                        Ok(())
+                    }))
+                }
+                _ => unreachable!(),
+            }
+            let error = run(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                &options(Direction::Push, true),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(match failure {
+                    "not_removed" => "delete was not confirmed",
+                    "local_reappeared" => "reappeared locally",
+                    _ => "reappeared remotely",
+                }),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(&baseline).unwrap(), old_baseline);
+        }
+        let (_temporary, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        fs::create_dir(local.join("new-folder")).unwrap();
+        *backend.after_mkdir.lock().unwrap() = Some(Box::new(|backend, path| {
+            backend.nodes.lock().unwrap().remove(path);
+            Ok(())
+        }));
+        assert!(run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Push, false)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("directory creation not confirmed"));
+        assert!(!baseline.exists());
+        let directory = Entry {
+            path: "folder".into(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+            etag: None,
+        };
+        assert!(delete_remote_file(&backend, "folder", &directory)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be conditionally deleted"));
+    }
+
+    #[tokio::test]
+    async fn remote_subroots_and_duplicate_entries_are_validated() {
+        let (_temporary, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        backend.dir("root");
+        backend.file("root/file", b"remote");
+        run(
+            &backend,
+            &local,
+            "root",
+            &baseline,
+            &options(Direction::Pull, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(local.join("file")).unwrap(), b"remote");
+        *backend.duplicate_list.lock().unwrap() = true;
+        assert!(remote_scan(&backend, "root")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate path"));
+        backend.file("not-a-directory", b"bytes");
+        assert!(remote_scan(&backend, "not-a-directory")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn metadata_bound_download_installs_selected_attributes() {
+        let (_temporary, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        backend.file("file", b"remote");
+        let source = local.parent().unwrap().join("metadata-source");
+        fs::write(&source, b"remote").unwrap();
+        let mut record = crate::metadata::capture(&source, &Default::default()).unwrap();
+        record
+            .attributes
+            .insert("user.rdrive.test".into(), "746167".into());
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        crate::metadata_remote::save_record(&backend, "file", &entry, &record)
+            .await
+            .unwrap();
+        run_with_metadata(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, false),
+            true,
+        )
+        .await
+        .unwrap();
+        let installed = crate::metadata::capture(&local.join("file"), &Default::default()).unwrap();
+        assert_eq!(installed.attributes["user.rdrive.test"], "746167");
+        assert_eq!(fs::read(local.join("file")).unwrap(), b"remote");
+    }
+
+    #[tokio::test]
+    async fn collisions_and_revision_loss_are_conflicts_and_nested_deletions_apply_deepest_first() {
+        let (_temporary, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        fs::write(local.join("FILE"), b"local").unwrap();
+        backend.file("file", b"remote");
+        assert!(run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Both, false)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("filename collision"));
+        assert!(!baseline.exists());
+        fs::remove_file(local.join("FILE")).unwrap();
+        backend.nodes.lock().unwrap().clear();
+        seed(&backend, &local, &baseline).await;
+        *backend.injected_entry.lock().unwrap() = Some(Entry {
+            path: "a.txt".into(),
+            is_dir: false,
+            size: 5,
+            modified: None,
+            etag: None,
+        });
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, true),
+        )
+        .await
+        .unwrap();
+        assert!(result.conflicts[0].reason.contains("no revision token"));
+        assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"first");
+        fs::create_dir_all(local.join("folder/nested")).unwrap();
+        fs::write(local.join("folder/nested/file"), b"retained original").unwrap();
+        run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Push, true),
+        )
+        .await
+        .unwrap();
+        backend.nodes.lock().unwrap().clear();
+        let result = run(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, true),
+        )
+        .await
+        .unwrap();
+        assert!(result.baseline_updated);
+        assert!(!local.join("folder").exists());
+        let file_index = result
+            .actions
+            .iter()
+            .position(|item| item.path == "folder/nested/file")
+            .unwrap();
+        let nested_index = result
+            .actions
+            .iter()
+            .position(|item| item.path == "folder/nested")
+            .unwrap();
+        let folder_index = result
+            .actions
+            .iter()
+            .position(|item| item.path == "folder")
+            .unwrap();
+        assert!(file_index < nested_index && nested_index < folder_index);
+        assert_eq!(fs::read_dir(local.join(INTERNAL)).unwrap().count(), 2);
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn rejected_download_metadata_keeps_content_uninstalled_and_baseline_unchanged() {
+        let (_temporary, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        backend.file("file", b"remote");
+        let entry = backend.stat("file").await.unwrap().unwrap();
+        let record = crate::metadata::MetadataRecord {
+            version: 1,
+            content_sha256: format!("{:x}", Sha256::digest(b"remote")),
+            attributes: BTreeMap::from([(crate::metadata::FINDER_INFO.into(), "ff".into())]),
+            selection: vec![crate::metadata::FINDER_INFO.into()],
+            excluded: vec![],
+        };
+        crate::metadata_remote::save_record(&backend, "file", &entry, &record)
+            .await
+            .unwrap();
+        let error = run_with_metadata(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            &options(Direction::Pull, false),
+            true,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot update selected xattr")
+                && message.contains("rollback completed"),
+            "{error:#}"
+        );
+        let recovery = Path::new(message.rsplit_once("recovery journal: ").unwrap().1);
+        assert_eq!(recovery.file_name().unwrap(), "xattr-recovery.json");
+        let stage = recovery.parent().unwrap();
+        assert!(stage
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("rdrive-sync-"));
+        assert_eq!(
+            stage.parent().unwrap(),
+            fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        assert!(
+            !stage.exists(),
+            "completed rollback must clean its staging directory"
+        );
+        assert!(!local.join("file").exists());
+        assert!(!baseline.exists());
+        assert_eq!(backend.bytes("file"), b"remote");
     }
 }

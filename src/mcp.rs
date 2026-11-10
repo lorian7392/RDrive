@@ -223,14 +223,16 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin, limit: usize) -> Result
     }
 }
 
-async fn invoke(
+async fn invoke_with_program(
     options: &Options,
     tool: &catalog::Tool,
     arguments: Value,
     cancel: CancellationToken,
+    executable: &std::io::Result<PathBuf>,
 ) -> Value {
     let outcome=async {
-        let mut command=Command::new(std::env::current_exe()?);
+        let executable = executable.as_ref().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut command=Command::new(executable);
         command.arg("--home").arg(&options.home).args(["--json","--progress","off","--jobs"]).arg(options.jobs.to_string());
         if let Some(limit)=options.limit {command.arg("--limit").arg(limit.to_string());}
         command.args(tool.argv(&arguments)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -275,10 +277,28 @@ async fn invoke(
 /// Serve the 2025-11-25 MCP lifecycle over newline-delimited stdio. Older
 /// 2025-06-18 and 2025-03-26 versions use the same implemented messages.
 pub async fn serve(options: Options) -> Result<()> {
+    serve_with_io(options, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// The same bounded protocol engine can run over isolated in-memory transports.
+async fn serve_with_io(
+    options: Options,
+    input: impl AsyncRead + Unpin + Send + 'static,
+    stdout: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    serve_with_program(options, input, stdout, std::env::current_exe()).await
+}
+async fn serve_with_program(
+    options: Options,
+    input: impl AsyncRead + Unpin + Send + 'static,
+    mut stdout: impl tokio::io::AsyncWrite + Unpin,
+    program: std::io::Result<PathBuf>,
+) -> Result<()> {
     let options = std::sync::Arc::new(options.validate()?);
+    let program = std::sync::Arc::new(program);
     let (frames_tx, mut frames) = mpsc::channel(4);
     let reader = tokio::spawn(async move {
-        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut reader = BufReader::new(input);
         loop {
             let next = read_frame(&mut reader).await;
             let end = !matches!(&next, Ok(Some(_)));
@@ -288,7 +308,6 @@ pub async fn serve(options: Options) -> Result<()> {
         }
     });
     let (done_tx, mut done) = mpsc::channel::<Value>(1);
-    let mut stdout = tokio::io::stdout();
     let mut phase = 0_u8;
     let mut active: Option<(Value, CancellationToken, tokio::task::JoinHandle<()>)> = None;
     loop {
@@ -503,8 +522,9 @@ pub async fn serve(options: Options) -> Result<()> {
                 let task_options = options.clone();
                 let sender = done_tx.clone();
                 let task_id = id.clone();
+                let task_program = program.clone();
                 let task = tokio::spawn(async move {
-                    let result = invoke(&task_options, &tool, arguments, task_cancel).await;
+                    let result = invoke_with_program(&task_options, &tool, arguments, task_cancel, task_program.as_ref()).await;
                     let response = if let Some(uri) = resource_uri {
                         if result["isError"] == true {
                             rpc_error(
@@ -653,4 +673,168 @@ mod tests {
             b"{}\n"
         );
     }
+
+    fn options(base: &Path) -> Options {
+        Options { home: base.join("state"), allow_write: true, local_roots: vec![base.to_owned()], timeout_secs: 1, jobs: 1, limit: Some(1) }
+    }
+
+    #[test]
+    fn invalid_server_options_never_cross_local_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        for field in ["timeout", "jobs", "limit"] {
+            let mut value = options(&base);
+            match field { "timeout" => value.timeout_secs = 0, "jobs" => value.jobs = 0, _ => value.limit = Some(0) }
+            assert!(value.validate().is_err());
+        }
+        let mut value = options(&base); value.local_roots = vec![base.join("missing")];
+        assert!(value.validate().is_err());
+        std::fs::create_dir(base.join("state")).unwrap();
+        let mut value = options(&base); value.local_roots = vec![base.join("state")];
+        assert!(value.validate().is_err());
+        assert!(absolute_resolved(Path::new("relative")).is_err());
+        assert!(absolute_resolved(&base.join("../outside")).is_err());
+        assert_eq!(resource_tool("unknown://resource"), None);
+    }
+
+    #[test]
+    fn cache_migration_targets_do_not_grant_file_access_to_protected_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let mut store = crate::state::Store::open(base.join("state")).unwrap();
+        let cache = base.join("content-cache");
+        std::fs::create_dir(&cache).unwrap();
+        store.config.cache.directory = Some(cache.clone());
+        store.save_config().unwrap();
+        let settings = options(&base).validate().unwrap();
+        let target = cache.join("new-cache-target");
+        let text = target.to_str().unwrap();
+        assert_eq!(settings.checked_local_path(text, true).unwrap(), target);
+        assert!(settings.local_path(text).unwrap_err().to_string().contains("protected RDrive content cache"));
+        assert!(!target.exists(), "path validation must never create a migration target");
+    }
+
+    #[tokio::test]
+    async fn capped_reads_and_message_writes_report_actual_io_failures() {
+        assert_eq!(read_capped(&b"abc"[..], 3).await.unwrap(), b"abc");
+        assert!(read_capped(&b"abcd"[..], 3).await.is_err());
+        let (client, mut server) = tokio::io::duplex(1);
+        drop(client);
+        assert!(write_message(&mut server, &json!({"result":true})).await.is_err());
+        assert!(read_frame(&mut &b""[..]).await.unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_subprocesses_validate_outputs_and_reap_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let options = options(&base).validate().unwrap();
+        let catalog = catalog::catalog();
+        let status = catalog.iter().find(|tool| tool.name == "rdrive_status").unwrap();
+        let text = catalog.iter().find(|tool| tool.name == "rdrive_read_text").unwrap();
+        let executable = base.join("synthetic-operation");
+        let run = |body: &str| {
+            std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        run("printf '{\"confirmed\":true}'");
+        let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
+        assert_eq!(response["isError"], false); assert_eq!(response["structuredContent"]["data"]["confirmed"], true);
+        run("exit 0");
+        let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
+        assert_eq!(response["structuredContent"]["data"], Value::Null);
+        run("printf 'not-json'");
+        assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await["isError"], true);
+        run("exit 3");
+        let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
+        assert_eq!(response["isError"], true); assert_eq!(response["structuredContent"]["error"], "RDrive operation failed");
+        run("printf 'hello\\n'");
+        let response = invoke_with_program(&options, text, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
+        assert_eq!(response["structuredContent"]["data"]["text"], "hello\n");
+        for content in ["printf '\\000'", "printf '\\377'", "printf '\\001'"] {
+            run(content);
+            assert_eq!(invoke_with_program(&options, text, json!({}), CancellationToken::new(), &Ok(executable.clone())).await["isError"], true);
+        }
+        run("exec /bin/sleep 5");
+        let cancelled = CancellationToken::new(); cancelled.cancel();
+        assert_eq!(invoke_with_program(&options, status, json!({}), cancelled, &Ok(executable.clone())).await["isError"], true);
+        assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await["isError"], true);
+        assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(base.join("missing"))).await["isError"], true);
+        let unavailable = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Synthetic missing executable identity"));
+        assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &unavailable).await["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn protocol_engine_rejects_invalid_lifecycle_and_catalog_messages() {
+        use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let release=base.join("release-child"); let program=base.join("synthetic-cli");
+        let quoted=format!("'{}'",release.to_string_lossy().replace('\'',"'\\''"));
+        std::fs::write(&program,format!("#!/bin/sh\nwhile [ ! -f {quoted} ]; do /bin/sleep 0.01; done\nexit 3\n")).unwrap();
+        std::fs::set_permissions(&program,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (client, server) = tokio::io::duplex(16384);
+        let (input, output) = tokio::io::split(server);
+        let mut settings=options(&base); settings.timeout_secs=10;
+        let service = tokio::spawn(serve_with_program(settings, input, output, Ok(program)));
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        async fn exchange(write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>, reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>, value: Value) -> Value {
+            write.write_all(format!("{}\n", value).as_bytes()).await.unwrap();
+            let mut line = String::new(); reader.read_line(&mut line).await.unwrap(); serde_json::from_str(&line).unwrap()
+        }
+        for value in [json!([]), json!({"jsonrpc":"2.0","id":true,"method":"ping"}), json!({"jsonrpc":"2.0","id":1,"method":0})] {
+            assert_eq!(exchange(&mut write, &mut reader, value).await["error"]["code"], -32600);
+        }
+        assert_eq!(exchange(&mut write, &mut reader, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await["error"]["code"], -32000);
+        assert_eq!(exchange(&mut write, &mut reader, json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}})).await["error"]["code"], -32602);
+        let initialize = json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"unknown-version","capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}}});
+        assert_eq!(exchange(&mut write, &mut reader, initialize.clone()).await["result"]["protocolVersion"], PROTOCOL);
+        assert_eq!(exchange(&mut write, &mut reader, initialize).await["error"]["code"], -32600);
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
+        // A notification with no matching active request is harmless, including
+        // the case where no operation has been started at all.
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"not-active\"}}\n").await.unwrap();
+        for (method, params, code) in [("tools/list", json!([]), -32602), ("tools/list", json!({"cursor":"next"}), -32602), ("resources/list", json!({"cursor":"next"}), -32602), ("resources/read", json!({"uri":"unknown"}), -32002), ("tools/call", json!({}), -32602), ("tools/call", json!({"name":"unknown"}), -32602), ("unknown-method", json!({}), -32601)] {
+            assert_eq!(exchange(&mut write, &mut reader, json!({"jsonrpc":"2.0","id":4,"method":method,"params":params})).await["error"]["code"], code);
+        }
+        // The controlled child stays active until the busy reply is observed;
+        // releasing its private gate then produces a deterministic CLI error.
+        let resource=json!({"jsonrpc":"2.0","id":11,"method":"resources/read","params":{"uri":"rdrive://status"}});
+        let busy=json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"rdrive_status","arguments":{}}});
+        write.write_all(format!("{resource}\n{busy}\n").as_bytes()).await.unwrap();
+        let mut line=String::new(); reader.read_line(&mut line).await.unwrap(); let response:Value=serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"],12); assert_eq!(response["error"]["code"],-32000);
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"different-request\"}}\n").await.unwrap();
+        let still_busy=json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"rdrive_status","arguments":{}}});
+        assert_eq!(exchange(&mut write, &mut reader, still_busy).await["error"]["code"], -32000);
+        std::fs::write(release,b"release").unwrap();
+        line.clear(); reader.read_line(&mut line).await.unwrap(); let response:Value=serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"],11); assert_eq!(response["error"]["code"],-32603);
+        // Restoring the default cache location omits its optional local path.
+        // Validation must reach the injected CLI, rather than reject that
+        // omission or try to access a directory supplied by another request.
+        let restore=json!({"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"rdrive_cache_set_directory","arguments":{"default":true,"dry_run":true}}});
+        let response=exchange(&mut write, &mut reader, restore).await;
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"],true);
+        assert_eq!(response["result"]["structuredContent"]["error"],"RDrive operation failed");
+        write.write_all(b"not-json\n").await.unwrap();
+        let mut line = String::new(); reader.read_line(&mut line).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["error"]["code"], -32700);
+        write.shutdown().await.unwrap();
+        service.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn local_path_inspection_errors_and_explicit_dot_segments_are_rejected() {
+        let temp=tempfile::tempdir().unwrap(); let root=temp.path().canonicalize().unwrap();
+        let file=root.join("file"); std::fs::write(&file,b"fixture").unwrap();
+        assert!(absolute_resolved(&file.join("child")).unwrap_err().to_string().contains("cannot inspect"));
+        assert!(absolute_resolved(&root.join("a/./b")).unwrap_err().to_string().contains("traversal"));
+    }
+
 }

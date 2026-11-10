@@ -52,9 +52,7 @@ fn compile(pattern: &str) -> Result<GlobMatcher> {
         bail!("invalid relative glob pattern");
     }
     let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
-    if pattern.is_empty() {
-        bail!("empty glob pattern");
-    }
+    // An empty input and slash-only absolute path were rejected above.
     Ok(GlobBuilder::new(pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -209,8 +207,16 @@ mod tests {
         );
         assert!(allowed(&config, "p", "a.tmp", false).unwrap());
         assert!(!allowed(&config, "q", "a.tmp", false).unwrap());
-        for pattern in ["/root", "../secret", "[", "a\\b", ""] {
+        for pattern in ["/root", "/", "../secret", "[", "a\\b", ""] {
             assert!(compile(pattern).is_err());
         }
+    }
+
+    #[test]
+    fn empty_root_is_traversable_and_oversized_rule_lists_are_rejected() {
+        let mut config = Config::default();
+        assert!(Selector::new(&config, "p").unwrap().allowed("", true).unwrap());
+        config.filters.exclude = vec!["*.tmp".into(); 257];
+        assert!(config.filters.validate().unwrap_err().to_string().contains("256"));
     }
 }

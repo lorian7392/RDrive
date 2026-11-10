@@ -68,9 +68,11 @@ pub async fn run(home: &Path) -> Result<()> {
     }
 }
 fn ensure_macos() -> Result<()> {
-    if !cfg!(target_os = "macos") {
+    #[cfg(not(target_os = "macos"))]
+    {
         bail!("resident services currently require macOS launchd");
     }
+    #[cfg(target_os = "macos")]
     Ok(())
 }
 
@@ -288,7 +290,32 @@ mod native {
         }
         Ok(Some(String::from_utf8(output.stdout)?.trim().into()))
     }
+    trait Artifacts {
+        fn property(&self, app: &Path, key: &str) -> Result<Option<String>>;
+        fn signed(&self, app: &Path) -> Result<bool>;
+    }
+    struct SystemArtifacts;
+    impl Artifacts for SystemArtifacts {
+        fn property(&self, app: &Path, key: &str) -> Result<Option<String>> {
+            native_property(app, key)
+        }
+        fn signed(&self, app: &Path) -> Result<bool> {
+            Ok(Command::new("/usr/bin/codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(app)
+                .output()?
+                .status
+                .success())
+        }
+    }
     fn normalized(options: &ServiceOptions, verify_artifacts: bool) -> Result<ServiceOptions> {
+        normalized_with(options, verify_artifacts, &SystemArtifacts)
+    }
+    fn normalized_with(
+        options: &ServiceOptions,
+        verify_artifacts: bool,
+        artifacts: &dyn Artifacts,
+    ) -> Result<ServiceOptions> {
         let home = directory(&options.home, false, true)?;
         if !exists(&home)? {
             bail!("initialize a private RDrive state directory before installing its service");
@@ -309,9 +336,9 @@ mod native {
             let app=directory(path,false,false)?;
             if verify_artifacts {
                 let _=executable(&app.join("Contents/MacOS/RDriveCompanion"))?;
-                if native_property(&app,"CFBundleIdentifier")?.as_deref()!=Some("io.rdrive.native"){bail!("the native watcher must come from the RDrive companion app");}
-                if !Command::new("/usr/bin/codesign").args(["--verify","--deep","--strict"]).arg(&app).output()?.status.success(){bail!("the RDrive companion app failed code-signature verification");}
-                let development=native_property(&app,"RDriveDevelopmentIPCRoot")?;
+                if artifacts.property(&app,"CFBundleIdentifier")?.as_deref()!=Some("io.rdrive.native"){bail!("the native watcher must come from the RDrive companion app");}
+                if !artifacts.signed(&app)?{bail!("the RDrive companion app failed code-signature verification");}
+                let development=artifacts.property(&app,"RDriveDevelopmentIPCRoot")?;
                 if options.development_tcp {
                     let root=development.context("--development-tcp requires a matching development native app")?;
                     if absolute(Path::new(&root))?!=ipc_root{bail!("service IPC root must match the native app's embedded development IPC root");}
@@ -334,12 +361,19 @@ mod native {
         })
     }
     fn planned(options: &ServiceOptions, verify_artifacts: bool) -> Result<Installation> {
+        planned_with_home(options, verify_artifacts, std::env::var_os("HOME"))
+    }
+    fn planned_with_home(
+        options: &ServiceOptions,
+        verify_artifacts: bool,
+        user_home: Option<std::ffi::OsString>,
+    ) -> Result<Installation> {
         let options = normalized(options, verify_artifacts)?;
         let agents = if let Some(path) = &options.launch_agents_dir {
             path.clone()
         } else {
-            let user = std::env::var_os("HOME")
-                .context("HOME is unavailable for the per-user LaunchAgent location")?;
+            let user =
+                user_home.context("HOME is unavailable for the per-user LaunchAgent location")?;
             directory(
                 &PathBuf::from(user).join("Library/LaunchAgents"),
                 false,
@@ -512,6 +546,14 @@ mod native {
         dry_run: bool,
         control: &dyn Launchctl,
     ) -> Result<Value> {
+        install_with(options, dry_run, control, directory)
+    }
+    fn install_with(
+        options: &ServiceOptions,
+        dry_run: bool,
+        control: &dyn Launchctl,
+        create_agents: impl FnOnce(&Path, bool, bool) -> Result<PathBuf>,
+    ) -> Result<Value> {
         let installation = planned(options, true)?;
         if dry_run {
             return plan(&installation, "install", vec![]);
@@ -543,7 +585,7 @@ mod native {
         }
         directory(&installation.options.ipc_root, true, true)?;
         directory(&installation.options.ipc_root.join("Transfers"), true, true)?;
-        directory(
+        create_agents(
             installation.plist.parent().unwrap(),
             true,
             installation.options.launch_agents_dir.is_some(),
@@ -660,7 +702,10 @@ mod native {
             .write(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
-        match file.try_lock() {
+        lock_active(file.try_lock())
+    }
+    fn lock_active(result: std::result::Result<(), std::fs::TryLockError>) -> Result<bool> {
+        match result {
             Ok(()) => Ok(false),
             Err(std::fs::TryLockError::WouldBlock) => Ok(true),
             Err(error) => Err(anyhow::anyhow!("cannot inspect supervisor lock: {error}")),
@@ -688,6 +733,22 @@ mod native {
         )
     }
     fn stop_foreground(installation: &Installation) -> Result<()> {
+        stop_foreground_with(
+            installation,
+            terminate_process,
+            Duration::from_secs(12),
+            Duration::from_millis(50),
+        )
+    }
+    fn terminate_process(pid: i32) -> bool {
+        unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+    }
+    fn stop_foreground_with(
+        installation: &Installation,
+        terminate: impl FnOnce(i32) -> bool,
+        timeout: Duration,
+        poll: Duration,
+    ) -> Result<()> {
         let service = service_dir(&installation.options.home, false)?;
         if !active(&service)? {
             return Ok(());
@@ -700,15 +761,15 @@ mod native {
             .as_u64()
             .filter(|pid| *pid > 1 && *pid <= i32::MAX as u64)
             .context("supervisor PID missing")?;
-        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+        if !terminate(pid as i32) {
             bail!("could not stop the owned foreground supervisor");
         }
-        let deadline = Instant::now() + Duration::from_secs(12);
+        let deadline = Instant::now() + timeout;
         while active(&service)? {
             if Instant::now() >= deadline {
                 bail!("owned supervisor has not stopped; no installation files were removed");
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(poll);
         }
         Ok(())
     }
@@ -846,12 +907,49 @@ mod native {
         json!({"format":FORMAT,"label":installation.label,"supervisor_pid":std::process::id(),"state":state,"updated":state::now(),"children":roles.iter().map(|role|(role.name.to_owned(),role.snapshot())).collect::<BTreeMap<_,_>>(),"credentials":credentials})
     }
     pub(super) async fn run(home: &Path) -> Result<()> {
+        run_with(home, shutdown_signal).await
+    }
+    fn shutdown_signal() -> Result<impl std::future::Future<Output = ()>> {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        Ok(async move {
+            let interrupt = tokio::signal::ctrl_c();
+            tokio::pin!(interrupt);
+            tokio::select! {_=terminate.recv()=>{},_=&mut interrupt=>{}}
+        })
+    }
+    async fn run_with<F, S>(home: &Path, shutdown: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<S>,
+        S: std::future::Future<Output = ()>,
+    {
         let installation = load(home)?;
         ensure_plist(&installation)?;
         ready(&installation)?;
         if std::env::current_exe()?.canonicalize()? != installation.options.executable {
             bail!("run the installed service executable or reinstall after moving it");
         }
+        supervise(&installation, shutdown).await
+    }
+    async fn supervise<F, S>(installation: &Installation, shutdown: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<S>,
+        S: std::future::Future<Output = ()>,
+    {
+        supervise_with(installation, shutdown, event, write::<Value>).await
+    }
+    async fn supervise_with<F, S, E, W>(
+        installation: &Installation,
+        shutdown: F,
+        mut record: E,
+        mut write_status: W,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<S>,
+        S: std::future::Future<Output = ()>,
+        E: FnMut(&Path, Value) -> Result<()>,
+        W: FnMut(&Path, &Value) -> Result<()>,
+    {
         let service = service_dir(&installation.options.home, true)?;
         let _lock = lock(&service.join("supervisor.lock"), false)?;
         if UnixStream::connect(installation.options.ipc_root.join("bridge.sock")).is_ok() {
@@ -909,16 +1007,14 @@ mod native {
             ));
         }
         let credentials = credential_diagnostics(&installation.options.home)?;
-        event(
+        record(
             &service,
             json!({"kind":"supervisor_started","pid":std::process::id()}),
         )?;
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let interrupt = tokio::signal::ctrl_c();
-        tokio::pin!(interrupt);
+        let shutdown = shutdown()?;
+        tokio::pin!(shutdown);
         let mut heartbeat = Instant::now();
-        write(
+        write_status(
             &service.join("status.json"),
             &runtime(&installation, &roles, "running", &credentials),
         )?;
@@ -928,22 +1024,22 @@ mod native {
                 changed |= role.tick(&service).await?;
             }
             if changed || heartbeat.elapsed() >= Duration::from_secs(2) {
-                write(
+                write_status(
                     &service.join("status.json"),
                     &runtime(&installation, &roles, "running", &credentials),
                 )?;
                 heartbeat = Instant::now();
             }
-            tokio::select! {_=terminate.recv()=>break,_=&mut interrupt=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+            tokio::select! {_=&mut shutdown=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
         }
         for role in roles.iter_mut().rev() {
             role.stop().await;
         }
-        write(
+        write_status(
             &service.join("status.json"),
             &runtime(&installation, &roles, "stopped", &credentials),
         )?;
-        event(
+        record(
             &service,
             json!({"kind":"supervisor_stopped","pid":std::process::id()}),
         )?;
@@ -1003,6 +1099,153 @@ mod native {
                 launch_agents_dir: Some(root.join("agents")),
             };
             (temporary, options)
+        }
+        struct MockArtifacts {
+            bundle: Option<String>,
+            development: Option<String>,
+            signed: bool,
+        }
+        impl Artifacts for MockArtifacts {
+            fn property(&self, _: &Path, key: &str) -> Result<Option<String>> {
+                Ok(if key == "CFBundleIdentifier" {
+                    self.bundle.clone()
+                } else {
+                    self.development.clone()
+                })
+            }
+            fn signed(&self, _: &Path) -> Result<bool> {
+                Ok(self.signed)
+            }
+        }
+        #[test]
+        fn artifact_policy_checks_identity_signature_and_explicit_development_root() {
+            let (temporary, mut options) = fixture();
+            let app = temporary.path().canonicalize().unwrap().join("Fixture.app");
+            let executable = app.join("Contents/MacOS/RDriveCompanion");
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::write(&executable, b"test-only executable marker").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            options.app = Some(app.clone());
+            let mut artifacts = MockArtifacts {
+                bundle: Some("io.rdrive.native".into()),
+                development: Some(options.ipc_root.to_string_lossy().into()),
+                signed: true,
+            };
+            assert_eq!(
+                normalized_with(&options, true, &artifacts).unwrap().app,
+                Some(app.clone())
+            );
+            artifacts.bundle = None;
+            assert!(normalized_with(&options, true, &artifacts)
+                .unwrap_err()
+                .to_string()
+                .contains("RDrive companion"));
+            artifacts.bundle = Some("io.rdrive.native".into());
+            artifacts.signed = false;
+            assert!(normalized_with(&options, true, &artifacts)
+                .unwrap_err()
+                .to_string()
+                .contains("code-signature"));
+            artifacts.signed = true;
+            artifacts.development = None;
+            assert!(normalized_with(&options, true, &artifacts)
+                .unwrap_err()
+                .to_string()
+                .contains("matching development"));
+            artifacts.development =
+                Some(temporary.path().join("other-ipc").to_string_lossy().into());
+            assert!(normalized_with(&options, true, &artifacts)
+                .unwrap_err()
+                .to_string()
+                .contains("must match"));
+            options.development_tcp = false;
+            assert!(normalized_with(&options, true, &artifacts)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit --development-tcp"));
+            artifacts.development = None;
+            assert!(normalized_with(&options, true, &artifacts).is_ok());
+            assert!(normalized_with(&options, false, &artifacts).is_ok());
+            let plist = app.join("Contents/Info.plist");
+            fs::write(&plist, b"not a property list").unwrap();
+            fs::set_permissions(&plist, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(SystemArtifacts
+                .property(&app, "CFBundleIdentifier")
+                .unwrap()
+                .is_none());
+            fs::write(&plist, br#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.rdrive.fixture</string></dict></plist>"#).unwrap();
+            assert_eq!(
+                SystemArtifacts
+                    .property(&app, "CFBundleIdentifier")
+                    .unwrap()
+                    .as_deref(),
+                Some("io.rdrive.fixture")
+            );
+            assert!(!SystemArtifacts.signed(&app).unwrap());
+            fs::set_permissions(&plist, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(native_property(&app, "CFBundleIdentifier")
+                .unwrap_err()
+                .to_string()
+                .contains("owned regular"));
+        }
+        #[test]
+        fn unsafe_service_paths_and_tampered_installation_records_are_rejected() {
+            let (temporary, mut options) = fixture();
+            let root = temporary.path();
+            assert!(absolute(Path::new("../escape")).is_err());
+            assert!(absolute(&root.join("line\nbreak")).is_err());
+            assert!(absolute(Path::new("rdrive-nonexistent-relative-fixture"))
+                .unwrap()
+                .is_absolute());
+            let link = root.join("linked");
+            symlink(&options.executable, &link).unwrap();
+            assert!(absolute(&link).is_err());
+            assert!(exists(&options.executable.join("child")).is_err());
+            assert!(directory(&options.executable, false, false).is_err());
+            fs::set_permissions(&options.executable, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(executable(&options.executable).is_err());
+            fs::set_permissions(&options.executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let large = root.join("large.json");
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&large)
+                .unwrap();
+            file.set_len(1024 * 1024 + 1).unwrap();
+            assert!(read_bytes(&large)
+                .unwrap_err()
+                .to_string()
+                .contains("too large"));
+            let original = options.home.clone();
+            options.home = root.join("missing-state");
+            assert!(normalized(&options, true)
+                .unwrap_err()
+                .to_string()
+                .contains("initialize a private"));
+            options.home = original;
+            options.ipc_root = root.join("i".repeat(104));
+            assert!(normalized(&options, true)
+                .unwrap_err()
+                .to_string()
+                .contains("too long"));
+            options.ipc_root = root.join("ipc");
+            let fake = Fake::default();
+            install(&options, false, &fake).unwrap();
+            let mut installation = load(&options.home).unwrap();
+            installation.format = 9;
+            write(&install_path(&options.home).unwrap(), &installation).unwrap();
+            assert!(load(&options.home)
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed"));
+            installation.format = FORMAT;
+            installation.plist = root.join("other.plist");
+            write(&install_path(&options.home).unwrap(), &installation).unwrap();
+            assert!(load(&options.home)
+                .unwrap_err()
+                .to_string()
+                .contains("paths changed"));
         }
         #[test]
         fn dry_run_writes_nothing_and_plan_contains_no_environment_values() {
@@ -1230,6 +1473,497 @@ mod native {
             assert_eq!(response["launchd"]["managed"], true);
             assert_eq!(response["launchd"]["running"], true);
             assert!(!response.to_string().contains("never-copy-this"));
+        }
+
+        struct ExitCode(i32);
+        impl Launchctl for ExitCode {
+            fn invoke(&self, _: &[String]) -> Result<CommandOutput> {
+                Ok(CommandOutput {
+                    code: self.0,
+                    stdout: String::new(),
+                })
+            }
+        }
+        fn owned_job(installation: &Installation, running: bool) -> String {
+            format!("state = {}\n{}path = {}\nprogram = {}\narguments = {{\n{}\n}}\nlast exit code = 7\n",
+                if running { "running" } else { "waiting" }, if running { "pid = 123\n" } else { "" },
+                installation.plist.display(), installation.options.executable.display(), arguments(installation).join("\n"))
+        }
+        #[test]
+        fn launchctl_transitions_and_failures_preserve_ownership() {
+            let (_temporary, options) = fixture();
+            let fake = Fake::default();
+            install(&options, false, &fake).unwrap();
+            let installation = load(&options.home).unwrap();
+            assert!(job(&installation, &ExitCode(42))
+                .unwrap_err()
+                .to_string()
+                .contains("exit 42"));
+            assert!(!job(&installation, &ExitCode(3)).unwrap().loaded);
+            for args in [vec![], vec!["bootstrap".into()]] {
+                assert!(command(&ExitCode(19), args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("existing state was preserved"));
+            }
+            action(&options.home, ServiceAction::Start, false, &fake).unwrap();
+            assert!(fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|args| args[0] == "bootstrap"));
+            *fake.output.lock().unwrap() = Some(owned_job(&installation, false));
+            action(&options.home, ServiceAction::Start, false, &fake).unwrap();
+            assert!(fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|args| args[0] == "kickstart"));
+            *fake.output.lock().unwrap() = Some(owned_job(&installation, true));
+            action(&options.home, ServiceAction::Start, false, &fake).unwrap();
+            let mut changed = options.clone();
+            changed.development_tcp = !options.development_tcp;
+            assert!(install(&changed, false, &fake)
+                .unwrap_err()
+                .to_string()
+                .contains("stop the existing"));
+            let mut altered = installation.clone();
+            altered.plist = options.home.join("wrong.plist");
+            assert!(ready(&altered)
+                .unwrap_err()
+                .to_string()
+                .contains("paths changed"));
+            action(&options.home, ServiceAction::Restart, false, &fake).unwrap();
+            assert!(fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|args| args[0] == "bootout"));
+            let service = service_dir(&options.home, false).unwrap();
+            let held = lock(&service.join("supervisor.lock"), false).unwrap();
+            assert!(action(&options.home, ServiceAction::Start, false, &fake)
+                .unwrap_err()
+                .to_string()
+                .contains("foreground supervisor"));
+            drop(held);
+            // Read-only inspection of a random nonexistent label executes the
+            // default adapter without managing any real launchd service.
+            let output = SystemLaunchctl
+                .invoke(&[
+                    "print".into(),
+                    format!(
+                        "gui/{}/io.rdrive.test.{}",
+                        uid(),
+                        state::key(&options.home.to_string_lossy())
+                    ),
+                ])
+                .unwrap();
+            assert_ne!(output.code, 0);
+        }
+        #[test]
+        fn default_agent_location_and_lock_io_errors_are_explicit() {
+            let (temporary, mut options) = fixture();
+            options.launch_agents_dir = None;
+            assert!(planned_with_home(&options, true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("HOME is unavailable"));
+            let installation = planned_with_home(
+                &options,
+                true,
+                Some(temporary.path().as_os_str().to_owned()),
+            )
+            .unwrap();
+            assert_eq!(
+                installation.plist.parent().unwrap(),
+                temporary
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("Library/LaunchAgents")
+            );
+            fs::create_dir(temporary.path().join("Library")).unwrap();
+            fs::write(
+                temporary.path().join("Library/LaunchAgents"),
+                b"not a directory",
+            )
+            .unwrap();
+            assert!(planned_with_home(
+                &options,
+                true,
+                Some(temporary.path().as_os_str().to_owned())
+            )
+            .is_err());
+            assert!(
+                lock_active(Err(std::fs::TryLockError::Error(std::io::Error::other(
+                    "synthetic lock failure"
+                ))))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot inspect supervisor lock")
+            );
+        }
+        #[test]
+        fn foreground_stop_validates_identity_and_waits_for_its_own_lock() {
+            let (_temporary, options) = fixture();
+            install(&options, false, &Fake::default()).unwrap();
+            let installation = load(&options.home).unwrap();
+            let service = service_dir(&options.home, false).unwrap();
+            let held = lock(&service.join("supervisor.lock"), false).unwrap();
+            let status = service.join("status.json");
+            write(&status, &json!({"label":"wrong", "supervisor_pid":123})).unwrap();
+            assert!(stop_foreground(&installation)
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch"));
+            write(
+                &status,
+                &json!({"label":installation.label, "supervisor_pid":1}),
+            )
+            .unwrap();
+            assert!(stop_foreground(&installation)
+                .unwrap_err()
+                .to_string()
+                .contains("PID missing"));
+            write(
+                &status,
+                &json!({"label":installation.label, "supervisor_pid":i32::MAX}),
+            )
+            .unwrap();
+            assert!(
+                stop_foreground_with(&installation, |_| false, Duration::ZERO, Duration::ZERO)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("could not stop")
+            );
+            assert!(
+                stop_foreground_with(&installation, |_| true, Duration::ZERO, Duration::ZERO)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("has not stopped")
+            );
+            drop(held);
+            let held = lock(&service.join("supervisor.lock"), false).unwrap();
+            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            write(
+                &status,
+                &json!({"label":installation.label, "supervisor_pid":child.id()}),
+            )
+            .unwrap();
+            let released = std::thread::spawn(move || {
+                child.wait().unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+                drop(held);
+            });
+            stop_foreground(&installation).unwrap();
+            released.join().unwrap();
+            assert!(!active(&service).unwrap());
+        }
+        #[test]
+        fn repeated_log_rotation_replaces_only_the_previous_private_log() {
+            let (_temporary, options) = fixture();
+            let service = service_dir(&options.home, true).unwrap();
+            for byte in [b'a', b'b'] {
+                let path = service.join("events.log");
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                file.set_len(LOG_LIMIT).unwrap();
+                fs::write(&path, vec![byte; LOG_LIMIT as usize]).unwrap();
+                event(&service, json!({"kind":"rotation"})).unwrap();
+                assert_eq!(
+                    fs::read(service.join("events.previous.log")).unwrap()[0],
+                    byte
+                );
+            }
+        }
+        #[tokio::test]
+        async fn role_restart_backoff_stable_reset_spawn_failure_and_owned_shutdown() {
+            let (_temporary, options) = fixture();
+            let service = service_dir(&options.home, true).unwrap();
+            let mut quick = role("quick", "/usr/bin/true".into(), vec![]);
+            quick.stop().await;
+            assert!(quick.tick(&service).await.unwrap());
+            quick.child.as_mut().unwrap().wait().await.unwrap();
+            assert!(quick.tick(&service).await.unwrap());
+            assert_eq!(quick.last_exit, Some(0));
+            assert_eq!(quick.delay, 1);
+            assert!(!quick.tick(&service).await.unwrap());
+            quick.next = Instant::now();
+            quick.tick(&service).await.unwrap();
+            quick.child.as_mut().unwrap().wait().await.unwrap();
+            quick.started = Some(Instant::now() - Duration::from_secs(31));
+            quick.delay = 30;
+            quick.tick(&service).await.unwrap();
+            assert_eq!(quick.delay, 1);
+            let mut failed = role("missing", options.home.join("no-executable"), vec![]);
+            failed.delay = 30;
+            assert!(failed.tick(&service).await.unwrap());
+            assert_eq!(failed.delay, 30);
+            assert_eq!(failed.starts, 0);
+            let mut signaled = role("signaled", "/bin/sleep".into(), vec!["30".into()]);
+            signaled.tick(&service).await.unwrap();
+            signaled.child.as_mut().unwrap().start_kill().unwrap();
+            signaled.child.as_mut().unwrap().wait().await.unwrap();
+            signaled.tick(&service).await.unwrap();
+            assert!(signaled.last_exit.unwrap() < 0);
+            let mut normal = role("normal", "/bin/sleep".into(), vec!["30".into()]);
+            normal.tick(&service).await.unwrap();
+            normal.stop().await;
+            assert!(normal.child.is_none());
+            let marker = service.join("ignoring-term");
+            let mut stubborn = role(
+                "stubborn",
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "trap '' TERM; : > \"$1\"; exec /bin/sleep 30".into(),
+                    "test-role".into(),
+                    marker.display().to_string(),
+                ],
+            );
+            stubborn.tick(&service).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            stubborn.stop().await;
+            assert!(stubborn.child.is_none());
+            let events = fs::read_to_string(service.join("events.log")).unwrap();
+            for kind in ["child_started", "child_exited", "spawn_failed"] {
+                assert!(events.contains(kind));
+            }
+        }
+        #[tokio::test]
+        async fn supervisor_refuses_existing_owners_and_runs_only_synthetic_roles() {
+            let (_temporary, mut options) = fixture();
+            let fake = Fake::default();
+            install(&options, false, &fake).unwrap();
+            assert!(run(&options.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("installed service executable"));
+            options.executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+            install(&options, false, &fake).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(options.ipc_root.join("bridge.sock"))
+                    .unwrap();
+            assert!(run(&options.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("existing broker"));
+            drop(listener);
+            fs::remove_file(options.ipc_root.join("bridge.sock")).unwrap();
+            let store = crate::state::Store::open(options.home.clone()).unwrap();
+            assert!(run(&options.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another manual client"));
+            drop(store);
+            run_with(&options.home, || {
+                Ok(async { tokio::time::sleep(Duration::from_millis(20)).await })
+            })
+            .await
+            .unwrap();
+            let installation = load(&options.home).unwrap();
+            let script = options.home.join("synthetic-role");
+            fs::write(&script, b"#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let app = options.home.join("Synthetic.app");
+            let watcher = app.join("Contents/MacOS/RDriveCompanion");
+            fs::create_dir_all(watcher.parent().unwrap()).unwrap();
+            fs::copy(&script, &watcher).unwrap();
+            let mut synthetic = installation.clone();
+            synthetic.options.executable = script;
+            synthetic.options.app = Some(app);
+            fs::remove_file(options.home.join("client.lock")).unwrap();
+            supervise(&synthetic, || {
+                Ok(async { tokio::time::sleep(Duration::from_millis(330)).await })
+            })
+            .await
+            .unwrap();
+            let runtime: Value = read(
+                &service_dir(&options.home, false)
+                    .unwrap()
+                    .join("status.json"),
+            )
+            .unwrap();
+            assert_eq!(runtime["state"], "stopped");
+            assert_eq!(runtime["children"]["broker"]["starts"], 1);
+            assert_eq!(runtime["children"]["native_watcher"]["starts"], 1);
+            assert!(runtime["children"]["broker"]["pid"].is_null());
+            let shutdown = shutdown_signal().unwrap();
+            let sender = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                // Only this test harness receives its registered signal.
+                assert_eq!(
+                    unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
+                    0
+                );
+            });
+            tokio::time::timeout(Duration::from_secs(1), shutdown)
+                .await
+                .unwrap();
+            sender.await.unwrap();
+        }
+        #[tokio::test]
+        async fn public_entrypoints_use_only_private_plans_and_readonly_launchctl() {
+            let (_temporary, options) = fixture();
+            assert_eq!(
+                crate::service::install(&options, true).unwrap()["dry_run"],
+                true
+            );
+            install(&options, false, &Fake::default()).unwrap();
+            assert_eq!(
+                crate::service::action(&options.home, ServiceAction::Start, true).unwrap()
+                    ["dry_run"],
+                true
+            );
+            assert_eq!(
+                crate::service::status(&options.home).unwrap()["installed"],
+                true
+            );
+            assert!(crate::service::run(&options.home).await.is_err());
+            let configuration: config::Config = serde_json::from_value(json!({"profiles":{
+                "env": {"protocol":"webdav", "url":"https://example.invalid", "password_env":"RDRIVE_SYNTHETIC_UNSET_SERVICE_PASSWORD"},
+                "keychain": {"protocol":"webdav", "url":"https://example.invalid"}
+            }})).unwrap();
+            write(&options.home.join("config.json"), &configuration).unwrap();
+            let diagnostics = credential_diagnostics(&options.home).unwrap();
+            assert_eq!(
+                diagnostics["environment_profiles"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                diagnostics["environment_profiles"][0]["variable"],
+                "RDRIVE_SYNTHETIC_UNSET_SERVICE_PASSWORD"
+            );
+            let installation = load(&options.home).unwrap();
+            let fake = Fake::default();
+            *fake.output.lock().unwrap() = Some(format!(
+                "{}unstructured-line\n",
+                owned_job(&installation, true)
+            ));
+            assert!(job(&installation, &fake).unwrap().managed);
+            let service = service_dir(&options.home, false).unwrap();
+            write(&service.join("status.json"), &json!({"state":"synthetic"})).unwrap();
+            assert_eq!(
+                status(&options.home, &fake).unwrap()["runtime"]["state"],
+                "synthetic"
+            );
+        }
+        #[test]
+        fn installation_and_bootstrap_errors_are_returned_without_service_mutation() {
+            let (_temporary, options) = fixture();
+            assert!(
+                install_with(&options, false, &Fake::default(), |_, _, _| bail!(
+                    "synthetic directory failure"
+                ))
+                .unwrap_err()
+                .to_string()
+                .contains("synthetic directory failure")
+            );
+            let fake = Fake::default();
+            install(&options, false, &fake).unwrap();
+            struct BootstrapFailure;
+            impl Launchctl for BootstrapFailure {
+                fn invoke(&self, args: &[String]) -> Result<CommandOutput> {
+                    Ok(CommandOutput {
+                        code: if args[0] == "print" { 113 } else { 29 },
+                        stdout: String::new(),
+                    })
+                }
+            }
+            assert!(action(
+                &options.home,
+                ServiceAction::Start,
+                false,
+                &BootstrapFailure
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bootstrap failed"));
+        }
+        #[tokio::test]
+        async fn role_event_failures_propagate_at_every_transition() {
+            let (_temporary, options) = fixture();
+            let service = service_dir(&options.home, true).unwrap();
+            let log = service.join("events.log");
+            fs::create_dir(&log).unwrap();
+            let mut starting = role("start-error", "/bin/sleep".into(), vec!["30".into()]);
+            assert!(starting.tick(&service).await.is_err());
+            starting.stop().await;
+            let mut missing = role("spawn-error", options.home.join("missing"), vec![]);
+            assert!(missing.tick(&service).await.is_err());
+            fs::remove_dir(&log).unwrap();
+            let mut exiting = role("exit-error", "/usr/bin/true".into(), vec![]);
+            exiting.tick(&service).await.unwrap();
+            exiting.child.as_mut().unwrap().wait().await.unwrap();
+            fs::remove_file(&log).unwrap();
+            fs::create_dir(&log).unwrap();
+            assert!(exiting.tick(&service).await.is_err());
+        }
+        #[tokio::test]
+        async fn supervisor_persistence_errors_propagate_at_start_heartbeat_and_stop() {
+            let (_temporary, options) = fixture();
+            let installation = planned(&options, false).unwrap();
+            // A marker executable deliberately fails to spawn; no external
+            // service, native app, or domain can be activated by these cases.
+            for failed_event in ["supervisor_started", "supervisor_stopped"] {
+                let result = supervise_with(
+                    &installation,
+                    || Ok(async {}),
+                    |_, value| {
+                        if value["kind"] == failed_event {
+                            bail!("synthetic event failure");
+                        }
+                        Ok(())
+                    },
+                    |_, _| Ok(()),
+                )
+                .await;
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("synthetic event failure"));
+            }
+            for failed_write in 1..=3 {
+                let mut writes = 0;
+                let result = supervise_with(
+                    &installation,
+                    || Ok(async {}),
+                    |_, _| Ok(()),
+                    |_, _| {
+                        writes += 1;
+                        if writes == failed_write {
+                            bail!("synthetic status failure");
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("synthetic status failure"));
+                assert_eq!(writes, failed_write);
+            }
         }
     }
 }

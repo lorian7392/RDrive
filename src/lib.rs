@@ -1,3 +1,6 @@
+#[cfg(test)]
+extern crate self as rdrive;
+
 pub mod backend;
 pub mod config;
 pub mod mount;

@@ -97,7 +97,7 @@ async fn absent_or_failed_metadata_preserves_cached_intent_but_explicit_empty_cl
 
 #[test]
 fn unknown_sidecar_allows_guarded_create_but_existing_metadata_keeps_fresh_version_check(){
-    let (_temp,_store,d,_j)=setup();let mut item=root_item(&d);item.id="doc".into();item.name="doc".into();item.kind="file".into();item.content_version="current-file".into();item.tag_data_hex=Some("aa".into());item.metadata_version=metadata_version("doc",&item.tag_data_hex,&item.extended_attributes,false).unwrap();
+    let (_temp,_store,d,_j)=setup();let mut item=root_item(&d);item.id="doc".into();item.name="doc".into();item.kind="file".into();item.content_version="current-file".into();item.tag_data_hex=Some("aa".into());item.metadata_version=metadata_version("doc",&item.tag_data_hex,&item.extended_attributes,false);
     let request:Request=serde_json::from_value(json!({"v":1,"op":"modify","id":"doc","domain":d.id,"base_content_version":item.content_version,"base_metadata_version":item.metadata_version})).unwrap();
     assert!(check_base(&request,&item).is_ok(),"the initial displayed snapshot must still match");assert!(check_fresh_metadata_base(&request,"doc",false,None).is_ok(),"unknown metadata uses expected=None publication, not an invented empty metadata version");
     let mut record=crate::metadata::MetadataRecord{version:1,content_sha256:"0".repeat(64),attributes:BTreeMap::from([("com.apple.metadata:_kMDItemUserTags".into(),"bb".into())]),selection:crate::metadata::MetadataPolicy::default().include,excluded:vec![]};

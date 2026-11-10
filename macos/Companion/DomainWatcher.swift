@@ -17,23 +17,30 @@ final class NativeDomainWatcher {
     private var lastRequests: [String: Date] = [:]
     private var lastSweep = Date.distantPast
 
-    init(bridge: BackendBridge) { self.bridge = bridge }
+    private let system: NativeSystemManaging
+    private let timeout: TimeInterval
+    private let now: () -> Date
+    init(bridge: BackendBridge, system: NativeSystemManaging = NativeSystemManager(),
+         timeout: TimeInterval = 20, now: @escaping () -> Date = Date.init) {
+        self.bridge = bridge; self.system = system; self.timeout = timeout; self.now = now
+    }
     func stop() { lock.lock(); stopped = true; lock.unlock(); operation.cancel() }
-    func poll() {
+    func poll(completion: ((Error?) -> Void)? = nil) {
         lock.lock()
-        guard !busy && !stopped else { lock.unlock(); return }
+        guard !busy && !stopped else { lock.unlock(); completion?(nil); return }
         busy = true; lock.unlock()
         queue.async {
-            defer { self.lock.lock(); self.busy = false; self.lock.unlock() }
+            var failure: Error?
+            defer { self.lock.lock(); self.busy = false; self.lock.unlock(); completion?(failure) }
             do { try self.tick() }
-            catch { nativeDevelopmentLog("Native domain watcher: \(error)") }
+            catch { nativeDevelopmentLog("Native domain watcher: \(error)"); failure = error }
         }
     }
     private func domains() throws -> [NSFileProviderDomain] {
         let done = DispatchSemaphore(value: 0)
         var result: [NSFileProviderDomain] = []; var failure: Error?
-        NSFileProviderManager.getDomainsWithCompletionHandler { result = $0; failure = $1; done.signal() }
-        guard done.wait(timeout: .now() + 20) == .success else { throw NativeFailure.bridge("The native domain list timed out.") }
+        system.domains { result = $0; failure = $1; done.signal() }
+        guard done.wait(timeout: .now() + timeout) == .success else { throw NativeFailure.bridge("The native domain list timed out.") }
         if let failure = failure { throw failure }
         return result
     }
@@ -44,7 +51,7 @@ final class NativeDomainWatcher {
         for domain in try domains() where smart.contains(domain.identifier.rawValue) {
             try operation.check()
             let id = domain.identifier.rawValue
-            guard let manager = NSFileProviderManager(for: domain) else { throw NativeFailure.bridge("A Smart Finder domain manager is unavailable.") }
+            guard let manager = system.manager(for: domain) else { throw NativeFailure.bridge("A Smart Finder domain manager is unavailable.") }
             let reply: [String: Any]
             if let anchor = anchors[id] {
                 do { reply = try bridge.request(["op": "changes", "domain": id, "anchor": anchor, "parent_id": "working_set"], operation: operation) }
@@ -91,18 +98,18 @@ final class NativeDomainWatcher {
             var scheduled = 0
             for item in (pendingPins[id] ?? [:]).values.sorted(by: { $0.id < $1.id }) {
                 let key = id + "\n" + item.id
-                guard Date().timeIntervalSince(lastRequests[key] ?? .distantPast) >= 15 else { continue }
+                guard now().timeIntervalSince(lastRequests[key] ?? .distantPast) >= 15 else { continue }
                 guard scheduled < 4 else { break }
-                scheduled += 1; lastRequests[key] = Date()
+                scheduled += 1; lastRequests[key] = now()
                 // This only schedules the OS request. The authoritative
                 // fetchContents callback owns admission and its unique lease;
                 // scheduling must never duplicate an in-flight reservation.
                 manager.requestDownloadForItem(withIdentifier: providerID(item.id)) { _ in }
             }
         }
-        if !smart.isEmpty && Date().timeIntervalSince(lastSweep) >= 15 {
-            try NativeMaterializationBudget(bridge: bridge, domain: "").sweep(operation: operation)
-            lastSweep = Date()
+        if !smart.isEmpty && now().timeIntervalSince(lastSweep) >= 15 {
+            try NativeMaterializationBudget(bridge: bridge, domain: "", system: system, timeout: timeout, now: now).sweep(operation: operation)
+            lastSweep = now()
         }
     }
 }

@@ -7,6 +7,10 @@ use std::{collections::BTreeMap,path::Path,sync::Arc};
 #[derive(Debug,Serialize)]pub struct ScheduleReport {pub results:Vec<JobResult>,pub failed:usize,pub concurrency:usize}
 enum Event {Start{job:Job,ack:tokio::sync::oneshot::Sender<std::result::Result<(),String>>},Finish{id:String,error:Option<String>}}
 pub async fn run(store:&mut Store,profile:Option<&str>,jobs:usize,retry_failed:bool,retry_overwrite:bool,context:TransferContext)->Result<ScheduleReport>{
+    run_with_connector(store,profile,jobs,retry_failed,retry_overwrite,context,|p,name,context|async move{factory::connect(&p,&name,context).await}).await
+}
+pub(crate) async fn run_with_connector<F,C>(store:&mut Store,profile:Option<&str>,jobs:usize,retry_failed:bool,retry_overwrite:bool,context:TransferContext,connect:F)->Result<ScheduleReport>
+where F:Fn(crate::config::Profile,String,TransferContext)->C+Clone+Send+Sync+'static,C:std::future::Future<Output=Result<Arc<dyn crate::backend::Backend>>>+Send {
     if jobs==0||jobs>64{bail!("jobs must be between 1 and 64");}
     let mut targets=BTreeMap::<String,Vec<(Job,crate::config::Profile)>>::new();let mut results=Vec::new();
     for job in &store.db.jobs {
@@ -19,12 +23,12 @@ pub async fn run(store:&mut Store,profile:Option<&str>,jobs:usize,retry_failed:b
     let semaphore=Arc::new(tokio::sync::Semaphore::new(jobs));let mut workers=tokio::task::JoinSet::new();
     let (send,mut recv)=tokio::sync::mpsc::channel::<Event>(128);
     for (_target,group) in targets {
-        let semaphore=semaphore.clone();let send=send.clone();let home=store.home.clone();let context=context.clone();
+        let semaphore=semaphore.clone();let send=send.clone();let home=store.home.clone();let context=context.clone();let connect=connect.clone();
         workers.spawn(async move {
             let _permit=semaphore.acquire_owned().await.context("scheduler cancelled")?;
             for (mut job,p) in group {
                 let result=async {
-                    let b=factory::connect(&p,&job.profile,context.scoped(&job.id)).await?;
+                    let b=connect(p,job.profile.clone(),context.scoped(&job.id)).await?;
                     let source=home.join("spool").join(&job.snapshot);
                     if state::fingerprint(&source)?!=job.sha256{bail!("upload snapshot checksum mismatch");}
                     if job.version&&!job.version_prepared {

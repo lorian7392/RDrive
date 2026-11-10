@@ -1,0 +1,563 @@
+{
+  "metric": "Unique physical executable production source lines; tests, dependencies and generated code excluded. No production adapters or error paths excluded.",
+  "scope": "All src Rust on the measured target, all macOS production Swift, four distributed Python scripts. Test and development infrastructure is outside application scope.",
+  "rust_branch_coverage": "not measured; stable LLVM line instrumentation does not collect Rust branches",
+  "inputs": {
+    "rust_lcov": "target/coverage/acceptance-rust-3/coverage.lcov",
+    "rust_test_spans": "target/coverage/acceptance-rust-3/test-spans.json",
+    "swift_lcov": "target/native-tests-final-verified/coverage.lcov",
+    "python_json": [
+      "target/coverage/acceptance-python.json"
+    ]
+  },
+  "total": {
+    "lines": 17957,
+    "covered": 17957,
+    "percent": 100.0,
+    "scope_complete": true,
+    "not_instrumented": []
+  },
+  "languages": {
+    "rust": {
+      "lines": 15803,
+      "covered": 15803,
+      "percent": 100.0,
+      "scope_complete": true,
+      "not_instrumented": [],
+      "files": [
+        {
+          "file": "src/backend.rs",
+          "sha256": "0083c17a7fc0cccf7e057c144cc618e9cf1dfb1d324eac767fc4bfd4511abd04",
+          "status": "instrumented",
+          "lines": 101,
+          "covered": 101,
+          "missing": []
+        },
+        {
+          "file": "src/cache.rs",
+          "sha256": "210227c81ad95f11c7a478c18fae6bfe723d37d34b414d3db7b442552b01488d",
+          "status": "instrumented",
+          "lines": 762,
+          "covered": 762,
+          "missing": []
+        },
+        {
+          "file": "src/cache_directory.rs",
+          "sha256": "d4a73a136d4af980f1380592df492c9eafd3425d98dd52c4c031437ac4cdf017",
+          "status": "instrumented",
+          "lines": 524,
+          "covered": 524,
+          "missing": []
+        },
+        {
+          "file": "src/config.rs",
+          "sha256": "54c6e0901cf755bfb8da13a7fa155127c10ac8f8ffcfa927205d1c6ef7c2d661",
+          "status": "instrumented",
+          "lines": 97,
+          "covered": 97,
+          "missing": []
+        },
+        {
+          "file": "src/factory.rs",
+          "sha256": "c682f09a9760253f6ba289a0a5ac3b5167e257ac3cfe28220ee7d3fc2ddf67d8",
+          "status": "instrumented",
+          "lines": 6,
+          "covered": 6,
+          "missing": []
+        },
+        {
+          "file": "src/filtering.rs",
+          "sha256": "cdacfe57f2f0c019a26f5d6ad666cfb68b6210979afbabeb321ae17dab4612c4",
+          "status": "instrumented",
+          "lines": 110,
+          "covered": 110,
+          "missing": []
+        },
+        {
+          "file": "src/lib.rs",
+          "sha256": "c8dbffe332cbfb51ed361d1a81933f96845e72b4e0d5817e6b78de559da646fe",
+          "status": "no_executable_items",
+          "lines": 0,
+          "covered": 0,
+          "missing": []
+        },
+        {
+          "file": "src/main.rs",
+          "sha256": "c49ab8f4a80ce8e691da9cdee489831b8b998d1d335d1e71e671538dbd85cc54",
+          "status": "instrumented",
+          "lines": 771,
+          "covered": 771,
+          "missing": []
+        },
+        {
+          "file": "src/mcp/catalog.rs",
+          "sha256": "e971f31ef511916b6d5ff3b71e2a5d43c0e8cedeee28be96c3e50f4dae643758",
+          "status": "instrumented",
+          "lines": 382,
+          "covered": 382,
+          "missing": []
+        },
+        {
+          "file": "src/mcp.rs",
+          "sha256": "e722f9ae2414c95701d68e096297010fe4d987392b24ce77037cbd8b37ab7c92",
+          "status": "instrumented",
+          "lines": 446,
+          "covered": 446,
+          "missing": []
+        },
+        {
+          "file": "src/metadata.rs",
+          "sha256": "4c097b0d4a0fd2e7bf4aa8b3bf1ddaefb1435ec8311a15fe7eb10798ce1a05b0",
+          "status": "instrumented",
+          "lines": 543,
+          "covered": 543,
+          "missing": []
+        },
+        {
+          "file": "src/metadata_remote.rs",
+          "sha256": "cac84fe05900b3f131bb9b6a180474fae1bfe01d97af085f623b35213caad407",
+          "status": "instrumented",
+          "lines": 653,
+          "covered": 653,
+          "missing": []
+        },
+        {
+          "file": "src/mount.rs",
+          "sha256": "490cac4e2c5d6bffe018abee6bbd4f8bdfed1c0ea7910d611cd5c3d4bd98a971",
+          "status": "instrumented",
+          "lines": 562,
+          "covered": 562,
+          "missing": []
+        },
+        {
+          "file": "src/operations.rs",
+          "sha256": "c4479bba8a0d66e26c8adef8a07dcb560217db3997a7f919340f00eda3d87fc9",
+          "status": "instrumented",
+          "lines": 454,
+          "covered": 454,
+          "missing": []
+        },
+        {
+          "file": "src/policies.rs",
+          "sha256": "ca00bc8bcdf985bcf5c956a907592c8d16f82a46a25e0f78b6dfa804aecf7e8b",
+          "status": "instrumented",
+          "lines": 217,
+          "covered": 217,
+          "missing": []
+        },
+        {
+          "file": "src/provider/index.rs",
+          "sha256": "adcbef6330a89ee2cff4a629e86d13d771d84f2a53719a7a455ec20ca5d0e263",
+          "status": "instrumented",
+          "lines": 732,
+          "covered": 732,
+          "missing": []
+        },
+        {
+          "file": "src/provider/index_scheduler.rs",
+          "sha256": "67fa7affe82d6d0e61d0fab92955827686012f6fa3b8ae9954ad815cb9976947",
+          "status": "instrumented",
+          "lines": 236,
+          "covered": 236,
+          "missing": []
+        },
+        {
+          "file": "src/provider/namespace.rs",
+          "sha256": "f98b2222b622e8043a88bb2d78dc428252fd90b48c6858a35763dcd31ee1c380",
+          "status": "instrumented",
+          "lines": 509,
+          "covered": 509,
+          "missing": []
+        },
+        {
+          "file": "src/provider/resolution.rs",
+          "sha256": "a7f22b79892098196c1585dc0cfd801cb688b053ee81431068585189cdbe23d0",
+          "status": "instrumented",
+          "lines": 265,
+          "covered": 265,
+          "missing": []
+        },
+        {
+          "file": "src/provider.rs",
+          "sha256": "e3669641acfe8188a881ac3fa2e75225b00ddc947ce30f00d0b417719c08e303",
+          "status": "instrumented",
+          "lines": 815,
+          "covered": 815,
+          "missing": []
+        },
+        {
+          "file": "src/repository.rs",
+          "sha256": "61781aee94910b31f33d3b049c4383bef88d452e5eba649a8e3c896adb574db6",
+          "status": "instrumented",
+          "lines": 135,
+          "covered": 135,
+          "missing": []
+        },
+        {
+          "file": "src/resume.rs",
+          "sha256": "54b58343dce017183ec114b3f6908dc4780c0a63c9a1a9a3f4cf41ba9d1a0816",
+          "status": "instrumented",
+          "lines": 384,
+          "covered": 384,
+          "missing": []
+        },
+        {
+          "file": "src/scheduler.rs",
+          "sha256": "310feda8daf474c93a4938dc84cd215d69b5e064663cbd364c51101430463cea",
+          "status": "instrumented",
+          "lines": 58,
+          "covered": 58,
+          "missing": []
+        },
+        {
+          "file": "src/service.rs",
+          "sha256": "26c5137975d8ff9d4b60a77386498aa7a78a3f10c44e62f86f30d060b088be94",
+          "status": "instrumented",
+          "lines": 845,
+          "covered": 845,
+          "missing": []
+        },
+        {
+          "file": "src/smart.rs",
+          "sha256": "97bbcb72ad135337eb61bdd1c6129f81eb3bc0eda92a42bec7f859f1f1493a34",
+          "status": "instrumented",
+          "lines": 928,
+          "covered": 928,
+          "missing": []
+        },
+        {
+          "file": "src/smb.rs",
+          "sha256": "1fae62fbf419c1e3ad9a8f134f00fc5801501332af8f59c084ebb10a09a864de",
+          "status": "instrumented",
+          "lines": 2118,
+          "covered": 2118,
+          "missing": []
+        },
+        {
+          "file": "src/state.rs",
+          "sha256": "0a56dbcc008d5a2efb91e85e50c9b6179d07c555acf09e70d097bffdb586267b",
+          "status": "instrumented",
+          "lines": 254,
+          "covered": 254,
+          "missing": []
+        },
+        {
+          "file": "src/sync.rs",
+          "sha256": "a65706636399f35fcf950d12122532b79ff542756c6afd536d1bd9d34e8121af",
+          "status": "instrumented",
+          "lines": 970,
+          "covered": 970,
+          "missing": []
+        },
+        {
+          "file": "src/transfer.rs",
+          "sha256": "fa39507f59c294a0268b499106fd2b60ba22eb820818ee3ba1fddc5b029eecde",
+          "status": "instrumented",
+          "lines": 434,
+          "covered": 434,
+          "missing": []
+        },
+        {
+          "file": "src/webdav.rs",
+          "sha256": "14a7fdac462040cf68320ef5ec0d75c7ce4393d9ee65797acb2b1bc94737626f",
+          "status": "instrumented",
+          "lines": 1492,
+          "covered": 1492,
+          "missing": []
+        }
+      ]
+    },
+    "swift": {
+      "lines": 1863,
+      "covered": 1863,
+      "percent": 100.0,
+      "scope_complete": true,
+      "not_instrumented": [],
+      "files": [
+        {
+          "file": "macos/Companion/DomainWatcher.swift",
+          "sha256": "d5b2a762fbce99b0ae7fed42f2d705357fe596c187c22398d0f02f56330a8d03",
+          "status": "instrumented",
+          "lines": 102,
+          "covered": 102,
+          "missing": []
+        },
+        {
+          "file": "macos/Companion/main.swift",
+          "sha256": "12b378f68992c48b0c43db1a3e042d925b6f53b73d0c2369e9308be26add8323",
+          "status": "instrumented",
+          "lines": 396,
+          "covered": 396,
+          "missing": []
+        },
+        {
+          "file": "macos/FileProvider/Enumerator.swift",
+          "sha256": "ecb93b3f324fcc12f79dac12638f0952203ad862af7055ca9327dadfd7cff4c4",
+          "status": "instrumented",
+          "lines": 75,
+          "covered": 75,
+          "missing": []
+        },
+        {
+          "file": "macos/FileProvider/Provider.swift",
+          "sha256": "8edc199da50ab5777242c0fd169b0920f23e11de4d3230677209222bed3fc247",
+          "status": "instrumented",
+          "lines": 257,
+          "covered": 257,
+          "missing": []
+        },
+        {
+          "file": "macos/FileProvider/ProviderItem.swift",
+          "sha256": "15920c93818c9b54169a1b778f6bb512f7670a3d749ee8d2387e611a72f5db6c",
+          "status": "instrumented",
+          "lines": 70,
+          "covered": 70,
+          "missing": []
+        },
+        {
+          "file": "macos/FileProviderUI/StatusViewController.swift",
+          "sha256": "6f0d278c3b26d608dd1ded6be279f4f71eccdb88069b808c4b7e3b2bd715118a",
+          "status": "instrumented",
+          "lines": 96,
+          "covered": 96,
+          "missing": []
+        },
+        {
+          "file": "macos/FinderSync/FinderSync.swift",
+          "sha256": "9a0be29a85eaa4ccff5cec0fc1ec732fc4fb8b1539573bd64b2699d7e2b8aae9",
+          "status": "instrumented",
+          "lines": 201,
+          "covered": 201,
+          "missing": []
+        },
+        {
+          "file": "macos/Shared/Bridge.swift",
+          "sha256": "615b42894e7a8cf516dc7eb8601f6d81cbfcb5e3e6ea83dc5c16d54bec1f861c",
+          "status": "instrumented",
+          "lines": 290,
+          "covered": 290,
+          "missing": []
+        },
+        {
+          "file": "macos/Shared/NativeBudget.swift",
+          "sha256": "859a751d01774458061db31dc733eebf75d9b5e658c2ff69278a5364c3bea7fc",
+          "status": "instrumented",
+          "lines": 337,
+          "covered": 337,
+          "missing": []
+        },
+        {
+          "file": "macos/Shared/TagData.swift",
+          "sha256": "1811dc7b9db9b46a682b5e3213fc60f219c17ab5a95d91145ba22b6b64870cfc",
+          "status": "instrumented",
+          "lines": 39,
+          "covered": 39,
+          "missing": []
+        }
+      ]
+    },
+    "python": {
+      "lines": 291,
+      "covered": 291,
+      "percent": 100.0,
+      "scope_complete": true,
+      "not_instrumented": [],
+      "files": [
+        {
+          "file": "macos/build.py",
+          "sha256": "eb24d2fd88a315713daa86c40c20c9dd754d89fb33ef7883ce1da7d4120799ec",
+          "status": "instrumented",
+          "lines": 102,
+          "covered": 102,
+          "missing": [],
+          "branches": {
+            "covered": 26,
+            "count": 26
+          }
+        },
+        {
+          "file": "scripts/install-skills.py",
+          "sha256": "7707278a27f0e354da6bc0b104a387ad0fc37f30ce05ab05637f803be8d4e22a",
+          "status": "instrumented",
+          "lines": 55,
+          "covered": 55,
+          "missing": [],
+          "branches": {
+            "covered": 22,
+            "count": 22
+          }
+        },
+        {
+          "file": "scripts/mcp-config.py",
+          "sha256": "4559bc07460609d5f228b20c69af97deabb1cd7d72c61034e16a0b8149ef55ad",
+          "status": "instrumented",
+          "lines": 36,
+          "covered": 36,
+          "missing": [],
+          "branches": {
+            "covered": 14,
+            "count": 14
+          }
+        },
+        {
+          "file": "scripts/generate-cli-docs.py",
+          "sha256": "54c6fe9f74cbec45c410709b03db87eb27448d4a07db3113ce95164f940f59a5",
+          "status": "instrumented",
+          "lines": 98,
+          "covered": 98,
+          "missing": [],
+          "branches": {
+            "covered": 32,
+            "count": 32
+          }
+        }
+      ]
+    }
+  },
+  "verified_source_manifests": [
+    {
+      "path": "target/coverage/acceptance-rust-3/manifest.json",
+      "sha256": "c3def377e5c7c95b98d98442b3743a565c3db958395cc13d80af296928e6c081",
+      "verified_sources": [
+        "src/backend.rs",
+        "src/cache.rs",
+        "src/cache_directory.rs",
+        "src/config.rs",
+        "src/factory.rs",
+        "src/filtering.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/mcp.rs",
+        "src/mcp/catalog.rs",
+        "src/metadata.rs",
+        "src/metadata_remote.rs",
+        "src/mount.rs",
+        "src/operations.rs",
+        "src/policies.rs",
+        "src/provider.rs",
+        "src/provider/coverage_tests.rs",
+        "src/provider/final_coverage_tests.rs",
+        "src/provider/final_local_tests.rs",
+        "src/provider/index.rs",
+        "src/provider/index_scheduler.rs",
+        "src/provider/namespace.rs",
+        "src/provider/resolution.rs",
+        "src/provider/test_backend.rs",
+        "src/provider_scopes_tests.rs",
+        "src/repository.rs",
+        "src/resume.rs",
+        "src/scheduler.rs",
+        "src/service.rs",
+        "src/smart.rs",
+        "src/smb.rs",
+        "src/state.rs",
+        "src/sync.rs",
+        "src/transfer.rs",
+        "src/webdav.rs"
+      ],
+      "verified_artifacts": {
+        "coverage.lcov": "103bdb966933f7243ae7d4c1dd69ffbc27c98afc1c8fe6a6bebde853a65b8975",
+        "test-spans.json": "3b850f8604ff90a7e16cff5b8d0293c28ac7bbb23f0426ef9f534bd6eadcd639"
+      }
+    },
+    {
+      "path": "target/native-tests-final-verified/coverage-manifest.json",
+      "sha256": "e2b1b3640532be35ea0bdcb95b86a616402c4e74511f1e1b9089722a1d17d74e",
+      "verified_sources": [
+        "macos/Companion/DomainWatcher.swift",
+        "macos/Companion/main.swift",
+        "macos/FileProvider/Enumerator.swift",
+        "macos/FileProvider/Provider.swift",
+        "macos/FileProvider/ProviderItem.swift",
+        "macos/FileProviderUI/StatusViewController.swift",
+        "macos/FinderSync/FinderSync.swift",
+        "macos/Shared/Bridge.swift",
+        "macos/Shared/NativeBudget.swift",
+        "macos/Shared/TagData.swift"
+      ],
+      "verified_artifacts": {}
+    },
+    {
+      "path": "target/coverage/acceptance-python-source-manifest-2.json",
+      "sha256": "190c12954c6c7db554535ea98a06935641456331b659fbbbee4a15d118dd37f5",
+      "verified_sources": [
+        "macos/build.py",
+        "scripts/generate-cli-docs.py",
+        "scripts/install-skills.py",
+        "scripts/mcp-config.py"
+      ],
+      "verified_artifacts": {}
+    }
+  ],
+  "unverified_sources": [],
+  "source_provenance_complete": true,
+  "validation": {
+    "collected_at_utc": "2026-11-10T09:52:35.230052+00:00",
+    "checkout_base_commit": "0bd26d5eea1fe10f7f769c20d6183cccc6b5d4b6",
+    "source_identity": "Measured working tree; per-file SHA-256 values identify the source delivered with this report. The base commit alone does not identify the modified source.",
+    "rust_tests": {
+      "passed": 416,
+      "failed": 0,
+      "initially_ignored": 4,
+      "smb_ignored_proofs_executed": 3,
+      "native_mount_test_not_executed": 1
+    },
+    "python_tests": {
+      "passed": 59,
+      "failed": 0
+    },
+    "documentation_tests_after_whitespace_regression": {
+      "passed": 13,
+      "failed": 0
+    },
+    "coverage_scope_tests": {
+      "passed": 2,
+      "failed": 0
+    },
+    "rust_workflows": [
+      "cli",
+      "advanced",
+      "smart",
+      "namespace",
+      "provider_receipts",
+      "coverage_cli",
+      "cache_directory",
+      "mcp",
+      "index",
+      "search",
+      "policy",
+      "service",
+      "smb",
+      "smb-lifecycle",
+      "smb-provider",
+      "smb-smart"
+    ],
+    "rust_profile_files": 1127,
+    "mcp_contract": {
+      "tools": 81,
+      "fields": 186,
+      "valid_cases": 394,
+      "invalid_cases": 2392
+    },
+    "cli_contract": {
+      "leaf_commands": 97,
+      "parameter_declarations": 727,
+      "accepted_value_cases": 1034
+    },
+    "python_branches": {
+      "covered": 94,
+      "count": 94
+    },
+    "system_boundaries": "Temporary DAV/Samba services and mock OS/UI boundaries. No real customer storage, Keychain queries, mount changes, domain registration or native cache eviction.",
+    "github_actions": "Configured in this change; local acceptance does not establish a hosted workflow result.",
+    "raw_input_sha256": {
+      "target/coverage/acceptance-rust-3/coverage.lcov": "103bdb966933f7243ae7d4c1dd69ffbc27c98afc1c8fe6a6bebde853a65b8975",
+      "target/coverage/acceptance-rust-3/test-spans.json": "3b850f8604ff90a7e16cff5b8d0293c28ac7bbb23f0426ef9f534bd6eadcd639",
+      "target/coverage/acceptance-rust-3/manifest.json": "c3def377e5c7c95b98d98442b3743a565c3db958395cc13d80af296928e6c081",
+      "target/native-tests-final-verified/coverage.lcov": "4927a255143b7f4db14f4b6045f50a45fa731697c800116fc2a03d0856c014ad",
+      "target/native-tests-final-verified/coverage-manifest.json": "e2b1b3640532be35ea0bdcb95b86a616402c4e74511f1e1b9089722a1d17d74e",
+      "target/coverage/acceptance-python.json": "9cccd148f96e9e294aec072524fc83e1da4835ac6e555d6e8bff580bdbfc25c5",
+      "target/coverage/acceptance-python-source-manifest-2.json": "190c12954c6c7db554535ea98a06935641456331b659fbbbee4a15d118dd37f5"
+    }
+  }
+}

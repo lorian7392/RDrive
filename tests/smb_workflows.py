@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Isolated Samba CLI integration tests; requires Docker and network for Alpine packages.
+"""Isolated Samba CLI tests; Docker plus network for the default Alpine bootstrap.
+
+RDRIVE_SMB_IMAGE may select a local image with Samba already installed for
+offline/repeated runs. The default remains the pinned Alpine image below.
+RDRIVE_SMB_NOTIFY_ONLY=1 selects only actual CLI notification/watch tests.
 
 Only a temporary synthetic share is mounted. The container is removed even after failure.
 Usage: python3 tests/smb_workflows.py [path/to/rdrive]
@@ -12,6 +16,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -51,11 +56,96 @@ def native_xattr(path, name, value=None):
         os.close(descriptor)
 
 
+def notification_cli_workflows(binary, root, share, env):
+    """Exercise actual CLI stream/watch control flow on an isolated namespace."""
+    home = root / "notification-state"
+    local = root / "notification-local"
+    local.mkdir()
+    remote = "cli-notifications"
+    (share / remote).mkdir(mode=0o777)
+
+    def cli(*arguments):
+        result = subprocess.run([str(binary), "--home", str(home), "--json", "--progress", "off", *map(str, arguments)],
+                                env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (arguments, result.stdout, result.stderr)
+        return result
+
+    cli("profile", "add", "fixture", "--protocol", "smb", "--url", env["RDRIVE_TEST_SMB_URL"],
+        "--username", "test", "--password-env", "RDRIVE_TEST_PASSWORD", "--timeout", "15")
+
+    def messages(path):
+        data = path.read_text()
+        lines = data.splitlines() if data.endswith("\n") else data.splitlines()[:-1]
+        return [json.loads(line) for line in lines if line.strip()]
+
+    def stop(process):
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    source = root / "notification-source"
+    source.write_bytes(b"first notification bytes")
+    output = root / "notify.jsonl"
+    errors = root / "notify.stderr"
+    with output.open("w") as stdout, errors.open("w") as stderr:
+        process = subprocess.Popen([str(binary), "--home", str(home), "--json", "--progress", "off", "notify", "fixture", remote, "--count", "1"],
+                                   env=env, stdout=stdout, stderr=stderr)
+        try:
+            wait(lambda: any(event.get("kind") == "ready" for event in messages(output)), "CLI notify never registered its watch", seconds=20)
+            cli("put", "fixture", source, remote + "/first.txt")
+            assert process.wait(timeout=20) == 0, errors.read_text()
+            events = messages(output)
+            assert events[0]["kind"] == "ready", events
+            assert any(event["kind"] != "ready" and event["path"].startswith(remote + "/") for event in events), events
+        finally:
+            stop(process)
+    print("PASS actual CLI notify emits readiness and a server event, then exits after --count 1", flush=True)
+
+    output = root / "watch.jsonl"
+    errors = root / "watch.stderr"
+    with output.open("w") as stdout, errors.open("w") as stderr:
+        process = subprocess.Popen([str(binary), "--home", str(home), "--json", "--progress", "off", "watch", "fixture", str(local), remote,
+                                    "--direction", "pull", "--interval", "30"], env=env, stdout=stdout, stderr=stderr)
+        try:
+            wait(lambda: messages(output), "SMB watch never produced its read-only initial plan", seconds=20)
+            before = len(messages(output))
+            source.write_bytes(b"second notification bytes")
+            cli("put", "fixture", source, remote + "/second.txt")
+            wait(lambda: len(messages(output)) > before and any(
+                any(action.get("path") == "second.txt" for action in report.get("actions", []))
+                for report in messages(output)), "SMB watch did not plan the new file before its 30-second polling interval", seconds=15)
+            time.sleep(0.1)
+            process.send_signal(signal.SIGINT)
+            assert process.wait(timeout=10) == 0, errors.read_text()
+            assert all(report["applied"] is False for report in messages(output)), messages(output)
+            assert not any(local.iterdir()), "read-only watch changed local files"
+        finally:
+            stop(process)
+    print("PASS actual CLI SMB watch reacts to notifications, preserves read-only plans and exits on SIGINT", flush=True)
+    cli("rm", "fixture", remote, "--recursive")
+
+
 def run_tests(binary):
     docker = os.environ.get("RDRIVE_DOCKER") or shutil.which("docker")
     if not docker:
         raise RuntimeError("Docker executable not found; set RDRIVE_DOCKER")
-    image = "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f"
+    image = os.environ.get("RDRIVE_SMB_IMAGE") or "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f"
+    report_path = Path(os.environ["RDRIVE_SMB_REPORT"]).resolve() if os.environ.get("RDRIVE_SMB_REPORT") else None
+    report = {"scope": "temporary synthetic Samba storage; no real cloud, NAS or system mount", "status": "starting", "stage": "fixture-startup",
+              "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "image": image, "image_id": None, "server_version": None, "checks": []}
+
+    def record(status=None):
+        if status is not None:
+            report["status"] = status
+        if report_path is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report, indent=2) + "\n")
+
+    record()
     container = "rdrive-smb-test-" + uuid.uuid4().hex[:12]
     with tempfile.TemporaryDirectory(prefix="rdrive-smb-test-") as temporary:
         root = Path(temporary).resolve()
@@ -97,6 +187,8 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                        "--volume", f"{config}:/etc/samba/smb.conf:ro", image, "sh", "-c", setup]
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=180)
             started = True
+            report["image_id"] = subprocess.check_output([docker, "inspect", "--format", "{{.Image}}", container], text=True, timeout=10).strip()
+            record()
             deadline = time.monotonic() + 180
             while True:
                 ready = subprocess.run([docker, "exec", container, "smbcontrol", "smbd", "ping"],
@@ -111,13 +203,21 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                 time.sleep(1)
             version = subprocess.run([docker, "exec", container, "smbd", "--version"],
                                      capture_output=True, text=True, check=True).stdout.strip()
-            print(f"SERVER {version}; IMAGE {image}", flush=True)
+            report["server_version"] = version
+            report["stage"] = "workflows"
+            record("running")
+            print(f"SERVER {version}; IMAGE {image}; IMAGE_ID {report['image_id']}", flush=True)
             home = root / "state"
             env = dict(os.environ, RDRIVE_TEST_PASSWORD="testpass")
             env.pop("RDRIVE_WEBDAV_LOCK_TOKEN", None)
             env["RDRIVE_TEST_SMB_URL"] = f"smb://127.0.0.1:{port}/test"
             env["RDRIVE_TEST_SMB_CONTAINER"] = container
             env["RDRIVE_TEST_DOCKER"] = docker
+            if os.environ.get("RDRIVE_SMB_NOTIFY_ONLY") == "1":
+                notification_cli_workflows(binary, root, share, env)
+                report["checks"].extend(["CLI notify readiness, event and count=1 exit", "CLI read-only watch reacts to a new file and exits on SIGINT"])
+                record("passed")
+                return
             if runner := os.environ.get("RDRIVE_SMB_TEST_RUNNER"):
                 cases = ["guarded_smb_integration", "resumable_smb_integration"]
                 if os.environ.get("RDRIVE_SMB_LIFECYCLE") == "1":
@@ -128,7 +228,12 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                     print(result.stdout, end="", flush=True)
                     if result.returncode != 0 or "1 passed; 0 failed" not in result.stdout:
                         raise AssertionError(f"SMB runtime proof did not pass exactly one test: {case}\n{result.stderr}")
+                    report["checks"].append(case)
+                    record()
+                notification_cli_workflows(binary, root, share, env)
+                report["checks"].extend(["CLI notify readiness, event and count=1 exit", "CLI read-only watch reacts to a new file and exits on SIGINT"])
                 if os.environ.get("RDRIVE_SMB_PROOF_ONLY") == "1":
+                    record("passed")
                     return
             passed = []
 
@@ -141,6 +246,8 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
 
             def passed_test(name):
                 passed.append(name)
+                report["checks"].append(name)
+                record()
                 print("PASS " + name, flush=True)
 
             cli("profile", "add", "fixture", "--protocol", "smb", "--url", f"smb://127.0.0.1:{port}/test",
@@ -156,7 +263,9 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                 domain = "smb-own-write"
                 smart = os.environ.get("RDRIVE_SMB_SMART") == "1"
                 cli("provider", "domain-add", domain, "fixture", "provider-own-write", *(["--smart"] if smart else []))
-                with tempfile.TemporaryDirectory(prefix="rd-smb-fp-", dir="/private/tmp") as bridge_temporary:
+                # macOS needs a short canonical path for Unix IPC; Linux CI
+                # uses its own temporary directory and has no /private/tmp.
+                with tempfile.TemporaryDirectory(prefix="rd-smb-fp-", dir="/private/tmp" if sys.platform == "darwin" else None) as bridge_temporary:
                     group = Path(bridge_temporary).resolve()
                     group.chmod(0o700)
                     staging = group / "Transfers"
@@ -272,7 +381,7 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                         assert not rejected["ok"] and rejected["error"]["code"] == "version_conflict", rejected
                         assert target.read_bytes() == external
                     finally:
-                        process.terminate()
+                        process.send_signal(signal.SIGINT)
                         try:
                             stdout, stderr = process.communicate(timeout=10)
                         except subprocess.TimeoutExpired:
@@ -282,6 +391,7 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
                 mode = "Smart" if smart else "raw"
                 passed_test(f"{mode} SMB provider create/content/metadata/content receipts retain strong guards, metadata and reject external edits without refetch")
                 print(json.dumps({"passed": passed, "domain_mode": {"smart": smart, "repository": False}, "catalog_storage": "SQLite authoritative state"}, indent=2))
+                record("passed")
                 return
 
             content = bytes(range(256)) * 9001  # Several MiB, many 64 KiB chunks.
@@ -431,6 +541,12 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             assert not (root / "blocked-link-download").exists()
             print("POLICY CHECK Samba follow symlinks=no prevents access to hidden POSIX symlinks", flush=True)
             print(f"{len(passed)} SMB integration workflows passed; POSIX symlink limitation and server policy verified", flush=True)
+            report["checks"].extend(["server-transparent POSIX symlink limitation observed", "server follow-symlinks=no policy verified"])
+            record("passed")
+        except BaseException as error:
+            report["error"] = {"type": type(error).__name__, "message": str(error)}
+            record("failed")
+            raise
         finally:
             if started:
                 subprocess.run([docker, "rm", "--force", container], capture_output=True, timeout=30)

@@ -608,7 +608,7 @@ impl Queue {
             &target_path,
             &version,
             &repository_snapshot,
-        )?;
+        );
         let plan = ResolutionPlan {
             strategy,
             request,
@@ -933,7 +933,7 @@ fn validate_index(index: &Index, domain: &str, binding: &str) -> Result<()> {
                         &plan.target_path,
                         &plan.version,
                         &plan.repository_snapshot,
-                    )?
+                    )
             {
                 bail!("invalid persisted Smart resolution plan");
             }
@@ -972,8 +972,12 @@ fn resolution_fingerprint(
     target: &str,
     version: &Option<crate::operations::Version>,
     repository_snapshot: &Option<String>,
-) -> Result<String> {
-    Ok(state::key(&serde_json::to_string(&(
+) -> String {
+    // This closed schema contains only strings, integers, booleans, JSON
+    // values and derived enums/structs. It has no custom serializer or invalid
+    // map key, and an owned String writer cannot fail. Keep the original
+    // tuple/struct field order: persisted resolution fingerprints depend on it.
+    let encoded = serde_json::to_string(&(
         id,
         original,
         strategy,
@@ -981,7 +985,9 @@ fn resolution_fingerprint(
         target,
         version,
         repository_snapshot,
-    ))?))
+    ))
+    .expect("the closed resolution fingerprint schema is JSON-serializable");
+    state::key(&encoded)
 }
 fn save_index(path: &Path, index: &Index) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index)?;
@@ -1045,6 +1051,9 @@ fn open_read(path: &Path) -> Result<File> {
     Ok(file)
 }
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    read_optional_with(path, |file, bytes| Read::by_ref(file).take(MAX_INDEX + 1).read_to_end(bytes))
+}
+fn read_optional_with(path: &Path, read: impl FnOnce(&mut File,&mut Vec<u8>)->std::io::Result<usize>) -> Result<Option<Vec<u8>>> {
     let mut file = match open_read(path) {
         Ok(file) => file,
         Err(error)
@@ -1060,9 +1069,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
         bail!("Smart state exceeds 64 MiB");
     }
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_INDEX + 1)
-        .read_to_end(&mut bytes)?;
+    read(&mut file,&mut bytes)?;
     if bytes.len() as u64 > MAX_INDEX {
         bail!("Smart state grew beyond allowed size");
     }
@@ -1176,10 +1183,146 @@ fn capture_snapshot(root: &Path, source: &File, info: &SnapshotInfo) -> Result<(
 }
 
 #[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use serde_json::json;
+    fn setup()->(tempfile::TempDir,Store,Queue,Mutation) {
+        let temp=tempfile::tempdir().unwrap();let store=Store::open(temp.path().join("state")).unwrap();let mut queue=Queue::open(&store,"domain",&"a".repeat(64)).unwrap();
+        let source=temp.path().join("source");fs::write(&source,b"retained content").unwrap();
+        let mutation=queue.enqueue(json!({"v":1,"op":"modify","domain":"domain","id":"file","request_id":"first","base_content_version":"c","base_metadata_version":"m"}),Some(&File::open(source).unwrap())).unwrap();
+        (temp,store,queue,mutation)
+    }
+    #[test]
+    fn every_state_has_a_stable_external_name_and_requests_reject_unsafe_fields() {
+        for (state,name,active) in [(MutationState::Pending,"pending",true),(MutationState::Running,"running",true),(MutationState::Interrupted,"interrupted",true),(MutationState::Conflict,"conflict",true),(MutationState::Failed,"failed",true),(MutationState::Done,"done",false),(MutationState::Cancelled,"cancelled",false),(MutationState::Superseded,"superseded",false)] {assert_eq!(state.as_str(),name);assert_eq!(state.active(),active);}
+        let request=json!({"v":1,"op":"modify","domain":"domain","id":"file","request_id":"first","base_content_version":"c","base_metadata_version":"m"});
+        for (field,value) in [("domain",json!("wrong")),("v",json!(2)),("op",json!("list")),("id",json!("")),("request_id",json!("bad\n")),("smart_origin_id",json!(4)),("smart_origin_id",json!("")),("name",json!(4)),("name",json!("parent/child"))] {
+            let mut invalid=request.clone();invalid[field]=value;assert!(sanitize_request(invalid,"domain").is_err());
+        }
+        assert!(sanitize_request(json!(null),"domain").is_err());
+        let mut huge=request;huge["extended_attributes"]=json!({"user.large#S":"0".repeat(MAX_REQUEST)});assert!(sanitize_request(huge,"domain").is_err());
+    }
+    #[test]
+    fn journal_corruption_cannot_invent_receipts_snapshots_resolution_or_supersession() {
+        let (_temp,_store,queue,mutation)=setup();let base=queue.index.clone();
+        let check=|index:&Index|assert!(validate_index(index,"domain",&"a".repeat(64)).is_err());
+        let mut bad=base.clone();bad.version=2;check(&bad);
+        let mut bad=base.clone();bad.mutations.get_mut(&mutation.id).unwrap().id="wrong".into();check(&bad);
+        let mut bad=base.clone();bad.mutations.get_mut(&mutation.id).unwrap().snapshot.as_mut().unwrap().file="../escape".into();check(&bad);
+        let mut bad=base.clone();let item=bad.mutations.get_mut(&mutation.id).unwrap();item.snapshot=None;item.payload_discarded=true;check(&bad);
+        let mut bad=base.clone();bad.mutations.get_mut(&mutation.id).unwrap().fingerprint="wrong".into();check(&bad);
+        let mut bad=base.clone();bad.mutations.get_mut(&mutation.id).unwrap().state=MutationState::Done;check(&bad);
+        let mut bad=base.clone();let item=bad.mutations.get_mut(&mutation.id).unwrap();item.state=MutationState::Superseded;item.superseded_by=Some(item.id.clone());check(&bad);
+        for (strategy,repository) in [(crate::policies::ConflictStrategy::Stop,None),(crate::policies::ConflictStrategy::Replace,None),(crate::policies::ConflictStrategy::Replace,Some("invalid".to_owned()))] {
+            let mut bad=base.clone();let item=bad.mutations.get_mut(&mutation.id).unwrap();
+            let mut plan=crate::policies::ResolutionPlan{strategy,request:item.request.clone(),target_path:"file".into(),version:None,repository_snapshot:repository,fingerprint:String::new(),created:state::now()};
+            plan.fingerprint=resolution_fingerprint(&item.id,&item.fingerprint,plan.strategy,&plan.request,&plan.target_path,&plan.version,&plan.repository_snapshot);item.resolution=Some(plan);check(&bad);
+        }
+        let mut bad=base;bad.mutations.get_mut(&mutation.id).unwrap().request["auth_token"]=json!("must-not-persist");check(&bad);
+    }
+    #[test]
+    fn invalid_native_files_and_changed_snapshot_metadata_never_become_upload_sources() {
+        use std::os::unix::fs::symlink;
+        let (temp,store,queue,mutation)=setup();let info=mutation.snapshot.unwrap();let snapshot=queue.root.join("dirty").join(&info.file);
+        let mut wrong=info.clone();wrong.metadata.attributes.insert("user.missing".into(),"00".into());
+        assert!(verify_snapshot(&File::open(&snapshot).unwrap(),&wrong).unwrap_err().to_string().contains("metadata changed"));
+        assert!(snapshot_info("test",&File::open(temp.path()).unwrap()).is_err());
+        let source=temp.path().join("new-source");fs::write(&source,b"different data").unwrap();
+        let mut wrong=info.clone();wrong.file="new.data".into();
+        assert!(capture_snapshot(&queue.root,&File::open(&source).unwrap(),&wrong).is_err());assert!(!queue.root.join("dirty/new.data").exists());
+        let alias=queue.root.join("dirty/alias.data");symlink(&source,&alias).unwrap();wrong.file="alias.data".into();assert!(capture_snapshot(&queue.root,&File::open(&source).unwrap(),&wrong).is_err());
+        assert!(read_optional(&alias).is_err());assert!(private_file(&File::open(temp.path()).unwrap()).is_err());
+        let oversized=temp.path().join("oversized");let file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&oversized).unwrap();file.set_len(MAX_INDEX+1).unwrap();assert!(read_optional(&oversized).is_err());
+        state::atomic_json(&queue.root.parent().unwrap().join("control.json"),&json!({"version":2,"paused":false,"updated":null})).unwrap();assert!(control(&store).is_err());
+    }
+    #[test]
+    fn queue_guards_keep_confirmed_receipts_and_busy_or_pending_snapshots() {
+        let (_temp,_store,mut queue,mutation)=setup();assert_eq!(queue.domain(),"domain");assert_eq!(queue.binding(),"a".repeat(64));
+        assert!(queue.set_error(&mutation.id,"invalid pending attention").is_err());
+        assert!(queue.complete(&mutation.id,json!({})).is_err());assert!(queue.discard_snapshot(&mutation.id).is_err());
+        queue.start(&mutation.id).unwrap();assert!(queue.cancel(&mutation.id).is_err());
+        queue.complete(&mutation.id,json!({"receipt":1})).unwrap();
+        assert!(queue.fail(&mutation.id,FailureKind::Other,"should-not-replace-success").is_err());
+        assert!(queue.complete(&mutation.id,json!({"receipt":2})).is_err());assert!(queue.cancel(&mutation.id).is_err());
+        let lease=queue.snapshot(&mutation.id).unwrap().unwrap();assert!(queue.discard_snapshot(&mutation.id).is_err());drop(lease);
+        queue.discard_snapshot(&mutation.id).unwrap();queue.discard_snapshot(&mutation.id).unwrap();assert!(queue.snapshot(&mutation.id).is_err());
+    }
+    #[test]
+    fn absent_and_invalid_domains_stay_read_only_and_stopped_work_needs_explicit_retry() {
+        let (_temp,store,mut queue,mutation)=setup();
+        assert!(read_only(&store.home,"",&"a".repeat(64)).is_err());assert!(read_only(&store.home,"missing-domain",&"a".repeat(64)).unwrap().is_empty());
+        assert!(Queue::open(&store,"",&"a".repeat(64)).is_err());
+        let untouched=tempfile::tempdir().unwrap();assert!(read_only(untouched.path(),"domain",&"a".repeat(64)).unwrap().is_empty());assert!(!control_at(untouched.path()).unwrap().paused);
+        set_paused(&store,true).unwrap();assert!(queue.start(&mutation.id).unwrap_err().to_string().contains("paused"));set_paused(&store,false).unwrap();
+        queue.start(&mutation.id).unwrap();assert!(queue.start(&mutation.id).is_err());assert!(queue.retry(&mutation.id).is_err());
+        queue.complete(&mutation.id,json!({"receipt":1})).unwrap();assert_eq!(queue.complete(&mutation.id,json!({"receipt":1})).unwrap().response,Some(json!({"receipt":1})));
+        let path=queue.root.join("dirty").join(&mutation.snapshot.as_ref().unwrap().file);let file=open_read(&path).unwrap();assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);assert!(queue.snapshot(&mutation.id).err().unwrap().to_string().contains("busy"));drop(file);
+        capture_snapshot(&queue.root,&File::open(&path).unwrap(),mutation.snapshot.as_ref().unwrap()).unwrap();
+    }
+    #[test]
+    fn snapshot_inventory_counts_unmanaged_and_missing_data_without_deleting_user_bytes() {
+        let (_temp,_store,queue,mutation)=setup();let dirty=queue.root.join("dirty");let foreign=dirty.join("foreign-file");fs::write(&foreign,b"keep me").unwrap();
+        assert_eq!(queue.status().unwrap().unmanaged_snapshot_bytes,7);
+        fs::remove_file(dirty.join(mutation.snapshot.unwrap().file)).unwrap();assert_eq!(queue.status().unwrap().missing_snapshots,1);assert_eq!(fs::read(&foreign).unwrap(),b"keep me");
+        fs::create_dir(dirty.join("foreign-directory")).unwrap();assert!(queue.status().unwrap_err().to_string().contains("unsafe unexpected"));
+    }
+    #[test]
+    fn resolution_plans_reject_bad_state_missing_snapshots_and_unguarded_targets() {
+        use crate::policies::ConflictStrategy;
+        let (_temp,_store,mut queue,mutation)=setup();let original=mutation.request.clone();let create=json!({"v":1,"op":"create","domain":"domain","client_item_id":"copy","name":"copy","kind":"file"});
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::KeepBoth,create.clone(),"copy".into(),None,None,true).is_err());
+        queue.fail(&mutation.id,FailureKind::Conflict,"synthetic conflict").unwrap();
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::Stop,create.clone(),"copy".into(),None,None,true).is_err());
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::KeepBoth,original.clone(),"file".into(),None,None,true).is_err());
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::Replace,original.clone(),"file".into(),None,None,true).is_err());
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::Replace,original.clone(),"file".into(),None,Some("bad".into()),true).is_err());
+        let metadata=queue.enqueue(json!({"v":1,"op":"modify","domain":"domain","id":"metadata","request_id":"metadata","base_content_version":"c","base_metadata_version":"m"}),None).unwrap();queue.fail(&metadata.id,FailureKind::Conflict,"metadata conflict").unwrap();
+        assert!(queue.plan_resolution(&metadata.id,ConflictStrategy::KeepBoth,create.clone(),"copy".into(),None,None,true).is_err());
+        queue.plan_resolution(&mutation.id,ConflictStrategy::KeepBoth,create.clone(),"copy".into(),None,None,true).unwrap();queue.fail(&mutation.id,FailureKind::Conflict,"new external edit").unwrap();
+        assert!(queue.plan_resolution(&mutation.id,ConflictStrategy::KeepBoth,create,"copy".into(),None,None,false).is_err());
+    }
+
+    #[test]
+    fn sparse_domains_missing_snapshots_and_corrupt_creations_cannot_change_persisted_intent() {
+        let (_temp,_store,mut queue,mutation)=setup();let queue_path=queue.root.join("queue.json");let bytes=fs::read(&queue_path).unwrap();fs::remove_file(&queue_path).unwrap();assert!(read_only(&queue.home,"domain",&"a".repeat(64)).unwrap().is_empty());fs::write(&queue_path,&bytes).unwrap();fs::set_permissions(&queue_path,fs::Permissions::from_mode(0o600)).unwrap();
+        let snapshot=queue.root.join("dirty").join(&mutation.snapshot.as_ref().unwrap().file);let source=File::open(&snapshot).unwrap();
+        assert!(queue.enqueue(json!({"v":1,"op":"delete","domain":"domain","id":"file","request_id":"delete","base_content_version":"c","base_metadata_version":"m"}),Some(&source)).is_err());
+        let mut wrong=mutation.snapshot.clone().unwrap();wrong.sha256="0".repeat(64);assert!(verify_snapshot(&source,&wrong).is_err());
+        let metadata=queue.enqueue(json!({"v":1,"op":"modify","domain":"domain","id":"meta","request_id":"metadata","base_content_version":"c","base_metadata_version":"m"}),None).unwrap();assert!(queue.status().unwrap().counts["pending"]>=2);queue.cancel(&metadata.id).unwrap();queue.discard_snapshot(&metadata.id).unwrap();
+        let mut bad=queue.index.clone();bad.mutations.get_mut(&mutation.id).unwrap().payload_discarded=true;assert!(validate_index(&bad,"domain",&"a".repeat(64)).is_err());
+        let created=queue.enqueue(json!({"v":1,"op":"create","domain":"domain","client_item_id":"origin","name":"created","kind":"file"}),None).unwrap();
+        let mut bad=queue.index.clone();bad.mutations.get_mut(&created.id).unwrap().request["client_item_id"]=json!("forged");assert!(validate_index(&bad,"domain",&"a".repeat(64)).unwrap_err().to_string().contains("content-bound creation"));
+        let file=queue.root.join("foreign-file");fs::write(&file,b"bytes").unwrap();assert!(existing_private_directory(&file).is_err());assert!(existing_private_directory(&file.join("child")).is_err());
+    }
+    #[test]
+    fn growing_state_reads_and_oversized_journals_leave_the_original_index_untouched() {
+        let (_temp,_store,queue,mutation)=setup();let path=queue.root.join("queue.json");let original=fs::read(&path).unwrap();
+        assert!(read_optional_with(&path,|_,bytes|{bytes.resize(MAX_INDEX as usize+1,0);Ok(bytes.len())}).unwrap_err().to_string().contains("grew beyond"));
+        let mut large=queue.index.clone();large.mutations.get_mut(&mutation.id).unwrap().error=Some("x".repeat(MAX_INDEX as usize+1));assert!(save_index(&path,&large).unwrap_err().to_string().contains("exceeds 64 MiB"));assert_eq!(fs::read(path).unwrap(),original);
+    }
+
+}
+
+#[cfg(test)]
 mod resolution_tests {
     use super::*;
     use crate::policies::ConflictStrategy;
     use serde_json::json;
+    #[test]
+    fn resolution_fingerprint_keeps_persisted_version_encoding_compatible() {
+        let version = crate::operations::Version {
+            id: "v1".into(), path: "folder/file".into(), saved: "saved".into(),
+            original: crate::backend::Entry {
+                path: "folder/file".into(), is_dir: false, size: u64::MAX,
+                modified: Some(i64::MIN), etag: Some("revision".into()),
+            }, sha256: "hash".into(),
+        };
+        // Golden from the pre-refactor tuple/derived-struct JSON encoding,
+        // including the largest unsigned and smallest signed supported values.
+        assert_eq!(resolution_fingerprint("mutation", "original", ConflictStrategy::Replace,
+            &json!({"id":"item","op":"modify"}), "folder/file", &Some(version), &Some("repository".into())),
+            "db8e47e42c475c63b5057a10255943f52b759c2a06df7589d53868aeb163e307");
+    }
     #[test]
     fn resolution_is_durable_and_does_not_change_original_intent_or_retry_guards() {
         let temp = tempfile::tempdir().unwrap();

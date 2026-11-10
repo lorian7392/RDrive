@@ -1,5 +1,7 @@
 # MCP 与 AI 操作技能
 
+全部工具、访问权限和完整参数约束见[自动生成的 MCP 工具参考](reference/MCP.md)。本页介绍客户端连接、权限、资源和使用流程。
+
 RDrive 0.5 起在原有 CLI 上提供本地 MCP stdio 服务；0.6 增加目录索引控制，0.7 增加离线搜索、过滤、版本/冲突和用户后台服务控制。每个工具通过独立子进程调用同一个 RDrive 可执行文件，复用原有 WebDAV、SMB、缓存、同步基线和事务实现；服务等待请求期间不持有状态目录锁。后台索引的启动与升级步骤见[目录索引说明](DIRECTORY_INDEXING.md)。
 
 ## 启动
@@ -47,13 +49,16 @@ JSON 输出供使用 `mcpServers` 配置结构的客户端使用；TOML 输出�
 - 文件传输和远端修改：`download`、`upload`、`mkdir`、`copy`、`move`、`remove`。覆盖、递归删除、断点续传沿用 CLI 的显式参数和协议能力。
 - 原生挂载：`mounts`、`mount_plan`、`mount`、`unmount`。实际挂载禁止交互密码提示，SMB 需系统已有凭据；远端连接密码仍按 CLI 的协议区别处理。
 - 同步、队列及传输检查点：`sync_plan`、`sync_apply`、`queue_list`、`queue_run`、`queue_cancel`、`transfers`。计划报告与冲突报告保留结构化结果。
-- 清洁缓存：`cache_status`、`cache_list`、`cache_fetch`、`cache_get`、`cache_config`、`cache_unpin`、`cache_prune`。
-- Smart 与域：`domains`、`smart_status`、`smart_list`、`smart_pause`、`smart_resume`、`smart_retry`、`smart_cancel`、`smart_export`、`smart_run`。
-- 目录索引：`index_status`、`index_config`、`index_refresh`。刷新命令只保存请求，由已有后台服务执行。
+- 清洁缓存：`cache_status`、`cache_list`、`cache_fetch`、`cache_get`、`cache_config`、`cache_unpin`、`cache_prune`、`cache_directory`、`cache_set_directory`、`cache_clear`。清理默认预览，目录迁移保护未发送编辑、固定内容与活跃读取。
+- Smart 与域：`domains`、`smart_status`、`smart_list`、`smart_pause`、`smart_resume`、`smart_retry`、`smart_cancel`、`smart_export`、`smart_run`、`smart_resolve`、`smart_recovery`。
+- 目录索引与搜索：`index_status`、`index_config`、`index_refresh`、`index_search`。搜索读取本地索引；刷新命令只保存请求，由已有后台服务执行。
+- 过滤规则：`filter_status`、`filter_test`、`filter_config`、`filter_reset`。过滤配置不会删除被排除的远端文件或未发送编辑。
+- 版本与冲突策略：`policy_status`、`policy_config`、`policy_reset`。冲突处理支持 `stop`、`keep-both` 和受保护的 `replace`。
+- 用户后台服务：`service_status`、`service_install`、`service_start`、`service_stop`、`service_restart`、`service_uninstall`。安装与启动分开；控制命令只管理当前状态目录的服务。
 - 托管快照事务：`repo_list`、`repo_transactions`、`repo_status`、`repo_init`、`repo_begin`、`repo_put`、`repo_mkdir`、`repo_remove`、`repo_move`、`repo_commit`、`repo_abort`、`repo_get`。
 - 标签及文件版本：`metadata_capture`、`metadata_push`、`metadata_pull`、`versions_list`、`versions_save`、`versions_restore`、`versions_prune`。
 
-只读资源 `rdrive://status`、`rdrive://profiles`、`rdrive://domains`、`rdrive://cache`、`rdrive://index` 提供对应 JSON 状态。它们不是远端任意文件读取接口。
+共有八个只读资源：`rdrive://status`、`rdrive://profiles`、`rdrive://domains`、`rdrive://cache`、`rdrive://index`、`rdrive://filters`、`rdrive://policies` 和 `rdrive://service`，分别提供对应 JSON 状态。它们不是远端任意文件读取接口。
 
 MCP 传输不改变原有能力边界：普通 WebDAV 的覆盖保护依赖可靠修订，普通多文件同步不具备跨文件原子性；跨崩溃的目录快照发布使用托管仓库。错误时需检查 `isError` 及返回报告，不能仅因为生成了计划、入队、注册了域就报告同步或挂载完成。远端文本和文件名应作为用户数据处理。
 
@@ -78,10 +83,13 @@ python3 scripts/install-skills.py
 
 ```sh
 cargo test --locked
+cargo test --locked --test mcp_catalog_contract
 python3 tests/mcp_workflows.py ./target/debug/rdrive
 ```
 
-MCP 黑盒工作流使用临时状态目录和本机认证 WebDAV 测试服务，不使用真实云盘文件。既有 SMB、同步和崩溃恢复验证仍见 [验证记录](VALIDATION.md)；新增 MCP 测试不应被解释为对所有真实服务器或客户端的兼容性认证。
+契约测试直接复用生产工具目录，逐工具/字段检查校验、命令位置参数、开关、固定保护参数、枚举、空规则和错误输入，再用真实 CLI 的帮助模式检查解析；帮助检查不会执行实际存储操作。MCP 黑盒工作流另外使用临时状态目录和本机认证 WebDAV 测试服务，验证实际 stdio 请求、权限与取消，不使用真实云盘文件。完整测量方法见[测试说明](TESTING.md)；历史 SMB、同步和崩溃恢复结果见[验证记录](VALIDATION.md)。这些检查不代表所有真实服务器或客户端的兼容性认证。
+
+## 版本变化
 
 0.7 新增 `rdrive_index_search`、`rdrive_filter_status/test/config/reset`、`rdrive_policy_status/config/reset`、`rdrive_smart_resolve/recovery`、`rdrive_service_status/install/start/stop/restart/uninstall`。搜索只读本地索引；过滤数组映射到重复 glob 参数。新增资源 `rdrive://filters`、`rdrive://policies`、`rdrive://service`，资源总数为 8。后台配置、服务控制和冲突决定均属写操作，保留默认写入隔离。使用说明见 [Smart 管理](SMART_OPERATIONS.md)。
 

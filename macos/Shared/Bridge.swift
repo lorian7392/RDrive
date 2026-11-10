@@ -22,7 +22,8 @@ struct NativePaths {
     var transfers: URL { group.appendingPathComponent("Transfers", isDirectory: true) }
     var roots: URL { group.appendingPathComponent("finder-roots.json") }
 
-    static func configured(bundle: Bundle = .main) throws -> NativePaths {
+    static func configured(bundle: Bundle = .main,
+                           groupContainer: (String) -> URL? = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier:)) throws -> NativePaths {
         if let path = bundle.object(forInfoDictionaryKey: "RDriveDevelopmentIPCRoot") as? String {
             let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
             guard path.hasPrefix("/"), url.path == url.resolvingSymlinksInPath().path else {
@@ -37,7 +38,7 @@ struct NativePaths {
             return NativePaths(group: url, development: true)
         }
         guard let identifier = bundle.object(forInfoDictionaryKey: "RDriveAppGroup") as? String,
-              let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier) else {
+              let group = groupContainer(identifier) else {
             throw NativeFailure.invalid("The signed app and its extensions require an authorized shared App Group.")
         }
         return NativePaths(group: group)
@@ -306,27 +307,36 @@ final class BackendBridge: @unchecked Sendable {
             }
         }
         var reply = Data()
+        var scannedThrough = reply.startIndex
+        var response: [String: Any] = [:]
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while true {
+        while response.isEmpty {
             try operation?.check()
-            if let newline = reply.firstIndex(of: 10) {
+            if let newline = reply[scannedThrough..<reply.endIndex].firstIndex(of: 10) {
                 let frame = reply.prefix(upTo: newline)
                 guard let result = try JSONSerialization.jsonObject(with: frame) as? [String: Any] else { throw NativeFailure.invalid("Invalid backend response.") }
                 reply.removeSubrange(...newline)
+                scannedThrough = reply.startIndex
                 if let event = result["progress"] as? [String: Any],
                    let completed = event["completed"] as? NSNumber, let total = event["total"] as? NSNumber {
                     operation?.report(completed: completed.int64Value, total: total.int64Value)
                     continue
                 }
                 guard result["ok"] as? Bool == true else { throw remoteError(result["error"] as? [String: Any] ?? [:]) }
-                return result
+                response = result
+                continue
             }
+            // Bytes before this offset were already checked for a frame end.
+            // Rescanning the entire accumulated reply makes large rejected
+            // responses quadratic in their size.
+            scannedThrough = reply.endIndex
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { try operation?.check(); throw NativeFailure.bridge("Backend disconnected or timed out before replying.") }
             reply.append(contentsOf: buffer.prefix(count))
             guard reply.count <= 64 * 1024 * 1024 else { throw NativeFailure.invalid("Backend response too large.") }
         }
+        return response
     }
 
     func item(_ request: [String: Any], operation: SocketOperation? = nil) throws -> WireItem {

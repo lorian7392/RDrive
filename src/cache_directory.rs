@@ -529,7 +529,19 @@ fn finish(home: &Path, intent: &Intent) -> Result<()> {
     sync_dir(home)
 }
 
+trait MigrationIo {
+    fn install(&self, source: &Path, destination: &Path) -> Result<()>;
+    fn save_config(&self, store: &Store) -> Result<()>;
+}
+struct LocalMigration;
+impl MigrationIo for LocalMigration {
+    fn install(&self, source: &Path, destination: &Path) -> Result<()> { install(source,destination) }
+    fn save_config(&self, store: &Store) -> Result<()> { store.save_config() }
+}
 pub fn set_directory(store: &mut Store, path: Option<&Path>) -> Result<Value> {
+    set_directory_with(store,path,&LocalMigration)
+}
+fn set_directory_with(store: &mut Store, path: Option<&Path>, filesystem: &impl MigrationIo) -> Result<Value> {
     let _budget = cache::budget_lock(&store.home, true)?;
     let (plan, files) = locked_plan(store, path)?;
     if plan.source == plan.destination {
@@ -577,7 +589,7 @@ pub fn set_directory(store: &mut Store, path: Option<&Path>) -> Result<Value> {
         sync_dir(&staging)?;
         state::atomic_json(&store.home.join(INTENT), &intent)?;
         for object in &intent.objects {
-            install(
+            filesystem.install(
                 &staging.join(&object.name),
                 &intent.destination.join(&object.name),
             )?;
@@ -593,7 +605,7 @@ pub fn set_directory(store: &mut Store, path: Option<&Path>) -> Result<Value> {
         return Err(error);
     }
     store.config.cache.directory = plan.next.clone();
-    if let Err(error) = store.save_config() {
+    if let Err(error) = filesystem.save_config(store) {
         let current: Config = state::read_json(&store.home.join("config.json"))?;
         store.config.cache.directory = current.cache.directory;
         if store.config.cache.directory == intent.previous {
@@ -967,4 +979,88 @@ mod tests {
             assert!(plan_directory(&store, Some(&alias.join("tmp"))).is_err());
         }
     }
+    #[test]
+    fn metadata_markers_and_ancestor_permissions_reject_foreign_cache_locations() {
+        use std::os::unix::fs::symlink;
+        let (_temporary,store)=home();let next=destination(&store);fs::DirBuilder::new().mode(0o700).create(&next).unwrap();
+        assert!(private_file(&next).is_err());assert!(marker(&store.home,&next,true).is_err());
+        let sparse=next.join("large.json");let file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&sparse).unwrap();file.set_len(32*1024*1024+1).unwrap();assert!(read_private::<Value>(&sparse).is_err());fs::remove_file(sparse).unwrap();
+        write_marker(&store.home,&next).unwrap();assert!(marker(&next,&next,true).is_err());assert_eq!(plan_directory(&store,Some(&next)).unwrap()["files"],0);
+        assert!(lexical(Path::new("relative")).is_err());let mut custom=Config::default();custom.cache.directory=Some(next.clone());assert!(protected_directories(&store.home,&custom).unwrap().contains(&next));
+        fs::set_permissions(&next,fs::Permissions::from_mode(0o777)).unwrap();assert!(lexical(&next.join("child")).is_err());fs::set_permissions(&next,fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(lexical(&next.join("missing/child")).is_err());assert!(path_is_within(Path::new("relative"),&next).is_err());
+        let alias=next.with_extension("alias");symlink(&next,&alias).unwrap();assert!(path_is_within(&alias,&next).unwrap());
+        let loop_path=next.with_extension("loop");symlink(&loop_path,&loop_path).unwrap();assert!(path_is_within(&next,&loop_path).is_err());assert!(path_is_within(&loop_path,&store.home).is_err());
+        let cloud=next.join("CloudStorage");fs::DirBuilder::new().mode(0o700).create(&cloud).unwrap();assert!(validate_path(&store.home,&cloud.join("cache")).is_err());
+        state::atomic_json(&store.home.join("baselines/known.json"),&json!({"local_root":next})).unwrap();assert!(validate_location(&store.home,&next.join("child")).is_err());
+        for object in ["","../escape","invalid.name",&"x".repeat(129)] {assert!(object_path(&store,object).is_err());}
+    }
+    #[test]
+    fn pending_migrations_protect_both_locations_and_validate_intents_before_cleanup() {
+        let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);let mut intent=intent(&store,next.clone(),&item);
+        state::atomic_json(&store.home.join(INTENT),&intent).unwrap();let paths=protected_directories(&store.home,&store.config).unwrap();assert!(paths.contains(&intent.source));assert!(paths.contains(&intent.destination));
+        intent.version=2;state::atomic_json(&store.home.join(INTENT),&intent).unwrap();assert!(protected_directories(&store.home,&store.config).is_err());assert!(recover(&mut store).is_err());
+        intent.version=1;intent.objects[0].name="../escape".into();state::atomic_json(&store.home.join(INTENT),&intent).unwrap();assert!(recover(&mut store).is_err());
+        intent.objects[0].name=item.object.clone();state::atomic_json(&store.home.join(INTENT),&intent).unwrap();
+        store.config.cache.directory=Some(next.with_extension("unrelated"));assert!(recover(&mut store).unwrap_err().to_string().contains("configuration changed"));
+        assert!(intent.source.join(item.object).exists());assert!(!next.exists());
+    }
+    #[test]
+    fn migration_planning_checks_active_admissions_duplicate_objects_and_corruption() {
+        let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);
+        assert_eq!(plan_directory(&store,None).unwrap()["changed"],false);
+        store.db.cache_reservations.insert("active".into(),crate::state::CacheReservation{size:1,created:state::now()});assert!(plan_directory(&store,Some(&next)).unwrap_err().to_string().contains("downloads are active"));store.db.cache_reservations.clear();
+        store.db.cache.insert("duplicate-reference".into(),item.clone());assert_eq!(plan_directory(&store,Some(&next)).unwrap()["files"],1);store.db.cache.remove("duplicate-reference");
+        fs::write(object_path(&store,&item.object).unwrap(),b"corrupt").unwrap();assert!(plan_directory(&store,Some(&next)).unwrap_err().to_string().contains("checksum differs"));fs::write(object_path(&store,&item.object).unwrap(),b"payload").unwrap();
+        set_directory(&mut store,Some(&next)).unwrap();assert!(plan_directory(&store,Some(&next.join("child"))).unwrap_err().to_string().contains("contain one another"));
+    }
+    #[test]
+    fn migration_rollback_and_finish_preserve_active_readers_and_only_remove_owned_copies() {
+        let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);let mut intent=intent(&store,next.clone(),&item);prepare(&store,&intent);
+        let staged=stage(&intent).join(&item.object);let mut output=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staged).unwrap();output.write_all(b"partial copy").unwrap();drop(output);
+        rollback(&store.home,&intent).unwrap();assert!(!staged.exists());assert!(intent.source.join(&item.object).exists());
+        fs::remove_file(next.join(MARKER)).unwrap();fs::remove_dir(&next).unwrap();prepare(&store,&intent);
+        let staged=stage(&intent).join(&item.object);let mut output=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staged).unwrap();output.write_all(b"payload").unwrap();let metadata=output.metadata().unwrap();intent.objects[0].copy_identity=Some((metadata.dev(),metadata.ino()));drop(output);
+        install(&staged,&next.join(&item.object)).unwrap();state::atomic_json(&store.home.join(INTENT),&intent).unwrap();store.config.cache.directory=Some(next.clone());
+        let reader=private_file(&intent.source.join(&item.object)).unwrap();assert_eq!(unsafe{libc::flock(reader.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)},0);
+        assert!(recover(&mut store).unwrap_err().to_string().contains("active reader"));assert!(intent.source.join(&item.object).exists());assert!(next.join(&item.object).exists());drop(reader);
+        recover(&mut store).unwrap();assert!(!intent.source.join(&item.object).exists());assert_eq!(fs::read(next.join(&item.object)).unwrap(),b"payload");assert!(!stage(&intent).exists());
+    }
+
+    struct FailedMigration { install_failure:bool, config_failure:bool, committed_config:bool }
+    impl MigrationIo for FailedMigration {
+        fn install(&self,source:&Path,destination:&Path)->Result<()> {if self.install_failure {bail!("synthetic destination install failure");}install(source,destination)}
+        fn save_config(&self,store:&Store)->Result<()> {if self.committed_config {store.save_config()?;}if self.config_failure {bail!("synthetic config write acknowledgement failure");}store.save_config()}
+    }
+    #[test]
+    fn failed_copy_or_config_publication_preserves_original_data_and_recovers_uncertain_commit() {
+        for (installation,acknowledged) in [(true,false),(false,false),(false,true)] {
+            let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);let home_path=store.home.clone();let source=home_path.join("cache").join(&item.object);
+            let peer=FailedMigration{install_failure:installation,config_failure:!installation,committed_config:acknowledged};
+            assert!(set_directory_with(&mut store,Some(&next),&peer).is_err());assert_eq!(fs::read(&source).unwrap(),b"payload");
+            if acknowledged {assert_eq!(store.config.cache.directory,Some(next.clone()));assert!(home_path.join(INTENT).exists());drop(store);let reopened=Store::open(home_path).unwrap();assert_eq!(reopened.config.cache.directory,Some(next.clone()));assert!(!source.exists());assert_eq!(fs::read(next.join(&item.object)).unwrap(),b"payload");}
+            else {assert!(store.config.cache.directory.is_none());assert!(!next.join(&item.object).exists());assert!(!home_path.join(INTENT).exists());}
+        }
+    }
+    #[test]
+    fn cleanup_accepts_already_removed_source_and_staging_but_refuses_extra_members() {
+        let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);let mut intent=intent(&store,next.clone(),&item);prepare(&store,&intent);
+        fs::remove_dir(stage(&intent)).unwrap();ensure_members(&next,&intent.objects,true).unwrap();fs::DirBuilder::new().mode(0o700).create(stage(&intent)).unwrap();
+        fs::write(stage(&intent).join("foreign"),b"unrelated").unwrap();assert!(ensure_members(&stage(&intent),&intent.objects,false).is_err());assert!(rollback(&store.home,&intent).is_err());fs::remove_file(stage(&intent).join("foreign")).unwrap();
+        let copy=next.join(&item.object);let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&copy).unwrap();file.write_all(b"payload").unwrap();let meta=file.metadata().unwrap();intent.objects[0].copy_identity=Some((meta.dev(),meta.ino()));drop(file);
+        fs::remove_dir(stage(&intent)).unwrap();state::atomic_json(&store.home.join(INTENT),&intent).unwrap();rollback(&store.home,&intent).unwrap();assert!(!copy.exists());assert!(intent.source.join(&item.object).exists());
+        fs::remove_file(next.join(MARKER)).unwrap();fs::remove_dir(&next).unwrap();prepare(&store,&intent);
+        let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&copy).unwrap();file.write_all(b"payload").unwrap();let meta=file.metadata().unwrap();intent.objects[0].copy_identity=Some((meta.dev(),meta.ino()));drop(file);
+        let source=intent.source.join(&item.object);fs::write(&source,b"changed").unwrap();assert!(verify_source(&source,&intent.objects[0]).is_err());fs::remove_file(source).unwrap();fs::remove_dir(stage(&intent)).unwrap();state::atomic_json(&store.home.join(INTENT),&intent).unwrap();store.config.cache.directory=Some(next);recover(&mut store).unwrap();assert!(copy.exists());
+    }
+    #[test]
+    fn inaccessible_state_and_missing_payloads_fail_before_any_cache_mutation() {
+        let (_temporary,mut store)=home();let item=seed(&mut store,"file",b"payload",false);let next=destination(&store);
+        fs::remove_file(object_path(&store,&item.object).unwrap()).unwrap();assert!(plan_directory(&store,Some(&next)).unwrap_err().to_string().contains("missing or unsafe"));
+        assert_eq!(set_directory(&mut store,None).unwrap()["changed"],false);
+        state::atomic_json(&store.home.join("baselines/no-root.json"),&json!({"kind":"other"})).unwrap();state::atomic_json(&store.home.join("baselines/unrelated-root.json"),&json!({"local_root":next})).unwrap();
+        fs::create_dir(store.home.join("baselines/directory")).unwrap();validate_location(&store.home,&next.with_extension("other")).unwrap();
+        fs::set_permissions(&store.home,fs::Permissions::from_mode(0o000)).unwrap();let protected=protected_directories(&store.home,&store.config);let recovered=recover(&mut store);fs::set_permissions(&store.home,fs::Permissions::from_mode(0o700)).unwrap();assert!(protected.is_err());assert!(recovered.is_err());
+    }
+
 }

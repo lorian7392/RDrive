@@ -118,7 +118,7 @@ pub fn put(store:&Store,id:&str,local:&Path,remote:&str)->Result<Transaction>{
 pub fn mkdir(store:&Store,id:&str,remote:&str)->Result<Transaction>{let mut tx=load(store,id)?;mutable(&tx)?;let path=logical(remote)?;if tx.entries.contains_key(&path){bail!("repository path exists");}tx.entries.insert(path,RepoItem{id:uuid::Uuid::new_v4().to_string(),kind:"directory".into(),size:0,blob:None,modified:state::now(),metadata:None});validate_tree(&tx.entries)?;state::atomic_json(&tx_path(store,id)?,&tx)?;Ok(tx)}
 pub fn remove(store:&Store,id:&str,remote:&str,recursive:bool)->Result<Transaction>{let mut tx=load(store,id)?;mutable(&tx)?;let path=logical(remote)?;if !tx.entries.contains_key(&path){bail!("repository path does not exist");}let prefix=format!("{path}/");if !recursive&&tx.entries.keys().any(|p|p.starts_with(&prefix)){bail!("directory has children; recursive removal required");}tx.entries.retain(|p,_|p!=&path&&!p.starts_with(&prefix));state::atomic_json(&tx_path(store,id)?,&tx)?;Ok(tx)}
 pub fn rename(store:&Store,id:&str,from:&str,to:&str)->Result<Transaction>{let mut tx=load(store,id)?;mutable(&tx)?;let from=logical(from)?;let to=logical(to)?;if to.starts_with(&format!("{from}/"))||tx.entries.contains_key(&to)||!tx.entries.contains_key(&from){bail!("invalid repository move");}let moving=tx.entries.iter().filter(|(p,_)|*p==&from||p.starts_with(&format!("{from}/"))).map(|(p,i)|(p.clone(),i.clone())).collect::<Vec<_>>();for(p,_)in&moving{tx.entries.remove(p);}for(p,i)in moving{tx.entries.insert(format!("{to}{}",&p[from.len()..]),i);}validate_tree(&tx.entries)?;state::atomic_json(&tx_path(store,id)?,&tx)?;Ok(tx)}
-pub fn set_metadata(store:&Store,id:&str,path:&str,metadata:serde_json::Value)->Result<Transaction>{let mut tx=load(store,id)?;mutable(&tx)?;let item=tx.entries.get_mut(&logical(path)?).context("item missing")?;let record:crate::metadata::MetadataRecord=serde_json::from_value(metadata.clone())?;if Some(&record.content_sha256)!=item.blob.as_ref(){bail!("metadata content binding mismatch");}item.metadata=Some(metadata);state::atomic_json(&tx_path(store,id)?,&tx)?;Ok(tx)}
+pub fn set_metadata(store:&Store,id:&str,path:&str,metadata:serde_json::Value)->Result<Transaction>{let mut tx=load(store,id)?;mutable(&tx)?;let item=tx.entries.get_mut(&logical(path)?).context("item missing")?;let record:crate::metadata::MetadataRecord=serde_json::from_value(metadata.clone())?;record.validate()?;if Some(&record.content_sha256)!=item.blob.as_ref(){bail!("metadata content binding mismatch");}item.metadata=Some(metadata);state::atomic_json(&tx_path(store,id)?,&tx)?;Ok(tx)}
 async fn verify_blob(store:&Store,b:&dyn Backend,path:&str,hash:&str,size:u64)->Result<()> {
     let temp=store.home.join("tmp").join(uuid::Uuid::new_v4().to_string());
     let result=async{let e=crate::operations::verified_download(b,path,&temp).await?;if e.size!=size||state::fingerprint(&temp)?!=hash{bail!("repository object is corrupt or does not match its content address");}Ok(())}.await;let _=fs::remove_file(temp);result
@@ -166,21 +166,21 @@ pub fn transactions(store:&Store)->Result<Vec<Transaction>>{let mut result=Vec::
 #[cfg(test)]
 mod tests {
  use super::*;use crate::{backend::{Capabilities,Entry},config::{Profile,Protocol}};use async_trait::async_trait;use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
- struct Disk {root:PathBuf,fail:AtomicBool,lost:AtomicBool,corrupt:AtomicBool,pause:AtomicBool,published:tokio::sync::Notify,barrier:std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>}
+ struct Disk {root:PathBuf,fail:AtomicBool,lost:AtomicBool,corrupt:AtomicBool,pause:AtomicBool,fail_published:AtomicBool,published:tokio::sync::Notify,barrier:std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>}
  impl Disk {fn p(&self,p:&str)->Result<PathBuf>{Ok(self.root.join(backend::normalize(p)?))}fn e(&self,p:&str)->Result<Option<Entry>>{let path=self.p(p)?;match fs::metadata(&path){Ok(m)=>Ok(Some(Entry{path:p.into(),is_dir:m.is_dir(),size:if m.is_dir(){0}else{m.len()},modified:Some(1),etag:if m.is_file(){Some(format!("\"{}\"",state::fingerprint(&path)?))}else{None}})),Err(e)if e.kind()==std::io::ErrorKind::NotFound=>Ok(None),Err(e)=>Err(e.into())}}}
  #[async_trait]impl Backend for Disk {
  fn capabilities(&self)->Capabilities{Capabilities{protocol:"test",conditional_write:true,server_copy:false,locking:false,notes:vec![]}}
  async fn stat(&self,p:&str)->Result<Option<Entry>>{self.e(p)}
  async fn list(&self,p:&str)->Result<Vec<Entry>>{let mut out=vec![];for e in fs::read_dir(self.p(p)?)?{let e=e?;let name=e.file_name().to_str().unwrap().to_owned();let path=backend::join(p,&name)?;out.push(self.e(&path)?.unwrap());}Ok(out)}
  async fn download(&self,p:&str,d:&Path)->Result<()>{let mut src=fs::File::open(self.p(p)?)?;let mut dst=fs::OpenOptions::new().write(true).create_new(true).open(d)?;std::io::copy(&mut src,&mut dst)?;Ok(())}
- async fn upload(&self,s:&Path,p:&str,c:WriteCondition)->Result<Entry>{let mut opts=fs::OpenOptions::new();opts.write(true);match c{WriteCondition::CreateNew=>{opts.create_new(true);},WriteCondition::Any=>{opts.create(true).truncate(true);},WriteCondition::Match(ref e)=>{if self.e(p)?.is_none_or(|a|!a.same_revision(e)){bail!("conflict");}opts.truncate(true);}}let mut dst=opts.open(self.p(p)?)?;std::io::copy(&mut fs::File::open(s)?,&mut dst)?;dst.sync_all()?;Ok(self.e(p)?.unwrap())}
+ async fn upload(&self,s:&Path,p:&str,c:WriteCondition)->Result<Entry>{if p.ends_with("/published.json")&&self.fail_published.load(Ordering::SeqCst){bail!("synthetic publication marker upload failure");}let mut opts=fs::OpenOptions::new();opts.write(true);match c{WriteCondition::CreateNew=>{opts.create_new(true);},WriteCondition::Any=>{opts.create(true).truncate(true);},WriteCondition::Match(ref e)=>{if self.e(p)?.is_none_or(|a|!a.same_revision(e)){bail!("conflict");}opts.truncate(true);}}let mut dst=opts.open(self.p(p)?)?;std::io::copy(&mut fs::File::open(s)?,&mut dst)?;dst.sync_all()?;Ok(self.e(p)?.unwrap())}
  async fn mkdir(&self,p:&str)->Result<()>{fs::create_dir(self.p(p)?)?;Ok(())}
- async fn remove(&self,p:&str,_:bool)->Result<()>{fs::remove_file(self.p(p)?)?;Ok(())}
+ async fn remove(&self,p:&str,recursive:bool)->Result<()>{let path=self.p(p)?;if path.is_dir(){if recursive{fs::remove_dir_all(path)?;}else{fs::remove_dir(path)?;}}else{fs::remove_file(path)?;}Ok(())}
  async fn rename(&self,f:&str,t:&str,overwrite:bool)->Result<()>{let publication=t.contains("/commits/");if publication{let barrier=self.barrier.lock().unwrap().clone();if let Some(barrier)=barrier{barrier.wait().await;}if self.fail.load(Ordering::SeqCst){bail!("injected crash before publication");}}if overwrite{fs::rename(self.p(f)?,self.p(t)?)?;}else{fs::hard_link(self.p(f)?,self.p(t)?)?;fs::remove_file(self.p(f)?)?;}if publication{if self.corrupt.load(Ordering::SeqCst){let mut record:Snapshot=serde_json::from_slice(&fs::read(self.p(t)?)?)?;record.commit.created.push_str(" changed-after-publish");state::atomic_json(&self.p(t)?,&record)?;}self.published.notify_one();if self.pause.load(Ordering::SeqCst){std::future::pending::<()>().await;}if self.lost.load(Ordering::SeqCst){bail!("injected lost commit acknowledgment");}}Ok(())}
  async fn copy(&self,_:&str,_:&str,_:bool)->Result<()>{bail!("unused")}
  }
  fn setup(root:&Path,name:&str)->Store{let mut s=Store::open(root.join(name)).unwrap();s.config.profiles.insert("test".into(),Profile{protocol:Protocol::Webdav,url:"https://example.test/".into(),username:None,password_env:None,allow_http:false,timeout_secs:10,smb_encryption:true,nextcloud_upload_url:None});s.save_config().unwrap();s}
- fn disk(root:&Path)->Arc<Disk>{fs::create_dir(root.join("remote")).unwrap();Arc::new(Disk{root:root.join("remote"),fail:AtomicBool::new(false),lost:AtomicBool::new(false),corrupt:AtomicBool::new(false),pause:AtomicBool::new(false),published:tokio::sync::Notify::new(),barrier:std::sync::Mutex::new(None)})}
+ fn disk(root:&Path)->Arc<Disk>{fs::create_dir(root.join("remote")).unwrap();Arc::new(Disk{root:root.join("remote"),fail:AtomicBool::new(false),lost:AtomicBool::new(false),corrupt:AtomicBool::new(false),pause:AtomicBool::new(false),fail_published:AtomicBool::new(false),published:tokio::sync::Notify::new(),barrier:std::sync::Mutex::new(None)})}
  #[tokio::test]async fn crash_before_publish_leaves_old_snapshot_and_resume_commits_whole_tree(){let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let b=disk(&root);let s=setup(&root,"state");init(&s,b.as_ref(),"").await.unwrap();let tx=begin(&s,b.as_ref(),"test","").await.unwrap();for p in ["a","b"]{fs::write(root.join(p),p).unwrap();put(&s,&tx.id,&root.join(p),p).unwrap();}b.fail.store(true,Ordering::SeqCst);assert!(commit(&s,b.as_ref(),&tx.id).await.is_err());assert!(read(&s,b.as_ref(),"").await.unwrap().commit.entries.is_empty());b.fail.store(false,Ordering::SeqCst);let c=commit(&s,b.as_ref(),&tx.id).await.unwrap();assert_eq!(c.commit.entries.len(),2);assert_eq!(read(&s,b.as_ref(),"").await.unwrap().checksum,c.checksum);}
  #[tokio::test]async fn lost_commit_response_is_reconciled_without_second_commit(){let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let b=disk(&root);let s=setup(&root,"state");init(&s,b.as_ref(),"").await.unwrap();let tx=begin(&s,b.as_ref(),"test","").await.unwrap();mkdir(&s,&tx.id,"folder").unwrap();b.lost.store(true,Ordering::SeqCst);let c=commit(&s,b.as_ref(),&tx.id).await.unwrap();let again=commit(&s,b.as_ref(),&tx.id).await.unwrap();assert_eq!(c.checksum,again.checksum);assert_eq!(read(&s,b.as_ref(),"").await.unwrap().commit.sequence,1);}
  #[tokio::test]async fn competing_writers_cannot_replace_one_anothers_commit_slot(){let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let b=disk(&root);let a=setup(&root,"a");let c=setup(&root,"c");init(&a,b.as_ref(),"").await.unwrap();let ta=begin(&a,b.as_ref(),"test","").await.unwrap();let tc=begin(&c,b.as_ref(),"test","").await.unwrap();mkdir(&a,&ta.id,"a").unwrap();mkdir(&c,&tc.id,"c").unwrap();*b.barrier.lock().unwrap()=Some(Arc::new(tokio::sync::Barrier::new(2)));let(x,y)=tokio::join!(commit(&a,b.as_ref(),&ta.id),commit(&c,b.as_ref(),&tc.id));assert_ne!(x.is_ok(),y.is_ok());assert_eq!(read(&a,b.as_ref(),"").await.unwrap().commit.sequence,1);}
@@ -230,6 +230,185 @@ mod tests {
     assert_eq!(old_item,snapshot.commit.entries["document"]);
     let current_output=root.join("current");get(&store,backend.as_ref(),"","document",&current_output,false).await.unwrap();
     assert_eq!(fs::read(current_output).unwrap(),b"snapshot B bytes");
+ }
+ #[tokio::test]
+ async fn metadata_rejection_preserves_transaction_bytes_and_abort_recovery() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let backend = disk(&root);
+    let store = setup(&root, "state");
+    init(&store, backend.as_ref(), "").await.unwrap();
+    let transaction = begin(&store, backend.as_ref(), "test", "").await.unwrap();
+    let source = root.join("source");
+    fs::write(&source, b"metadata-bound contents").unwrap();
+    put(&store, &transaction.id, &source, "document").unwrap();
+    let record = crate::metadata::capture(&source, &Default::default()).unwrap();
+    let journal = tx_path(&store, &transaction.id).unwrap();
+    let original = fs::read(&journal).unwrap();
+    let mut invalid_version = record.clone();
+    invalid_version.version = 2;
+    let mut invalid_attribute = record.clone();
+    invalid_attribute.attributes.insert("user.contract".into(), "not-hex".into());
+    let mut different_content = record.clone();
+    different_content.content_sha256 = "a".repeat(64);
+    for invalid in [
+        serde_json::to_value(invalid_version).unwrap(),
+        serde_json::to_value(invalid_attribute).unwrap(),
+        serde_json::to_value(different_content).unwrap(),
+        serde_json::json!({"version":1}),
+    ] {
+        assert!(set_metadata(&store, &transaction.id, "document", invalid).is_err());
+        assert_eq!(fs::read(&journal).unwrap(), original, "failed metadata must never poison the durable transaction");
+        assert_eq!(load(&store, &transaction.id).unwrap().phase, "open");
+    }
+    let mut accepted = record;
+    accepted.selection = vec!["user.contract".into()];
+    accepted.attributes.clear();
+    accepted.attributes.insert("user.contract".into(), "76616c7565".into());
+    let accepted = serde_json::to_value(accepted).unwrap();
+    let updated = set_metadata(&store, &transaction.id, "document", accepted.clone()).unwrap();
+    assert_eq!(updated.entries["document"].metadata, Some(accepted.clone()));
+    assert_eq!(load(&store, &transaction.id).unwrap().entries["document"].metadata, Some(accepted));
+    assert_eq!(abort(&store, &transaction.id).unwrap().phase, "aborted");
+    assert_eq!(fs::read(source).unwrap(), b"metadata-bound contents");
+ }
+ #[tokio::test]
+ async fn local_namespace_edits_preserve_stable_ids_and_list_aborted_journals() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let backend = disk(&root);
+    let store = setup(&root, "state");
+    init(&store, backend.as_ref(), "").await.unwrap();
+    init(&store, backend.as_ref(), "").await.unwrap();
+    let transaction = begin(&store, backend.as_ref(), "test", "").await.unwrap();
+    mkdir(&store, &transaction.id, "folder").unwrap();
+    let source = root.join("source");
+    fs::write(&source, b"namespace fixture").unwrap();
+    let staged = put(&store, &transaction.id, &source, "folder/document").unwrap();
+    let stable = staged.entries["folder/document"].id.clone();
+    let renamed = rename(&store, &transaction.id, "folder", "renamed").unwrap();
+    assert_eq!(renamed.entries["renamed/document"].id, stable);
+    assert!(remove(&store, &transaction.id, "renamed", false).is_err());
+    let before = fs::read(tx_path(&store, &transaction.id).unwrap()).unwrap();
+    assert!(rename(&store, &transaction.id, "renamed", "renamed/child").is_err());
+    assert_eq!(fs::read(tx_path(&store, &transaction.id).unwrap()).unwrap(), before);
+    remove(&store, &transaction.id, "renamed/document", false).unwrap();
+    mkdir(&store, &transaction.id, "renamed/child").unwrap();
+    assert!(remove(&store, &transaction.id, "missing", true).is_err());
+    assert!(remove(&store, &transaction.id, "renamed", true).unwrap().entries.is_empty());
+    abort(&store, &transaction.id).unwrap();
+    fs::write(store.home.join("transactions/ignored.txt"), b"not a journal").unwrap();
+    let listed = transactions(&store).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, transaction.id);
+    assert_eq!(listed[0].phase, "aborted");
+    assert!(set_metadata(&store, &transaction.id, "document", serde_json::json!({})).is_err());
+ }
+ #[tokio::test]
+ async fn version_publication_guards_preserve_history_until_confirmation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let backend = disk(&root);
+    let store = setup(&root, "state");
+    fs::write(backend.root.join("document"), b"prior revision").unwrap();
+    let expected = backend.stat("document").await.unwrap().unwrap();
+    let version = crate::policies::prepare_version(&store, backend.as_ref(), "test", "document", &expected, "publication-contract", true).await.unwrap().unwrap();
+    let mut unconfirmed = version.clone();
+    unconfirmed.sha256 = "a".repeat(64);
+    assert!(crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &unconfirmed).await.unwrap_err().to_string().contains("not confirmed"));
+    let prefix = format!("{}/{}", crate::operations::version_root("document"), version.id);
+    let marker = backend.root.join(format!("{prefix}/published.json"));
+    let invalid = serde_json::json!({"format":1,"version":version.id,"path":"another-file","sha256":version.sha256});
+    state::atomic_json(&marker, &invalid).unwrap();
+    let original_marker = fs::read(&marker).unwrap();
+    assert!(crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &version).await.unwrap_err().to_string().contains("marker is invalid"));
+    assert_eq!(fs::read(&marker).unwrap(), original_marker);
+    fs::remove_file(&marker).unwrap();
+    backend.fail_published.store(true, Ordering::SeqCst);
+    assert!(crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &version).await.unwrap_err().to_string().contains("synthetic publication marker"));
+    assert!(!marker.exists());
+    assert_eq!(fs::read(backend.root.join(format!("{prefix}/content"))).unwrap(), b"prior revision");
+    backend.fail_published.store(false, Ordering::SeqCst);
+    assert!(crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &version).await.unwrap().is_empty());
+    let confirmed = fs::read(&marker).unwrap();
+    backend.fail_published.store(true, Ordering::SeqCst);
+    assert!(crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &version).await.unwrap().is_empty(), "confirmed replay must not upload another marker");
+    assert_eq!(fs::read(marker).unwrap(), confirmed);
+    assert_eq!(fs::read(backend.root.join("document")).unwrap(), b"prior revision");
+    assert!(fs::read_dir(store.home.join("tmp")).unwrap().next().is_none());
+ }
+ #[tokio::test]
+ async fn scheduler_persists_archived_revision_guards_before_versioned_upload() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let backend = disk(&root);
+    let mut store = setup(&root, "state");
+    fs::write(backend.root.join("document"), b"queued prior revision").unwrap();
+    let original = backend.stat("document").await.unwrap().unwrap();
+    let source = root.join("source");
+    fs::write(&source, b"queued replacement").unwrap();
+    let overwrite = crate::operations::enqueue(&mut store, "test", &source, "document", true, None, true).unwrap();
+    let new_file = crate::operations::enqueue(&mut store, "test", &source, "new-file", true, None, true).unwrap();
+    let ordinary = crate::operations::enqueue(&mut store, "test", &source, "ordinary-file", false, None, false).unwrap();
+    let connector = backend.clone();
+    let context = crate::transfer::TransferContext::new(None, crate::transfer::ProgressOutput::Off).unwrap();
+    let report = crate::scheduler::run_with_connector(&mut store, None, 2, false, false, context.clone(), move |_, _, _| {
+        let connector = connector.clone();
+        async move { Ok(connector as Arc<dyn Backend>) }
+    }).await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.results.len(), 3);
+    let completed = store.db.jobs.iter().find(|job| job.id == overwrite.id).unwrap();
+    assert_eq!(completed.status, "done");
+    assert!(completed.version_prepared);
+    assert!(completed.expected.as_ref().unwrap().same_revision(&original));
+    assert!(!store.home.join("spool").join(&completed.snapshot).exists());
+    let created = store.db.jobs.iter().find(|job| job.id == new_file.id).unwrap();
+    assert!(created.version_prepared);
+    assert!(created.expected.is_none());
+    assert!(matches!(created.condition(), WriteCondition::CreateNew));
+    let versions = crate::operations::versions(&store, backend.as_ref(), "document").await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].original.same_revision(&original));
+    assert_eq!(fs::read(backend.root.join(format!("{}/{}/content", crate::operations::version_root("document"), versions[0].id))).unwrap(), b"queued prior revision");
+    assert!(!store.db.jobs.iter().find(|job| job.id == ordinary.id).unwrap().version_prepared);
+    for path in ["document", "new-file", "ordinary-file"] { assert_eq!(fs::read(backend.root.join(path)).unwrap(), b"queued replacement"); }
+    let saved: serde_json::Value = state::read_json(&store.home.join("state.json")).unwrap();
+    assert!(saved["jobs"].as_array().unwrap().iter().all(|job| job["status"] == "done" && (job["version"] == false || job["version_prepared"] == true)));
+    assert!(crate::scheduler::run(&mut store, None, 1, false, false, context).await.unwrap().results.is_empty());
+ }
+ #[tokio::test]
+ async fn confirmed_retention_prunes_only_old_published_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let backend = disk(&root);
+    let mut store = setup(&root, "state");
+    fs::write(backend.root.join("document"), b"guarded history").unwrap();
+    let expected = backend.stat("document").await.unwrap().unwrap();
+    assert!(!crate::policies::VersionPolicy::default().matches("document").unwrap());
+    let mut versions = Vec::new();
+    for request in ["old-published", "recent-published", "unpublished", "current-published"] {
+        let version = crate::policies::prepare_version(&store, backend.as_ref(), "test", "document", &expected, request, true).await.unwrap().unwrap();
+        if versions.len() < 2 {
+            crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &version).await.unwrap();
+        }
+        versions.push(version);
+    }
+    store.config.policies.profiles.insert("test".into(), crate::policies::ProfilePolicy {
+        versions: Some(crate::policies::VersionPolicy { enabled: true, keep: 2, exclude: vec!["*.tmp".into()], ..Default::default() }),
+        conflicts: None,
+    });
+    store.config.policies.profiles.insert("inherited".into(), crate::policies::ProfilePolicy::default());
+    store.config.policies.validate().unwrap();
+    assert!(crate::policies::prepare_version(&store, backend.as_ref(), "test", "excluded.tmp", &expected, "ignored", false).await.unwrap().is_none());
+    let removed = crate::policies::finish_version(&store, backend.as_ref(), "test", "document", &versions[3]).await.unwrap();
+    assert_eq!(removed, vec![versions[0].id.clone()]);
+    let remaining = crate::operations::versions(&store, backend.as_ref(), "document").await.unwrap();
+    assert_eq!(remaining.len(), 3, "unpublished recovery copies do not consume confirmed retention quota");
+    assert!(remaining.iter().any(|version| version.id == versions[2].id));
+    for version in remaining {
+        assert_eq!(fs::read(backend.root.join(format!("{}/{}/content", crate::operations::version_root("document"), version.id))).unwrap(), b"guarded history");
+    }
  }
  #[tokio::test]async fn malformed_history_and_unicode_case_collisions_are_rejected(){let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let b=disk(&root);let s=setup(&root,"state");init(&s,b.as_ref(),"").await.unwrap();let tx=begin(&s,b.as_ref(),"test","").await.unwrap();mkdir(&s,&tx.id,"Café").unwrap();assert!(mkdir(&s,&tx.id,"CAFE\u{301}").is_err());fs::write(b.root.join(format!("{CONTROL}/commits/00000000000000000002.json")),b"corrupt").unwrap();assert!(read(&s,b.as_ref(),"").await.is_err());}
 }
