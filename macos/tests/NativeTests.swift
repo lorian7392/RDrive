@@ -200,11 +200,16 @@ enum NativeTests {
         }
         let dirty = ProviderItem(try fixtureItem(["has_unsynced_changes": true]))
         try expect(!dirty.isUploaded, "Explicit unsynced flag was ignored")
+        let pinnedDirectory = ProviderItem(try fixtureItem(["kind": "directory", "pinned": true]))
+        let pinnedFile = ProviderItem(try fixtureItem(["pinned": true]))
+        try expect(pinnedDirectory.contentPolicy == .downloadEagerlyAndKeepDownloaded && pinnedFile.contentPolicy == .downloadEagerlyAndKeepDownloaded, "Pinned content policy changed")
+        #if RDRIVE_HAS_NAMESPACE_POLICY
         if #available(macOS 27.0, *) {
             try expect(directory.namespacePolicy == .materializeLazily, "Root namespace policy changed")
-            try expect(ProviderItem(fixtureItem(["kind": "directory", "pinned": true])).namespacePolicy == .materializeEagerly, "Pinned directory namespace policy changed")
+            try expect(pinnedDirectory.namespacePolicy == .materializeEagerly, "Pinned directory namespace policy changed")
             try expect(regular.namespacePolicy == .inherited, "File namespace policy changed")
         }
+        #endif
         print("PASS complete file/directory properties, version/capability projection, native policies and error states")
     }
 

@@ -2,6 +2,7 @@
 """Compile and exercise native SDK objects against an isolated Unix-socket peer."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,9 @@ import threading
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_SPEC = importlib.util.spec_from_file_location("rdrive_native_build", ROOT / "build.py")
+BUILD_MODULE = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(BUILD_MODULE)
 
 
 PRODUCTION_SOURCES = [
@@ -23,7 +27,7 @@ PRODUCTION_SOURCES = [
 TESTED_SOURCES = [source for source in PRODUCTION_SOURCES if source != "Companion/main.swift"]
 
 
-def export_coverage(output, binary, objects, profiles, tested_sources, safe_control_tests=False):
+def export_coverage(output, binary, objects, profiles, tested_sources, safe_control_tests=False, namespace_policy=False):
     """Use every production mapping, including zero-hit compile-only components."""
     raw = sorted(profiles.glob("*.profraw"))
     if not raw:
@@ -82,6 +86,7 @@ def export_coverage(output, binary, objects, profiles, tested_sources, safe_cont
         "instrumented_sources": len(PRODUCTION_SOURCES) - len(missing),
         "not_instrumented": missing,
         "scope_complete": not missing,
+        "sdk_namespace_policy": namespace_policy,
         "executable_lines": count,
         "covered_lines": covered,
         "line_percent": 100 * covered / count if count and not missing else None,
@@ -110,6 +115,9 @@ def main():
                 "-module-cache-path", str(output / "module-cache")]
     if options.coverage:
         compiler += ["-profile-generate", "-profile-coverage-mapping", "-D", "RDRIVE_DEVELOPMENT"]
+    namespace_policy = BUILD_MODULE.namespace_policy_supported(compiler)
+    if namespace_policy:
+        compiler += ["-D", "RDRIVE_HAS_NAMESPACE_POLICY"]
     frameworks = ["-framework", "Foundation", "-framework", "FileProvider", "-framework", "UniformTypeIdentifiers",
                   "-framework", "AppKit", "-framework", "FinderSync", "-framework", "FileProviderUI"]
     # Compile the actual Companion source as a testable module, renaming only
@@ -327,7 +335,8 @@ def main():
                 stopped.set(); listener.close(); worker.join(timeout=2)
 
     if options.coverage:
-        export_coverage(output, binary, objects, profiles, TESTED_SOURCES, safe_control_tests=True)
+        export_coverage(output, binary, objects, profiles, TESTED_SOURCES,
+                        safe_control_tests=True, namespace_policy=namespace_policy)
 
 
 if __name__ == "__main__":

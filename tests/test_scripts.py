@@ -226,12 +226,13 @@ class SkillInstallationTests(TemporaryFiles):
 
 
 class BuildPeer:
-    def __init__(self, cli, *, fail_run=None, fail_query=None):
+    def __init__(self, cli, *, fail_run=None, fail_query=None, namespace_policy=True):
         self.cli = cli
         self.calls = []
         self.queries = []
         self.fail_run = fail_run
         self.fail_query = fail_query
+        self.namespace_policy = namespace_policy
 
     def query(self, arguments, *, text):
         self.queries.append(arguments)
@@ -245,10 +246,15 @@ class BuildPeer:
             return "rdrive 0.8.0\n"
         raise AssertionError("unexpected external query: " + repr(arguments))
 
-    def run(self, arguments, *, check):
+    def run(self, arguments, *, check, **options):
         self.calls.append(arguments)
         if self.fail_run and self.fail_run(arguments):
             raise subprocess.CalledProcessError(1, arguments, stderr="injected build failure")
+        if "-typecheck" in arguments:
+            assert check is False and options["capture_output"] and options["text"]
+            assert options["timeout"] == 120 and arguments[-1] == "-"
+            supported = self.namespace_policy or "NSFileProviderNamespacePolicy" not in options["input"]
+            return subprocess.CompletedProcess(arguments, 0 if supported else 1, "", "" if supported else "unsupported namespace policy")
         if arguments[:2] == ["xcrun", "swiftc"]:
             binary = Path(arguments[arguments.index("-o") + 1])
             binary.write_bytes(("synthetic compiled " + binary.name).encode())
@@ -303,7 +309,9 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertFalse(report["distribution_ready"])
         self.assertFalse(report["installed"]); self.assertFalse(report["activated"])
         self.assertEqual(report["signing_status"], "ad-hoc review build; no Developer Team identity")
-        self.assertEqual(len([call for call in peer.calls if call[:2] == ["xcrun", "swiftc"]]), 4)
+        self.assertEqual(len([call for call in peer.calls if call[:2] == ["xcrun", "swiftc"] and "-typecheck" not in call]), 4)
+        self.assertTrue(report["sdk_namespace_policy"])
+        self.assertTrue(all("RDRIVE_HAS_NAMESPACE_POLICY" in call for call in peer.calls if "-typecheck" not in call and call[:2] == ["xcrun", "swiftc"]))
         self.assertEqual(peer.calls[-1][:5], ["codesign", "--verify", "--deep", "--strict", "--verbose=2"])
         provider = self.read_plist("RDrive.app/Contents/PlugIns/RDriveProvider.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(provider["NSExtensionFileProviderDocumentGroup"], "group.io.rdrive.shared")
@@ -326,6 +334,42 @@ class NativeBuildScriptTests(TemporaryFiles):
         with self.peer():
             invoke(self.module, self.arguments + ["--app-group", "group.fixture.explicit"])
         self.assertEqual(self.report()["app_group"], "group.fixture.explicit")
+
+    def test_older_sdk_omits_only_unavailable_namespace_policy(self):
+        with self.peer(namespace_policy=False) as peer:
+            invoke(self.module, self.arguments)
+        self.assertFalse(self.report()["sdk_namespace_policy"])
+        compiles = [call for call in peer.calls if call[:2] == ["xcrun", "swiftc"] and "-typecheck" not in call]
+        self.assertEqual(len(compiles), 4)
+        self.assertTrue(all("RDRIVE_HAS_NAMESPACE_POLICY" not in call for call in compiles))
+        probes = [call for call in peer.calls if "-typecheck" in call]
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(probes[0], probes[1])
+        self.assertFalse(self.report()["installed"])
+        self.assertFalse(self.report()["activated"])
+
+    def test_sdk_probe_failures_preserve_previous_app_before_staging(self):
+        previous = self.previous_app()
+        with self.peer(fail_run=lambda args: "-typecheck" in args), self.assertRaises(subprocess.CalledProcessError):
+            invoke(self.module, self.arguments)
+        self.assert_previous_preserved(previous)
+        self.assertEqual(list(self.output.glob(".building-*")), [])
+
+    def test_sdk_capability_probe_rejects_broken_imports_and_compiler_crashes(self):
+        compiler = ["xcrun", "swiftc", "-sdk", "/fixture/SDK", "-target", "arm64-apple-macosx13.0"]
+        success = subprocess.CompletedProcess(compiler, 0, "", "")
+        failed = subprocess.CompletedProcess(compiler, 1, "", "broken FileProvider import")
+        with mock.patch.object(self.module.subprocess, "run", return_value=failed) as run, self.assertRaises(subprocess.CalledProcessError) as error:
+            self.module.namespace_policy_supported(compiler)
+        self.assertEqual(error.exception.stderr, "broken FileProvider import")
+        self.assertEqual(run.call_count, 1, "a broken SDK must not become an unavailable optional feature")
+        crashed = subprocess.CompletedProcess(compiler, -11, "", "compiler crashed")
+        with mock.patch.object(self.module.subprocess, "run", side_effect=[success, crashed]), self.assertRaises(subprocess.CalledProcessError) as error:
+            self.module.namespace_policy_supported(compiler)
+        self.assertEqual(error.exception.returncode, -11)
+        for failure in [FileNotFoundError("missing compiler"), subprocess.TimeoutExpired(compiler, 120)]:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(self.module.subprocess, "run", side_effect=failure), self.assertRaises(type(failure)):
+                self.module.namespace_policy_supported(compiler)
 
     def test_development_build_uses_narrow_exception_and_removes_app_groups(self):
         development = self.root / "private-ipc"
@@ -385,7 +429,7 @@ class NativeBuildScriptTests(TemporaryFiles):
         for phase in ["compiler", "signer", "verify"]:
             with self.subTest(phase=phase):
                 previous = self.previous_app()
-                failure = lambda args: ((phase == "compiler" and args[:2] == ["xcrun", "swiftc"]) or (phase == "signer" and "--sign" in args) or (phase == "verify" and "--verify" in args))
+                failure = lambda args: ((phase == "compiler" and args[:2] == ["xcrun", "swiftc"] and "-typecheck" not in args) or (phase == "signer" and "--sign" in args) or (phase == "verify" and "--verify" in args))
                 before = set(self.output.glob(".building-*"))
                 with self.peer(fail_run=failure), self.assertRaises(subprocess.CalledProcessError):
                     invoke(self.module, self.arguments)

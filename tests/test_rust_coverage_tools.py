@@ -62,6 +62,19 @@ class RustCoverageToolsTests(unittest.TestCase):
         self.assertEqual(runner.workflows("python", Path("/binary"), "none", self.root, Path("/lib-tests")), [])
         self.assertEqual(len(runner.workflows("python", Path("/binary"), "dav", self.root, Path("/lib-tests"))), 12)
 
+    def test_library_fixtures_are_isolated_without_filtering_the_full_suite(self):
+        library = Path("/current/lib-tests")
+        obj = {"path": str(library)}
+        self.assertEqual(runner.test_command(obj, library, "all"),
+                         [str(library), "--test-threads=1"])
+        self.assertEqual(runner.test_command(obj, library, "portable-smb"),
+                         [str(library), "smb::", "--test-threads=1"])
+        external = {"path": "/current/coverage_operations"}
+        for suite in ["all", "portable-smb"]:
+            self.assertEqual(runner.test_command(external, library, suite),
+                             ["/current/coverage_operations"])
+        self.assertEqual(obj, {"path": str(library)})
+
     def test_frozen_inventory_rejects_changed_added_and_removed_sources(self):
         frozen = runner.sources(self.root)
         runner.check_sources(self.root, frozen)

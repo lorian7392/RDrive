@@ -13,6 +13,28 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 
 
+def namespace_policy_supported(compiler):
+    """Probe the selected SDK and compiler, rather than a Swift version number."""
+    command = [str(argument) for argument in compiler] + ["-typecheck", "-"]
+    baseline = subprocess.run(command, input="import FileProvider\n", text=True,
+                              capture_output=True, check=False, timeout=120)
+    if baseline.returncode:
+        raise subprocess.CalledProcessError(baseline.returncode, command,
+                                            output=baseline.stdout, stderr=baseline.stderr)
+    source = """import FileProvider
+@available(macOS 27.0, *)
+func rdriveNamespacePolicyProbe() -> [NSFileProviderNamespacePolicy] {
+    [.inherited, .materializeLazily, .materializeEagerly]
+}
+"""
+    feature = subprocess.run(command, input=source, text=True,
+                             capture_output=True, check=False, timeout=120)
+    if feature.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(feature.returncode, command,
+                                            output=feature.stdout, stderr=feature.stderr)
+    return feature.returncode == 0
+
+
 def run(*arguments):
     subprocess.run([str(x) for x in arguments], check=True)
 
@@ -55,6 +77,9 @@ def main():
         flags += ["-D", "RDRIVE_DEVELOPMENT"]
     module_cache = output / "module-cache"
     flags += ["-module-cache-path", module_cache]
+    namespace_policy = namespace_policy_supported(flags)
+    if namespace_policy:
+        flags += ["-D", "RDRIVE_HAS_NAMESPACE_POLICY"]
     base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "10", "CFBundleShortVersionString": "0.8.0",
             "LSMinimumSystemVersion": "13.0", "RDriveAppGroup": app_group}
     if development_root:
@@ -142,7 +167,8 @@ def main():
               "app_group": None if development_root else app_group, "development_ipc_root": str(development_root) if development_root else None,
               "distribution_ready": options.identity != "-" and development_root is None, "installed": False, "activated": False,
               "signing_status": "ad-hoc review build; no Developer Team identity" if options.identity == "-" else "signed with requested identity"}
-    report.update(source_cli_sha256=source_cli_sha256, embedded_cli_sha256=embedded_cli_sha256, cli_version=cli_version)
+    report.update(source_cli_sha256=source_cli_sha256, embedded_cli_sha256=embedded_cli_sha256,
+                  cli_version=cli_version, sdk_namespace_policy=namespace_policy)
     (output / "build-report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

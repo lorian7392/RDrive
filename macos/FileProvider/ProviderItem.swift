@@ -41,11 +41,13 @@ final class ProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDecora
         if wire.pinned { return .downloadEagerlyAndKeepDownloaded }
         return wire.id == "root" ? .downloadLazily : .inherited
     }
+    #if RDRIVE_HAS_NAMESPACE_POLICY
     @available(macOS 27.0, *)
     var namespacePolicy: NSFileProviderNamespacePolicy {
         if wire.kind == "directory" && wire.pinned { return .materializeEagerly }
         return wire.id == "root" ? .materializeLazily : .inherited
     }
+    #endif
     var isUploaded: Bool { !(wire.has_unsynced_changes ?? [.syncing, .queued, .conflict].contains(NativeSyncState.item(wire))) }
     var isUploading: Bool { NativeSyncState.item(wire) == .syncing }
     var uploadingError: Error? {

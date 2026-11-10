@@ -129,6 +129,20 @@ def notification_cli_workflows(binary, root, share, env):
     cli("rm", "fixture", remote, "--recursive")
 
 
+def cleanup_fixture(docker, container, image, share):
+    """Stop the server, then return its temporary Linux files to the host user."""
+    subprocess.run([docker, "rm", "--force", container],
+                   check=True, capture_output=True, text=True, timeout=30)
+    if sys.platform == "linux":
+        # Samba writes as root. Native Linux bind mounts retain that ownership,
+        # unlike Docker Desktop's macOS file sharing. Only mount this fixture's
+        # share, with networking disabled, and never follow its test symlinks.
+        subprocess.run([docker, "run", "--rm", "--network", "none", "--user", "0:0",
+                        "--volume", f"{share}:/share", "--entrypoint", "chown", image,
+                        "-h", "-R", f"{os.getuid()}:{os.getgid()}", "/share"],
+                       check=True, capture_output=True, text=True, timeout=30)
+
+
 def run_tests(binary):
     docker = os.environ.get("RDRIVE_DOCKER") or shutil.which("docker")
     if not docker:
@@ -549,7 +563,13 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             raise
         finally:
             if started:
-                subprocess.run([docker, "rm", "--force", container], capture_output=True, timeout=30)
+                try:
+                    cleanup_fixture(docker, container, report["image_id"] or image, share)
+                except BaseException as error:
+                    report["stage"] = "fixture-cleanup"
+                    report["error"] = {"type": type(error).__name__, "message": str(error)}
+                    record("failed")
+                    raise
 
 
 if __name__ == "__main__":

@@ -730,7 +730,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
-        let options = options(&base).validate().unwrap();
+        let mut options = options(&base).validate().unwrap();
+        // Output validation is independent of host process-launch scheduling.
+        // The timeout behavior below retains its own one-second deadline.
+        options.timeout_secs = 10;
         let catalog = catalog::catalog();
         let status = catalog.iter().find(|tool| tool.name == "rdrive_status").unwrap();
         let text = catalog.iter().find(|tool| tool.name == "rdrive_read_text").unwrap();
@@ -741,7 +744,7 @@ mod tests {
         };
         run("printf '{\"confirmed\":true}'");
         let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
-        assert_eq!(response["isError"], false); assert_eq!(response["structuredContent"]["data"]["confirmed"], true);
+        assert_eq!(response["isError"], false, "{response}"); assert_eq!(response["structuredContent"]["data"]["confirmed"], true);
         run("exit 0");
         let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
         assert_eq!(response["structuredContent"]["data"], Value::Null);
@@ -759,8 +762,14 @@ mod tests {
         }
         run("exec /bin/sleep 5");
         let cancelled = CancellationToken::new(); cancelled.cancel();
-        assert_eq!(invoke_with_program(&options, status, json!({}), cancelled, &Ok(executable.clone())).await["isError"], true);
-        assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await["isError"], true);
+        let response = invoke_with_program(&options, status, json!({}), cancelled, &Ok(executable.clone())).await;
+        assert_eq!(response["isError"], true, "{response}");
+        assert!(response["structuredContent"]["error"].as_str().unwrap().contains("cancelled"), "{response}");
+        options.timeout_secs = 1;
+        let response = invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(executable.clone())).await;
+        assert_eq!(response["isError"], true, "{response}");
+        assert!(response["structuredContent"]["error"].as_str().unwrap().contains("timed out"), "{response}");
+        options.timeout_secs = 10;
         assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(base.join("missing"))).await["isError"], true);
         let unavailable = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Synthetic missing executable identity"));
         assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &unavailable).await["isError"], true);

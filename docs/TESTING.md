@@ -113,6 +113,8 @@ python3 tests/run_rust_coverage.py \
 
 Only these explicit objects are exported with Rust's bundled LLVM. Outputs include `coverage.lcov`, `test-spans.json`, per-command logs, and `manifest.json`. The manifest records source/object hashes. Changed inputs, failed commands, or missing profiles fail collection. This does not rely on automatic discovery of old objects in a Cargo coverage directory.
 
+The library harness runs with `--test-threads=1` to isolate fixtures that exercise process-global signals, subprocess creation, and file-lock lifetimes. Every selected test still runs, and deliberate thread/process concurrency inside individual tests remains enabled. Separate integration-test executables keep their normal harness settings; the manifest records the exact commands.
+
 `--target-dir PATH` may reuse build caches while retaining fresh profiles and exact current Cargo artifacts. `--offline` disables Cargo networking, and `--cargo-llvm-cov PATH` selects an installed tool. `--workflows dav` collects DAV/IPC, `smb` collects Samba, and `none` runs only Rust tests; none of these subsets is complete acceptance. `--test-suite portable-smb` runs only SMB library tests and operations integration tests and requires `--workflows smb`. It supplements Linux protocol testing; macOS acceptance retains the default `all`.
 
 Do not clear collection directories, remove `.profraw`, or replace objects before aggregation. Source changes require new collection; old line mappings cannot be reused for a new revision.

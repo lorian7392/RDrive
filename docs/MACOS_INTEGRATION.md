@@ -31,6 +31,14 @@ verification succeeds. It never installs or activates the app automatically.
 entitlements mode, CLI version, original CLI SHA256 before signing the copied
 executable, embedded CLI SHA256 after signing, and whether activation occurred.
 
+The build probes the selected SDK for `NSFileProviderNamespacePolicy` instead
+of assuming that a newer runtime makes the API available to the compiler. It
+enables eager namespace materialization only when that SDK supports the API
+and the app runs on macOS 27 or later. Older SDKs retain the existing
+`NSFileProviderContentPolicy` behavior for pinned files and folders. The build
+report and native coverage summary record this capability as
+`sdk_namespace_policy`.
+
 The default identity is an ad-hoc development signature. For an authorized App Group build, set `--identity` and `--team-id`; the host and all three extensions must share the same authorized group:
 
 ```sh
@@ -165,7 +173,7 @@ root mapping. No unrelated local directory is silently uploaded.
 Keep Offline persists a pin through the Rust service. The provider exposes the
 native `downloadEagerlyAndKeepDownloaded` content policy, which asks macOS to
 download the item and retain it. Folder pins apply to known descendants and
-new descendants discovered later. On macOS versions supporting namespace policy,
+new descendants discovered later. With a supporting SDK and macOS 27 or later,
 pinned directories also ask the OS to materialize their namespace eagerly.
 Unpinning restores inherited/lazy policy. Download Now and Remove Download use
 native download/eviction APIs. A native network mount is not an offline store:

@@ -66,6 +66,17 @@ def artifacts(output, root):
     return list(found.values())
 
 
+def test_command(obj, library, suite):
+    command = [obj["path"]]
+    if obj["path"] == str(library):
+        if suite == "portable-smb":
+            command.append("smb::")
+        # Library fixtures exercise process-global signals and file locks.
+        # Isolate unrelated fixtures while preserving concurrency inside each.
+        command.append("--test-threads=1")
+    return command
+
+
 def workflows(python, binary, group, output, library):
     commands = []
     if group in ("dav", "all"):
@@ -144,9 +155,7 @@ def collect(options):
     for index, obj in enumerate(tests):
         if options.test_suite == "portable-smb" and obj["path"] != str(library) and obj["name"] != "coverage_operations":
             continue
-        command = [obj["path"]]
-        if options.test_suite == "portable-smb" and obj["path"] == str(library):
-            command.append("smb::")
+        command = test_command(obj, library, options.test_suite)
         run(command, root=root, environment=environment,
             log=logs / (f"test-{index:02d}-" + obj["name"] + ".log"))
         executed_tests.append(command)
