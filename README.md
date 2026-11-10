@@ -1,55 +1,50 @@
 # RDrive
 
-**面向 macOS 的 WebDAV / SMB 文件与同步客户端，使用 Rust 构建。**
+[![Build](https://github.com/lorian7392/RDrive/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/lorian7392/RDrive/actions/workflows/build.yml)
+[![Tests](https://github.com/lorian7392/RDrive/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/lorian7392/RDrive/actions/workflows/checks.yml)
+[![Documentation](https://github.com/lorian7392/RDrive/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/lorian7392/RDrive/actions/workflows/docs.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-RDrive 将远程文件操作、可恢复传输、离线缓存和受版本保护的同步放在一个命令行工具中。可选的 macOS 伴随 App 通过 File Provider 提供 Finder 占位文件、按需下载和离线编辑；需要多个文件一起发布时，可使用托管快照仓库。
+**A WebDAV and SMB file and synchronization client for macOS, built with Rust.**
 
-当前源码版本为 **0.8.0**，采用 [MIT 许可证](LICENSE)。CLI 可独立运行，无需 FUSE、伴随 App 或 Docker。协议兼容性与原生扩展状态见[测试与验证](docs/TESTING.md)；版本号和开发构建不代表正式签名发行包。
+RDrive combines resumable transfers, offline caching, revision-protected synchronization, and recoverable file operations in a standalone command-line tool. An optional macOS companion adds Finder placeholders, on-demand downloads, and offline editing through File Provider. Managed repositories provide complete multi-file snapshot publication for cooperating clients.
 
-[安装](docs/INSTALLATION.md) · [快速上手](docs/QUICKSTART.md) · [完整功能](docs/FEATURES.md) · [命令参考](docs/reference/CLI.md) · [配置参考](docs/reference/CONFIGURATION.md) · [全部文档](docs/README.md)
+[Documentation](https://lorian7392.github.io/RDrive/) · [Quick start](docs/QUICKSTART.md) · [Features](docs/FEATURES.md) · [CLI reference](docs/reference/CLI.md) · [Configuration](docs/reference/CONFIGURATION.md)
 
-2026-11-10 源码验收：Rust、Swift、Python 的生产行覆盖率均为 **100%**，详见[范围、结果和逐文件报告](docs/COVERAGE.md)。
+## Features
 
-## 可以做什么
+- Browse, read, upload, copy, move, delete, and edit remote files.
+- Resume verified downloads, SMB uploads, and explicitly configured Nextcloud chunked uploads.
+- Queue immutable upload snapshots, limit bandwidth, and run up to 64 parallel queue jobs.
+- Keep selected files offline, enforce an LRU clean-cache budget, and safely clear or relocate cached payloads.
+- Preview and apply two-way or one-way directory synchronization with shared baselines and conflict detection.
+- Use native macOS network mounts or an optional Smart File Provider view.
+- Manage Smart offline edits, file and directory operations, SQLite indexes, filename/path search, filters, versions, conflicts, and background services.
+- Synchronize selected Finder tags and user extended attributes.
+- Publish managed-repository transactions with concurrent-writer protection and uncertain-commit recovery.
+- Connect AI clients through a read-only-by-default MCP server and three companion Skills.
 
-- **操作远程文件**：浏览、搜索列表、读写、复制、移动、删除，以及受版本保护的编辑。
-- **传输与恢复**：流式大文件、校验过的下载检查点、SMB 上传续传、显式配置的 Nextcloud 分块上传、持久上传队列。
-- **控制传输**：进度、JSON 事件、共享限速与最多 64 个并行队列任务。
-- **离线使用**：显式缓存、固定保留、LRU 容量管理、清理预览和缓存目录安全迁移。
-- **同步目录**：先预览后执行的双向/单向同步、共同基线、冲突检测、显式删除传播和恢复副本。
-- **在 Finder 使用**：原生 SMB/WebDAV 网络卷，或另行配置的 Smart File Provider 按需视图。
-- **管理 Smart**：离线编辑队列、文件与目录操作、SQLite 索引、本地名称/路径搜索、过滤规则、版本/冲突策略和用户后台服务。
-- **保留所选元数据**：Finder 文件标签和允许的用户扩展属性；托管模式将内容和所选元数据随快照发布。
-- **发布多文件快照**：托管仓库事务、并发提交保护和不明提交结果恢复。
-- **连接 AI 工具**：默认只读的 MCP stdio 服务，以及文件操作、Smart 同步、托管事务三个配套 Skills。
+See the [feature guide](docs/FEATURES.md) for protocol differences, guarantees, and limits.
 
-支持范围及限制集中在[功能说明](docs/FEATURES.md)。
+## Install from source
 
-## 从源码安装
+Requires **Rust 1.90+** and the macOS command-line developer tools. Keep the committed `Cargo.lock` and patched `vendor/` dependencies.
 
-需要 **Rust 1.90 或更新版本**及 macOS 命令行开发工具。以下命令在仓库根目录运行；使用提交的 `Cargo.lock` 和 `vendor/` 补丁源码。
-
-```sh
+~~~sh
 git clone https://github.com/lorian7392/RDrive.git
 cd RDrive
 cargo build --release --locked
 ./target/release/rdrive --version
-./target/release/rdrive --help
-```
-
-将编译结果放入当前终端的搜索路径后，即可使用下文的 `rdrive`：
-
-```sh
 export PATH="$PWD/target/release:$PATH"
-```
+~~~
 
-可选 App 的构建、签名及升级步骤见[安装指南](docs/INSTALLATION.md)。源码克隆不包含本机开发产物、账户配置或运行服务。
+The CLI runs without FUSE, Docker, or the companion App. See [installation](docs/INSTALLATION.md) for the optional native bundle, signing, and upgrades. A source checkout does not include local build artifacts or account configuration.
 
-## 第一次连接
+## Connect
 
-用你自己的服务地址和用户名替换示例。以下密码输入方式适用于 macOS 默认的 **zsh 交互终端**，输入不会回显，也不会把密码字面量写入历史记录。
+Replace the example endpoint and username with your own. In an interactive **zsh** terminal, read the password without echoing it or putting its literal value into shell history:
 
-```sh
+~~~sh
 read -rs 'RDRIVE_PASSWORD?Password: '
 printf '\n'
 export RDRIVE_PASSWORD
@@ -59,62 +54,67 @@ rdrive profile add dav --protocol webdav \
   --username demo --password-env RDRIVE_PASSWORD
 rdrive info dav
 rdrive ls dav
-```
+~~~
 
-SMB 连接使用共享路径；先重新输入该服务器对应的密码，或改用单独的密码变量：
+For SMB, enter that server's password first, or use a separate password variable:
 
-```sh
+~~~sh
 rdrive profile add nas --protocol smb \
   --url smb://nas.example.com/share/folder \
   --username demo --password-env RDRIVE_PASSWORD
 rdrive info nas
-rdrive ls nas
-```
+~~~
 
-连接配置只记录密码环境变量名。也可通过 macOS 钥匙串提供密码，见[认证配置](docs/QUICKSTART.md#认证与连接)。不要将密码放入 URL、命令参数或配置文件。WebDAV 默认要求 HTTPS；SMB 默认要求传输加密。
+Profiles store the environment-variable name, not its value. macOS Keychain is also supported. WebDAV requires HTTPS by default; SMB requires transport encryption. See [authentication](docs/QUICKSTART.md#authentication-and-connections).
 
-## 常用操作
+## Common operations
 
-远程路径相对于连接 URL，使用 `/`。默认下载、上传、复制和移动均不覆盖已有目标。
+Remote paths are relative to the profile URL. Transfers, copies, and moves preserve existing destinations by default.
 
-```sh
+~~~sh
 rdrive get dav reports/report.pdf ./report.pdf
 rdrive put dav ./notes.txt notes.txt
 rdrive get nas large.zip ./large.zip --resume
 rdrive put nas ./large.zip uploads/large.zip --resume --queue
 rdrive queue run nas
-```
+~~~
 
-准备离线副本，并在断网后读取：
+Prepare a verified offline copy:
 
-```sh
+~~~sh
 rdrive cache config --max-bytes 5368709120
 rdrive cache fetch dav notes.txt --pin
 rdrive cache get dav notes.txt ./offline-notes.txt
-```
+~~~
 
-同步先查看计划；确认后再加 `--apply`：
+Preview synchronization before applying it:
 
-```sh
+~~~sh
 mkdir -p ./work
 rdrive mkdir dav work
 rdrive sync dav ./work work
 rdrive sync dav ./work work --apply
-```
+~~~
 
-挂载、覆盖、目录删除、后台服务和冲突恢复均有单独说明。完整操作流程见[快速上手](docs/QUICKSTART.md)，遇到问题先看[故障排查](docs/TROUBLESHOOTING.md)。
+Continue with the [quick start](docs/QUICKSTART.md) or [troubleshooting guide](docs/TROUBLESHOOTING.md).
 
-## 使用前了解
+## Guarantees and limits
 
-普通文件操作和目录同步的多个请求不构成跨文件事务；托管仓库提供合作客户端之间的完整快照可见性。覆盖保护依赖服务器正确执行修订条件或 SMB 保护句柄。恢复副本与自定义版本保存在同一服务器，不能代替独立备份。
+Ordinary file operations and directory synchronization use multiple requests and do not form cross-file transactions. Managed repositories provide complete snapshot visibility to cooperating clients. Overwrite protection depends on correct server revision conditions or protected SMB handles. Versions and recovery copies on the same server do not replace independent backups.
 
-本地缓存、上传快照及离线编辑内容以明文保存。RDrive 不提供 Cryptomator、公开分享/文件请求、远程 ACL 编辑、完整 macOS 元数据备份或完整 GUI 连接管理。原生网络卷的缓存由 macOS 管理，与 RDrive 的清洁缓存上限分开。
+Local caches, upload snapshots, and retained edits are stored in plaintext. RDrive does not implement Cryptomator, public sharing or file requests, remote ACL editing, complete macOS metadata backup, or a full GUI connection manager. Native network-volume caches are managed by macOS and are separate from RDrive's clean-cache budget.
 
-## 文档与参与
+## Development
 
-- 入门：[安装](docs/INSTALLATION.md)、[快速上手](docs/QUICKSTART.md)、[故障排查](docs/TROUBLESHOOTING.md)。
-- 查询：[全部文档](docs/README.md)、[功能说明](docs/FEATURES.md)、[CLI 参数](docs/reference/CLI.md)、[配置与状态](docs/reference/CONFIGURATION.md)。
-- 专题：[挂载](docs/MOUNT.md)、[Smart](docs/SMART_SYNCHRONIZATION.md)、[缓存](docs/CACHE_MANAGEMENT.md)、[MCP](docs/MCP.md)、[托管仓库](docs/REPOSITORY.md)。
-- 项目：[变更记录](CHANGELOG.md)、[贡献指南](CONTRIBUTING.md)、[安全说明](SECURITY.md)、[测试说明](docs/TESTING.md)。
+The current source version is **0.8.0**, licensed under [MIT](LICENSE).
 
-发现问题时，请提供脱敏后的版本、命令、错误及复现步骤。报告方法见[贡献指南](CONTRIBUTING.md)；包含凭据或未公开漏洞的信息请按[安全说明](SECURITY.md)处理。
+The [2026-11-10 coverage snapshot](docs/COVERAGE.md) measured **100% production line coverage** for Rust, Swift, and Python. It records the measured source hashes and scope; it is distinct from the status of subsequent CI runs. System-boundary mocks and isolated DAV/Samba fixtures complement real-system validation.
+
+- [Build and test](CONTRIBUTING.md)
+- [Test methodology and coverage](docs/TESTING.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
+- [All documentation](docs/README.md)
+
+Please include a redacted version, command, error, and minimal reproduction when [reporting an issue](https://github.com/lorian7392/RDrive/issues).

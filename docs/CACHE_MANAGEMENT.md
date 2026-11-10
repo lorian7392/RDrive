@@ -1,65 +1,65 @@
-# 清理缓存与缓存目录（0.8）
+# Cache management
 
-RDrive 有两类清洁内容：Rust 客户端缓存，以及 macOS File Provider 管理的 Finder 下载副本。两者计入已有的联合容量预算。以下 `cache clear` 和 `cache directory` 管理 Rust 缓存；不会移动系统管理的 Finder 存储，不会迁移或删除待上传快照、离线修改、目录索引、连接配置和版本历史。
+RDrive accounts for two kinds of clean content: the Rust client's cache and downloaded Finder copies managed by macOS File Provider. Both contribute to the shared capacity budget. The `cache clear` and `cache directory` commands introduced in 0.8 manage the Rust cache. They do not move Finder's system-managed storage, upload snapshots, offline edits, directory indexes, connection profiles, or version history.
 
-## 清理缓存
+## Clear the cache
 
 ```sh
-# 只预览，不移除文件。
+# Preview without removing files.
 rdrive cache clear
 
-# 清理可回收的内容。
+# Remove reclaimable content.
 rdrive cache clear --apply
 rdrive cache status
 ```
 
-清理只处理状态库记录的缓存对象。固定离线的文件、正在通过 RDrive 读取的文件和未记录文件保持原样。即使一个文件的名称长得像缓存 UUID，也不会因此被删除。结果给出候选文件及字节数、实际清理数量，以及跳过的固定/在用对象。
+Clearing considers only cache objects recorded in the state database. Pinned files, files being read through RDrive, and unrecorded files remain untouched. A filename that resembles a cache UUID is not sufficient authority to delete it. Results list candidate files and bytes, actual removals, and skipped pinned or active objects.
 
-需要回收固定内容时，先明确解除对应文件的固定，再清理：
+To reclaim pinned content, explicitly unpin the relevant files first:
 
 ```sh
 rdrive cache unpin dav documents --recursive
 rdrive cache clear --apply
 ```
 
-这不删除远端文件。缓存中的唯一离线副本被回收后，下一次访问需要重新下载。Finder 内的已下载文件由系统保护；可使用 Finder 的 Allow Automatic Removal / Remove Download，或已有的系统回收入口：
+This does not delete remote files. Reclaiming the only offline copy means that the next access needs a download. For system-managed Finder copies, use Finder's Allow Automatic Removal / Remove Download actions or the native trim command:
 
 ```sh
-# 请求系统回收可移除的 Finder 下载副本，固定或未上传内容仍受保护。
+# Ask macOS to reclaim removable Finder copies. Pinned and unsent content stays protected.
 rdrive provider native -- --trim-cache 0
 ```
 
-应对当前已注册的伴随 App 执行该命令；使用其他包时显式指定 `--app /absolute/path/RDrive.app`。系统可能拒绝回收正在使用、已固定或修改未上传的文件，命令返回结果才是本次实际回收情况。不要手工删除 `~/Library/CloudStorage` 内的文件来模拟缓存清理。
+Use the companion App associated with the currently registered domains. To select another bundle, pass `--app /absolute/path/RDrive.app`. macOS can refuse eviction for files that are open, pinned, or contain unsent changes; inspect the returned result for what was actually reclaimed. Do not manually delete files under `~/Library/CloudStorage` to simulate cache clearing.
 
-## 修改缓存路径
+## Change the cache directory
 
 ```sh
-# 显示当前路径。
+# Show the current path.
 rdrive cache directory
 
-# 新路径的父目录应已存在；新目录可以不存在，或是空的 0700 私有目录。
+# The parent must exist. The destination may be absent or an empty private 0700 directory.
 rdrive cache directory /absolute/path/RDriveCache --dry-run
 rdrive cache directory /absolute/path/RDriveCache
 
-# 将现有内容迁回默认状态目录下的 cache。
+# Move existing content back to cache under the default state directory.
 rdrive cache directory --default --dry-run
 rdrive cache directory --default
 ```
 
-相对路径、符号链接、非私有目录、非空目标，以及与状态目录、已知同步目录或系统 File Provider 存储重叠的位置会被拒绝。不同状态目录不能使用同一个缓存根。每个自定义根带有绑定到状态目录和目录身份的私有标记，不会把用户已有文件夹直接收编为缓存。
+RDrive rejects relative paths, symbolic links, non-private directories, nonempty destinations, and locations overlapping its state directory, known synchronization roots, or system File Provider storage. Separate state directories cannot share a cache root. Each custom root has a private ownership marker bound to its state directory and directory identity; an existing user folder is never silently adopted as a cache.
 
-迁移包含固定内容，保持文件版本、哈希、固定策略和连接归属。开始前检查活跃下载/读取；有活跃使用时保持原设置，待任务结束后重试。迁移先复制并逐个核验 SHA-256，完成后一次保存新配置，最后清理旧副本。因此跨磁盘也可迁移，但目标盘需要容纳全部缓存的空间；中途不能依赖移动操作立即腾出源空间。
+Migration includes pinned content and preserves revisions, hashes, pin policies, and connection ownership. Active downloads or readers prevent the change and leave the existing configuration intact; retry after they finish. RDrive copies and verifies every payload with SHA-256, saves the new configuration once, then removes old copies. Migration can cross disks, but the destination needs room for the entire cache. Do not rely on it to free source space while copying.
 
-迁移计划持久保存在状态目录。进程在配置提交前退出时，下一次启动清理此次未完成的复制并继续使用旧路径；配置已经提交则验证新副本后完成旧副本清理。出现损坏、非预期文件或身份改变时保留数据并停止，不能通过删除迁移计划来“修复”。目录索引、上传队列与原生 Finder 存储的位置保持独立。
+The migration plan is persisted in the state directory. If the process exits before configuration commit, the next startup removes this migration's incomplete copies and keeps the old path. After configuration commit, it verifies the new copies before completing old-copy cleanup. Corruption, unexpected files, or changed directory identity stop recovery and preserve data. Deleting the migration plan is not a repair procedure. Directory indexes, upload queues, and native Finder storage keep their own locations.
 
-源目录出现未记录文件时，迁移会停止并保留所有内容。先自行整理这些文件；清理缓存不会删除它们。恢复默认路径同样需要目标没有非预期内容。
+Unrecorded files in the source stop migration without deleting any content. Review those files separately; cache clearing will not remove them. Returning to the default path also requires a destination free of unexpected content.
 
-## MCP 与 Skills
+## MCP and Skills
 
-- `rdrive_cache_directory`：只读查询当前路径。
-- `rdrive_cache_set_directory`：传入 `directory`，或 `default: true` 恢复默认；可加 `dry_run: true`。
-- `rdrive_cache_clear`：默认预览，`apply: true` 才执行。
+- `rdrive_cache_directory` queries the current path without writing.
+- `rdrive_cache_set_directory` accepts `directory`, or `default: true` to restore the default; `dry_run: true` previews the change.
+- `rdrive_cache_clear` previews by default and requires `apply: true` to remove content.
 
-写入工具需要 MCP `--allow-write`；新目录需要位于 `--local-root` 授权范围。普通上传、下载和导出入口禁止访问缓存根及迁移涉及的目录，即使它们处于一个更大的授权本地目录中。使用 `cache get` / 对应工具按连接和远端路径读取自己的缓存；不要从内部对象名绕过连接归属。
+Write tools require MCP `--allow-write`, and the destination must fall within an authorized `--local-root`. General upload, download, and export tools reject the cache root and migration directories even when they lie inside a broader authorized local directory. Read cached content by profile and remote path with `cache get` or its MCP equivalent; internal object names must not bypass connection ownership.
 
-旧版本后台程序不能识别新的缓存路径配置。启用此功能前，将使用同一状态目录的桥接服务升级到 0.8；保留原状态，正常停止旧进程后再启动新版。`cache directory` 不设置 Finder 系统下载目录，也不是把整个 RDrive 状态目录迁到另一块磁盘。
+Older background processes do not understand custom cache paths. Before enabling this feature, upgrade every bridge using the same state directory to 0.8, stop older processes normally, and retain the existing state. `cache directory` does not configure Finder's download location or relocate the whole RDrive state directory.

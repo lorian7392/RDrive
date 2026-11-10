@@ -1,11 +1,11 @@
-## 问题与行为
+## Problem and behavior
 
-描述触发问题、修改后的具体行为，以及对应 issue（如有）。
+Describe the trigger, resulting behavior, and related issue, if any.
 
-## 验证
+## Validation
 
-列出实际运行的检查、结果和未执行的相关环境检查。区分 mock、隔离服务与真实系统验证；不要以测试计数代替覆盖率。
+List the checks actually run, their results, and relevant checks not run. Distinguish mocks, isolated servers, and real-system verification. Test counts do not establish coverage.
 
-## 兼容性
+## Compatibility
 
-如涉及状态迁移、覆盖、删除或恢复，说明旧状态如何处理、失败时保留哪些数据及相关文档更新。
+For migration, overwrite, deletion, or recovery changes, explain how existing state is handled, what survives failure, and which documentation was updated.

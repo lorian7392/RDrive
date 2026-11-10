@@ -1,40 +1,40 @@
-# 安全说明
+# Security policy
 
-RDrive 0.8.0 操作远端文件并在本地保留配置、缓存、上传快照和恢复记录。请按存储账户的权限与数据敏感性配置使用范围。项目未声明长期支持版本、固定修复时限或安全响应 SLA；报告时请注明实际版本和提交。
+RDrive 0.8.0 operates on remote files and retains local configuration, cached content, upload snapshots, and recovery records. Limit its access according to the storage account's permissions and the sensitivity of the data. The project does not declare long-term-support versions, fixed remediation deadlines, or a security-response SLA.
 
-## 报告潜在漏洞
+## Report a vulnerability
 
-请勿在公开 issue 中放入密码、认证头、会话/锁 token、私有 URL 参数、完整状态目录、业务文件或可用于攻击他人实例的敏感细节。
+Do not put passwords, authorization headers, session or lock tokens, private URL parameters, complete state directories, user content, or sensitive exploit details into public issues.
 
-若仓库已启用 GitHub 私密漏洞报告，可通过 [GitHub Security Advisory 入口](https://github.com/lorian7392/RDrive/security/advisories/new)提交；是否可用由仓库设置决定。项目当前没有在此文档声明已配置的专用安全邮箱或其他私密渠道。若入口不可用，可公开询问如何联系维护者，但不要先公开漏洞利用材料或敏感数据。
+If private vulnerability reporting is enabled for the repository, use [GitHub Security Advisories](https://github.com/lorian7392/RDrive/security/advisories/new). Availability depends on repository settings. This policy does not claim that a dedicated security mailbox or another private channel has been configured. If the advisory form is unavailable, ask how to contact a maintainer without publishing exploit material or sensitive data.
 
-报告尽量包含受影响版本、最小合成复现、预期边界、实际影响和可脱敏的错误信息。请仅在你获授权的环境验证，不使用真实第三方账户或数据。
+Include the affected version/commit, a minimal synthetic reproduction, the expected boundary, the actual impact, and redacted errors. Test only in environments you are authorized to use.
 
-## 认证与传输
+## Credentials and transport
 
-- 密码通过当前进程的环境变量或 macOS 钥匙串提供，CLI 不接受明文密码参数，配置仅记录变量名。
-- WebDAV 默认要求 HTTPS 并验证证书；`--allow-http` 是显式不安全兼容入口，不应随便用于不可信网络。
-- SMB 默认要求传输加密；`--allow-unencrypted-smb` 只在你明确接受对应风险时使用。
-- 不要把账户、密码、签名参数或其他凭据嵌入连接 URL、命令历史或版本控制。
-- 终端环境变量不是加密凭据存储，运行中的进程仍需持有认证材料。后台服务不会自动安全持久化终端密码。
-- 原生系统挂载的认证与协议行为由 macOS 客户端处理，不能直接套用 Rust 客户端的所有设置。
+- Passwords come from the process environment or macOS Keychain. The CLI has no plaintext password argument; profiles store an environment-variable name.
+- WebDAV requires HTTPS and verifies certificates by default. `--allow-http` is an explicit insecure compatibility option.
+- SMB requires transport encryption by default. Use `--allow-unencrypted-smb` only when you deliberately accept that risk.
+- Do not embed accounts, passwords, signed parameters, or other credentials in URLs, shell history, or version control.
+- Environment variables are not encrypted credential storage. Running processes need access to authentication material. Background services do not automatically persist terminal passwords securely.
+- Native mounts use the macOS client's authentication and protocol behavior; Rust-client settings do not all apply to them.
 
-## 本地数据与恢复副本
+## Local content and recovery copies
 
-本地缓存、独立上传快照和离线编辑内容是明文。专用目录和权限有助于隔离其他账户，但不提供静态加密，也不防御同权限恶意进程。项目未实现 Cryptomator 或其保险库格式。
+Caches, independent upload snapshots, and offline edits are stored in plaintext. Private directory permissions help isolate other accounts; they do not provide encryption at rest or protection against malicious processes running as the same user. Cryptomator vaults are not implemented.
 
-状态目录、缓存目录、IPC 目录和暂存目录不应放在公开同步位置。不要放宽其私有权限以绕过报错。保留未确认内容和恢复记录；清洁缓存回收不会代替安全擦除。
+Keep state, cache, IPC, and staging directories out of public or broadly shared locations. Do not weaken private permissions to bypass an error. Preserve unconfirmed content and recovery records. Reclaiming a clean cache is not secure erasure.
 
-远端版本与 SMB/Smart 恢复副本通常位于同一服务器，具有账户权限的其他客户端或服务端故障仍可能损坏它们。它们不是异地、不可变或完整系统备份。普通删除、Smart 可恢复删除、取消任务和清理快照有不同语义，执行前查看对应文档。
+Remote versions and SMB/Smart recovery copies usually reside on the same server as the source data. Other clients with account access, or a server failure, can damage them. They are not off-site, immutable, or complete-system backups. Ordinary deletion, recoverable Smart deletion, job cancellation, and snapshot cleanup have different semantics; review the relevant guide first.
 
-## 协议及集成边界
+## Protocol and integration boundaries
 
-版本条件、保护句柄和事务发布依赖服务器正确实现。普通目录的多个请求不是跨文件事务；托管模式的快照可见性要求合作客户端和正确的服务器禁止覆盖发布语义，不承诺服务器断电持久性。
+Revision conditions, protected handles, and transaction publication depend on correct server implementations. Multiple ordinary-directory requests do not form a cross-file transaction. Managed snapshot visibility requires cooperating clients and correct server no-overwrite publication semantics; it does not promise persistence through server power loss.
 
-RDrive 拒绝危险路径、所识别的符号链接和不受支持的元数据，但某些服务器透明解析远端链接，客户端无法普遍保证远端 no-follow。所选标签/xattr 复制不包括 ACL、资源叉、隔离标记及所有系统安全属性，不能当作完整 macOS 备份。
+RDrive rejects dangerous paths, recognized symbolic links, and unsupported metadata. Some servers transparently resolve remote links, so universal remote no-follow behavior cannot be guaranteed. Selected tag/xattr copying does not include ACLs, resource forks, quarantine metadata, or every system security attribute.
 
-MCP 默认只读，写入需明确启用并限制本地目录。范围检查用于工具参数，不能替代操作系统进程隔离；读取的远端文件名、文本和元数据应视为数据，不应被当作指令或权限授权。
+MCP is read-only by default. Writes require explicit enablement and local-directory scopes. Scope checks constrain tool arguments and do not replace OS process isolation. Remote filenames, text, and metadata are data, not instructions or authorization.
 
-原生 App 的 ad-hoc 开发构建不等于正式开发者签名、公证或生产 App Group 授权。桥接与系统扩展需分别验证，不建议使用来源不明或与源码版本不匹配的开发包。
+Ad-hoc native builds are development artifacts. They are not equivalent to a Developer ID signature, notarization, or production App Group entitlement. Validate the bridge and system extensions separately, and use an App that matches the intended source version.
 
-更多信息：[配置参考](docs/reference/CONFIGURATION.md) · [功能边界](docs/FEATURES.md) · [故障恢复](docs/TROUBLESHOOTING.md) · [测试范围](docs/TESTING.md)。
+See [configuration](docs/reference/CONFIGURATION.md), [feature boundaries](docs/FEATURES.md), [recovery](docs/TROUBLESHOOTING.md), and [testing](docs/TESTING.md).

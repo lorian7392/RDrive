@@ -1,376 +1,257 @@
-# 功能、保护与限制
-
-本页说明当前实现提供的行为。全部命令、参数与默认值见 [CLI 参考](reference/CLI.md)，
-持久配置与环境变量见 [配置参考](reference/CONFIGURATION.md)，
-当前测试方式及历史验证范围见 [测试](TESTING.md) 和 [验证记录](VALIDATION.md)。
-代码具备某项能力、隔离测试通过、某台真实服务器验证及 macOS 已接受扩展，是不同证据。
-
-## 三种访问方式与托管模式
+# Features, guarantees, and limits
 
-**Rust CLI 文件操作**直接连接 WebDAV 或 SMB。`ls/stat/get/cat/put/mkdir/cp/mv/rm/url/edit`
-可独立使用，无需 FUSE 或伴随 App。RDrive 自己管理缓存、队列、同步基线、续传检查点和恢复记录。
+This guide describes the implemented behavior. Use the [CLI reference](reference/CLI.md) for every command, argument, and default; [configuration](reference/CONFIGURATION.md) for persistent settings and environment variables; and [testing](TESTING.md) and [validation records](https://github.com/lorian7392/RDrive/blob/main/docs/VALIDATION.md) for evidence.
 
-**普通 `mount` 网络卷**调用 macOS 原生 SMB/WebDAV helper，应用访问的是系统网络文件系统。
-它保留服务器原有目录结构；认证、缓存、证书、超时和文件 I/O 由 macOS 管理。
-RDrive 的 `--limit`、清洁缓存预算、Smart 队列与普通 `sync` 不控制这个卷的应用 I/O。
+An implemented capability, an isolated passing test, a verified server deployment, and a system-accepted native extension are different results.
 
-**File Provider / Smart 域**由可选伴随 App、系统扩展与 Rust 桥接服务共同提供。
-系统管理真实占位文件与下载副本；SQLite 保存已发现的目录元数据，离线修改另存持久快照。
-创建配置、编译 App、注册域、系统启用和 Finder 实际可用需要分别完成与验证。
+## Access modes
 
-**managed repository** 是另一个存储格式，可从 CLI 或 File Provider 逻辑视图读取。
-它将不可变内容对象与完整快照一起发布，合作客户端只看到完整旧树或完整新树。
-普通 `mount`、普通文件操作及 `sync` 不自动获得跨文件事务；
-直接挂载仓库的服务器目录会看到内部对象，而非逻辑文件树。
+**Rust CLI operations** connect directly to WebDAV or SMB. `ls/stat/get/cat/put/mkdir/cp/mv/rm/url/edit` work without FUSE or the companion App. RDrive manages its own cache, queue, baselines, checkpoints, and recovery records.
 
-## 连接、认证、路由与能力诊断
-
-`profile add/list/remove` 维护连接；`info` 测试实际认证连接并显示后端能力/诊断。
-已有连接禁止直接覆盖，删除时检查未完成上传与缓存，防止意外把旧数据指向新目标。
-密码由指定环境变量或 macOS 钥匙串读取，不接受密码参数，也不写入配置。
-没有用户名的 WebDAV 可匿名访问；后台进程需要自己的可用凭据。
-
-WebDAV 默认 HTTPS 并验证证书。HTTP 仅明确许可后可用，主要用于可信测试环境。
-当前 Rust WebDAV 使用 Basic 认证，未提供 Digest、OAuth、客户端证书、自定义 CA 或自定义请求头配置。
-URL 禁止内嵌认证、查询参数及片段。重定向默认拒绝，只允许同一资源补末尾 `/` 的有限情况。
-超时默认 120 秒，可在新增连接时设置；WebDAV 连接超时最多 30 秒，总请求采用配置值。
+**Native `mount` network volumes** use macOS SMB/WebDAV helpers. Applications access the system network filesystem with the server's ordinary directory layout. macOS controls authentication, certificates, caching, timeouts, and file I/O. RDrive's `--limit`, clean-cache budget, Smart queue, and ordinary `sync` do not control application I/O on these volumes.
 
-Rust WebDAV 保留系统及环境变量代理支持；`localhost` 和字面回环 IP 强制直连，
-其他私网目标仍保留原代理路由。底层 macOS 代理发现不完整支持例外表与 PAC，
-可用 `NO_PROXY` 明确指定直连目标。见 [配置与代理](reference/CONFIGURATION.md)。
+**File Provider / Smart domains** combine the optional companion, system extensions, and Rust bridge. macOS manages real placeholders and downloaded copies. SQLite retains discovered metadata; offline changes have separate persistent snapshots. Configuration, compilation, domain registration, system enablement, and usable Finder behavior require separate steps.
 
-SMB 使用纯 Rust SMB2/3 客户端，默认要求加密，可为可信兼容性测试明确关闭。
-支持用户名/密码认证，未提供 SMB1、Kerberos/SSO、DFS、域浏览或服务发现。
-SMB 的协议能力及生命周期诊断与原生系统挂载分别实现，不能用其中一种成功推断另一种成功。
-
-## 路径与通用文件操作
-
-远端路径是相对于连接 URL 的 UTF-8 路径，根为 `""`，使用 `/`。
-禁止绝对路径、`..`、反斜杠、NUL；重复分隔符和 `.` 段会规范化。
-后端也核验服务器返回的解码路径，拒绝越界子项与目录循环。
-`ls --recursive --contains TEXT` 递归列举并按内容片段筛选路径；
-这会请求服务器目录，与离线 `index search` 不同。`stat` 读取类型、大小、时间与修订。
-
-`get` 在目标旁写临时文件，核对远端长度和修订，再提交到本地。
-默认不覆盖本地文件；`cat` 直接输出文件字节，`--max-bytes` 可在下载前限制文件大小。
-`put` 先保存独立、校验过的源快照，默认只创建新文件；明确 `--overwrite` 才允许覆盖。
-`cp`、`mv` 同样默认不覆盖；`mkdir --parents` 才递归创建祖先；
-`rm` 拒绝根，删除目录必须 `--recursive`。
-
-SMB 文件上传/复制先写同目录独立暂存文件，完成后服务器重命名发布。
-失败可能留下 `.rdrive-upload-<UUID>`、`.rdrive-copy-<UUID>`，目录复制可能留下部分目标树。
-这些内部文件被普通同步排除，暂不自动清理。
-识别到的 SMB 重解析点/符号链接被拒绝；WebDAV 没有统一远端链接属性，
-服务端透明解析的链接无法保证识别。本地同步不接受符号链接。
-
-大文件采用流式传输；哈希校验、SMB 强修订扫描和同步会额外读取内容，带来磁盘及网络开销。
-WebDAV 单次目录 XML 最大 16 MiB，超过上限停止，不将不完整列表当成空目录。
-原始修改时间不保证全部保留。
-
-`url` 只生成资源地址，不改变权限、不建立公开或临时签名分享链接。
-普通 WebDAV/SMB 没有统一分享、文件请求或远程 ACL 编辑接口。
-
-## 安全编辑
-
-`edit PROFILE REMOTE` 下载文件、运行 `EDITOR`，保存后入队受版本保护的上传。
-`EDITOR` 必须是单个可执行文件（默认 `/usr/bin/vi`），不能包含附加参数。
-WebDAV 要求可靠强 ETag；SMB 核验 SHA-256 和文件身份，使用受保护句柄。
-远端变化时保留本地结果并停止上传；编辑器失败会报告保留文件路径。
-这不是 GUI 编辑器调度或跨文件编辑事务。
-
-## 持久上传队列与历史
-
-`put --queue` 只保存持久快照和任务；之后源文件被修改或删除不会改变队列内容。
-`queue list/run/cancel` 检查、执行或取消任务，`status` 离线汇总本机队列/缓存，
-`history --limit N` 显示本地完成事件，默认 20 条。历史是本机记录，不是服务端审计日志。
-
-只有服务器确认后任务才是 `done`；重启将未确认的 `running` 改为 `interrupted`。
-`queue run` 可重试待处理及不覆盖远端的中断任务；失败任务需 `--retry-failed`。
-曾无条件覆盖且结果不明的任务还需要 `--retry-ambiguous-overwrite`，它可能再次覆盖同一路径。
-默认只创建的重试若发现已有目标会冲突并保留快照，不静默改成覆盖。
-
-未使用 `--resume` 的任务从头传输。取消普通队列任务删除其本地快照；
-若有上传检查点则保留，取消不删除远端暂存或恢复备份。
-Smart 取消采用另一个保留本地恢复快照的流程，不要混淆两类队列。
-单次普通 CLI 退出后不会留下后台同步进程。
-
-## 进度、限速与并行
-
-`--limit N` 是同一 Rust 进程的共享文件载荷字节/秒，必须为正整数。
-所有相关任务共同使用；重试、前缀核验、强修订哈希、复制和发布后校验产生的真实额外流量也计入。
-已经续传的前缀不重复计为新的逻辑完成量。不含 HTTP/SMB 头、加密或 TCP 重传开销，
-也不约束原生网络卷的系统 I/O。
-
-`--progress auto` 在终端显示传输条、速度和 ETA，重定向时输出逐行 JSON；
-`json` 始终输出 JSON，`off` 关闭。进度在 stderr，结果在 stdout。
-包含任务与汇总计数，速度窗口为最近两秒；传输完成字节与服务器确认提交分别记录。
-
-`--jobs 1..64`（默认 4）控制 `queue run` 的并行远端目标数。
-相同连接及目标路径保持顺序，状态由协调器保存。
-它不会把普通同步或托管事务所有步骤自动并行化。
-
-## 下载与上传断点续传
-
-`get --resume` 的持久检查点保存落盘前缀长度与 SHA-256。
-重启先重新核验前缀，裁去未记录尾部，再按受保护修订请求剩余字节。
-远端变化、错误的范围响应、本地目标被其他进程修改都会停止并保留数据。
-`--overwrite` 替换本地文件时保留旧副本，位置由 `previous_local` 返回。
-
-SMB `put --resume` 在重连后核验远端私有暂存文件身份与每个已上传前缀字节，才续写。
-重跑相同内容及参数可复用未完成任务；内容改变则建立新任务。
-检查点上传在运行中可进行有限次认证重连恢复；它不依赖协议 durable 写句柄或脏写缓存。
-
-普通 WebDAV 没有统一上传续传协议，不会用分段 PUT 猜测。
-明确配置同源 `nextcloud_upload_url` 后，`put --resume` 使用 Nextcloud 分块上传。
-只有已确认、源哈希匹配且具有未改变强校验标识的块才能跳过；其他块重传。
-发布采用目标条件保护，之后完整下载核对 SHA-256，因此增加一次完整读取。
-结果不明先核对目标，不盲目覆盖重发。服务器可能让过期会话失效；
-隔离协议测试不能替代真实 Nextcloud 兼容性实测。
-
-下载检查点在状态目录 `transfers/`，部分数据在目标旁 `.rdrive-partial-<UUID>/`，
-上传检查点为 `spool/<job-id>.upload.json`。`transfers list/discard` 检查或丢弃下载检查点，
-保留旧本地恢复副本；这些数据、上传快照和远端暂存不是普通清洁缓存。
-
-## 清洁缓存、离线固定与目录迁移
-
-`cache fetch [--recursive] [--pin]` 在线获取并核验文件，复用有效副本；
-`cache get` 完全离线读取并校验 SHA-256，不保证副本是服务器最新修订。
-`cache list/status` 离线检查，`unpin` 解除固定，`prune --max-bytes` 按 LRU 回收未固定内容。
-普通 `get` 不自动固定缓存。
-
-`cache config --max-bytes N` 持久设置联合清洁预算，`--unlimited` 解除限制。
-预算包括 Rust 缓存、客户端报告的 File Provider 清洁副本和下载预留。
-开始下载前预留空间，固定及正在读取的文件受保护；缩小预算无法容纳受保护内容时报错并保持原配置。
-上传快照、未上传编辑、传输暂存、数据库、恢复数据及系统开销额外占用空间。
-它是清洁载荷预算，不是磁盘分区配额或静态空间预分配。
-
-`cache clear` 默认只预览，`--apply` 才清理状态库记载的可回收 Rust 对象。
-未知文件不会仅因像 UUID 而被删除。`cache directory` 查询路径，
-`PATH [--dry-run]` 安全迁移，`--default` 迁回默认路径。
-迁移复制并逐项校验，再提交新配置与清理旧副本；目标需额外空间。
-中断恢复按日志核对旧/新目录，身份变化、损坏或未知文件出现时保留数据并停止。
-
-自定义根需绝对、真实、私有，目标为空且不与状态、同步或系统 File Provider 存储重叠；
-缓存 marker 绑定状态目录与目录身份，不同状态目录不可共享同一根。
-迁移包含固定缓存，不迁移 Finder 系统下载目录、队列或索引。
-系统副本需用系统 eviction 接口回收，可能被系统拒绝；不要手工删除 CloudStorage 模拟清缓存。
-见 [缓存管理](CACHE_MANAGEMENT.md)。所有缓存及快照目前明文保存，未实现静态加密。
-
-## 普通目录同步与 watch
-
-`sync` / `watch` 需要两端根预先存在；方向为默认 `both`、`push` 或 `pull`。
-默认只计划，`--apply` 才执行；方向不是无条件镜像许可。
-`watch` 在前台按间隔重复（默认 30 秒），两轮之间释放状态锁；Ctrl-C 停止。
-SMB 通知用于促发核对，周期扫描仍保留。
-
-首次无共同基线时不根据另一端缺失推断删除。同路径已有文件会下载远端临时副本核验 SHA-256，
-只有两边内容相同且版本稳定才建基线；否则报告冲突，不能只靠大小和时间认定相同。
-后续比较本地哈希、远端修订和共同基线，两边都改动时整份计划停止。
-文件/目录类型冲突、大小写/Unicode 规范化名称冲突、符号链接、失败或不完整扫描也会停止。
-
-删除传播另需 `--delete` 且已有成功基线。不支持可靠受保护删除的远端保留文件并失败；
-远端空目录保留，不用递归删除猜测其中没有新文件。SMB 文件删除核验身份和内容、使用受保护句柄。
-被本地替换/删除的旧内容保存在同步根 `.rdrive-versions/<id>/original`，内部目录不再同步。
-这与服务器上的自定义远端版本是两个独立存储。
-
-WebDAV 覆盖需要强 ETag。SMB 覆盖核验 SHA-256 与身份，持有拒写/删句柄，
-把旧文件移到恢复副本，再用不覆盖重命名发布新文件。
-两次重命名之间有短暂路径空缺，不能称为跨崩溃原子替换。
-未完成恢复收据会阻止同步将空缺解释为用户删除。
-SMB 强修订扫描读取完整内容，可能增加大量流量，也可能因外部客户端正在写而停止本轮。
-
-普通同步没有跨文件事务：中途失败不回滚已确认的网络操作，保留旧基线及旧内容副本。
-下一次运行可能需要检查已发生变化并处理无共同基线/版本冲突。
-丢失状态目录也会丢失共同基线。`--metadata` 使用独立属性基线，见下节。
-
-## 文件标签和选定用户扩展属性
-
-`metadata capture/apply/recover/push/pull` 及 `sync --metadata` 处理普通文件所选属性。
-CLI 内建选择 Finder 标签 `com.apple.metadata:_kMDItemUserTags`、`com.apple.FinderInfo`、
-安全的 `com.apple.metadata:*` 与 `user.*`。二进制值使用十六进制保存，保留标签 plist 原始数据。
-单值最大 1 MiB、总值最大 4 MiB、属性最多 1024；CLI 输入记录文件最大 64 MiB。
-排除项在报告中列明，未选或接收策略不管理的属性保留。
-目录标签、资源叉、ACL、隔离标记、签名和系统安全属性不在复制范围，不能当完整 macOS 备份。
-
-普通 WebDAV/SMB 使用 `.rdrive-metadata/` 的便携记录，绑定相对路径、强修订和内容 SHA-256。
-推送先核验本地/远端正文一致，再条件更新；不直接修改服务器原生 xattrs、ACL 或 SMB ADS。
-属性同步两端都变化时保留双方并报告冲突；无可靠修订或正文不一致时停止或延后。
-正文与侧边记录分步确认，不是同一事务；托管仓库将所选元数据放在快照内一起发布。
-
-本地属性应用先记旧值，失败会回滚；macOS 没有跨多个 xattr 的原子系统调用。
-`metadata apply --journal` 可将恢复日志保存到专用私有目录，
-中断后 `metadata recover` 核验文件身份和内容，再恢复，拒绝套用到替换后的文件。
-
-原生 File Provider 通过系统 `tagData` 与 `extendedAttributes` 回调桥接。
-Finder 可能提供 abstract keyed archive，伴随程序验证并转换为标准标签 plist；
-不能把 archive 直接写成磁盘 xattr。原生扩展属性范围比 CLI 小：允许的 `user.*` /
-`com.apple.metadata:*` 名称还必须以 `#S` 结尾，合计最多 32 KiB，标签走独立字段。
-构建通过和实际 Finder 双向标签回调成功需分别验证，见 [macOS 集成](MACOS_INTEGRATION.md)。
-
-## Smart 按需、离线修改及恢复
-
-`smart setup` 创建独立域，不自动改变普通网络卷。
-当前清洁预算为 unlimited 时会设为 5 GiB，已有数值上限保持；需要无限可在建域后重新配置。
-`--register` 才要求已构建的原生 App 注册；桥接服务、通知助手和系统扩展启用仍需匹配配置。
-`provider domain-add` 也可创建普通或托管域；`provider domains/domain-remove` 管理本地域配置。
-移除本地配置不等于注销系统域或释放全部磁盘占用。
-
-目录首页先写入 SQLite，后台逐层发现；浏览已索引目录不用等待全树扫描。
-打开文件才按需下载；已下载系统副本可离线打开，未下载文件仍需网络。
-Keep Offline 固定目录及后代，新发现子项继承；解除父固定不撤销子项单独固定。
-允许自动移除只是解除固定，不承诺立刻回收内容。
-
-离线修改先保存独立校验快照，重连按原始版本条件上传，服务器确认后才完成回执。
-`smart status/list` 查看，`pause/resume` 控制发布，`run` 执行一遍，
-`retry` 只标记可重试、不放宽版本条件；`cancel` 保留恢复副本；
-`export` 导出为真实文件，`discard` 只允许已结束/取消/替代的恢复快照。
-暂停/取消不能撤回已发生的远端操作。
-
-未开始、基于相同修订的连续编辑可合并；已开始或结果不明的修改保留各自快照。
-后续编辑只能依据本客户端前一次确认回执重新建立条件，外部变化会停止重放链。
-新建文件重复保存同样在首次创建确认后转为受保护修改。
-已确认传输副本可回收，回执、哈希和条件继续保留；请求 UUID 改变不会重复已确认写入。
-
-Smart 普通目录支持文件/目录新建、内容与标签更新、重命名、移动和恢复式删除。
-移动不覆盖，稳定 ID、后代路径与固定策略一起更新。目录删除保存清单，
-受保护移动至 `.rdrive-trash-<UUID>` 并核验整树，变化则恢复或保留恢复路径并冲突。
-`smart recovery` 显示原路径、备份路径与阶段，`space_reclaimed: false` 说明未释放服务器空间。
-本版不自动物理清空远端恢复备份。复合内容/名称/标签操作有分步回执，普通目录没有跨请求原子性。
-详见 [Smart 使用](SMART_SYNCHRONIZATION.md) 与 [Smart 管理](SMART_OPERATIONS.md)。
-
-## 过滤、自动版本与冲突决定
-
-`filter status/config/reset/test` 管理全局与连接级规则。
-默认排除常见临时文件，支持重复 include/exclude glob、清空列表、临时文件开关与逐字段继承。
-排除优先于包含，目录规则覆盖后代；规则区分大小写，完整语法见 [配置](reference/CONFIGURATION.md)。
-过滤影响 Smart 列表、索引发现/搜索与新写入，不删除远端、不清除恢复快照，也不推断删除。
-被排除的待处理工作可暂停，重新允许后继续。显式 CLI 访问及普通 `sync` 保持各自规则。
-
-`policy status/config/reset` 设置 Smart 自动版本与正文冲突策略。
-自动版本默认关闭，启用后覆盖前先归档观察到的修订，确认发布后才裁剪，默认保留 5 个。
-备份失败或发布不明时不先删历史；其他写者未确认的恢复备份也受保护，数量可暂时超限。
-历史按路径保存，不自动随重命名迁移。
-
-冲突默认 `stop`；`keep-both` 使用稳定后缀且只创建新文件，`replace` 先保存实际远端修订再条件替换。
-决定在写入前持久化，之后远端再次变化仍停止。
-`smart resolve --strategy keep-both|replace|remote` 可对保留正文的冲突明确选择，
-`remote` 放弃本地发布但保留恢复快照。目录、目标缺失和同时移动/改名的命名冲突可能需人工处理。
-普通 `sync` 不因这些策略获得自动覆盖许可。
-
-## SQLite 目录索引与离线搜索
-
-`index config/status/refresh` 控制背景元数据预建、深度、刷新与一次性需求。
-默认预建完整树，一般目录 300 秒、当前浏览/固定目录 30 秒；根深度 0。
-关闭一般预建后仍可刷新根、浏览与离线需求；手动递归刷新可越过深度上限。
-这些请求只保存到本机，需要保持 `provider serve` 或后台服务运行，单次 `info` / 普通挂载不会启动它。
-
-列举只读元数据，SMB 使用明确的弱 metadata token，不把它当覆盖条件。
-后台连接复用、失败退避、公平调度；慢网络请求可能延后下个后台任务，
-已有目录的 SQLite 读取不等待网络工作者锁。完整目录比较后事务发布变更，失败列表不删除旧项。
-`pending` 是已发现未成功扫描目录数，不是正在执行任务数。
-
-`index search DOMAIN QUERY` 仅搜索已索引文件名/路径，不搜正文、不连服务器。
-三字符及以上使用 FTS5 trigram，短查询使用转义 LIKE，`%` / `_` 按字面解释；
-不执行用户 FTS 语法。支持范围、文件类型、分页，应用当前过滤与待删除状态。
-索引变化可能影响跨页结果，结果不代表整个服务器都已扫描。
-
-每域 SQLite 使用 WAL、事务和持久 anchor，绑定协议、账户、远端根与仓库模式。
-旧 JSON 首次迁移后保留，SQLite 成为权威来源；旧 schema 派生搜索索引原子升级。
-损坏、未知版本、绑定不匹配会报错并保留数据，不静默清空回执。
-备份运行中数据库需包含 WAL 的正确 SQLite 备份方式，升级勿混用旧服务。
-详见 [目录索引](DIRECTORY_INDEXING.md)。
-
-## 托管快照与多文件事务
-
-`repo init/begin/put/mkdir/rm/mv/status/commit/abort/transactions/ls/get` 提供专用逻辑文件树。
-`repo put` 保存校验快照，修改原源文件不改变事务。事务可一次添加、替换、改名、移动或删除多个逻辑项，
-稳定身份与所选文件标签随完整树一起发布。已有普通目录不自动导入。
-
-控制目录 `.rdrive-repository/` 包含格式、不可变 SHA-256 对象、提交槽与暂存清单。
-发布前核验对象与完整清单，以禁止覆盖重命名争用下一个不可变序号；不依赖可变 HEAD 或远端残留锁。
-读者校验父链、内容绑定、UUID、父目录和名称冲突。并发写者只有一方发布，另一方冲突并保留暂存。
-不会自动合并；需要重读最新树并建立新事务。
-
-结果不明时保留同一状态目录，重放相同 `repo commit TX` 核对已发布事务，不新建重复提交。
-`repo abort` 仅允许未准备发布事务。保证依赖服务器正确提供同文件系统原子禁止覆盖重命名，
-范围是合作客户端的快照可见性及客户端进程崩溃恢复，不是服务器断电或恶意服务器持久性保证。
-
-没有垃圾回收、历史压缩、分支合并、自动迁移或自动冲突合并。
-旧提交、不可达对象、失败暂存及本机源快照继续占空间；当前读取验证完整历史，提交验证引用对象，
-大仓库成本随历史与内容增长。不能把仓库控制目录当缓存清理。见 [仓库](REPOSITORY.md)。
-
-## SMB 通知、lease 与断线恢复
-
-`notify` 使用真实 CHANGE_NOTIFY，报告创建、修改、删除与重命名提示，
-`--recursive` 请求后代，`--count` 控制非 ready 事件数量。
-通知不是完整日志，重命名提示不是配对事务；溢出、无效路径、断线与取消需要重新扫描/订阅。
-断线发送 `rescan_required` 后结束，订阅间可能丢失变化，因此 `watch` 保留周期核对。
-
-SMB3 读取请求 RH lease 与 durable-v2，服务器可拒绝或调整超时；SMB2 使用普通受保护打开。
-处理真实 lease break / ACK，不存在脏写缓存或保留已关闭应用句柄。
-读失败后按相同身份与加密策略重新认证，先尝试 durable 重连，必要时完整身份+SHA-256 核验后 reopen；
-内容相同但身份改变也拒绝。最多 3 次读恢复，单次认证最多 5 次有限退避尝试。
-客户端重启使用应用层下载检查点，不持久化协议 durable token。
-
-这些能力不等于 persistent CA handles、透明故障转移、服务器重启后 durable 状态仍存或断电保证。
-诊断区分请求、实际授予、重连、verified reopen 与失败认证，不把发出标志当服务端已支持。
-详见 [SMB 生命周期](SMB_LIFECYCLE.md)。
-
-## 远端恢复标记与版本
-
-SMB 受保护覆盖保留 `.rdrive-backup-<UUID>` 与 `.rdrive-recovery-<UUID>.json`，
-成功发布有完成标记；与 `.rdrive-upload-*` / `.rdrive-copy-*` 一起被同步排除。
-未完成收据会阻止将路径空缺当成删除。没有可用检查点时，先检查目标、收据、完整暂存和旧副本，
-明确选择恢复后才删除对应未完成收据；不要盲目清理全部内部标记。这些副本不自动回收，也不是异地备份。
-
-`versions save/list/restore/prune` 保存自定义文件历史；`put --overwrite --version`
-在覆盖前保存目标修订并持久化重试条件。SMB 与强 ETag WebDAV 可用。
-内容在服务器 `.rdrive-versions/<路径哈希>/<版本ID>/content`，清单含 SHA-256，恢复前核验。
-仅文件，经过本机临时下载再上传，不依赖服务器 COPY，与 Mountain Duck `.duckversions` 不兼容。
-`prune` 默认计划，`--apply` 才删除；保存多步骤失败可能留下无有效清单的目录，列表不将其当有效版本。
-历史与源数据在同一服务器，删除服务器目录会一起丢失，不是离线、异地或不可变备份。
-
-## WebDAV 锁
-
-`lock --seconds` 默认请求 600 秒，要求服务器 LOCK/UNLOCK，实际期限由服务器决定。
-后续修改与 `unlock` 从 `RDRIVE_WEBDAV_LOCK_TOKEN` 读取 token 并附条件。
-不自动续约，不承诺组合多个源/目标锁。SMB 受保护打开/共享模式与 WebDAV 锁不同，没有 SMB 锁管理命令。
-
-## 用户后台服务与 macOS 原生集成
-
-`service install/start/stop/restart/status/uninstall/run` 是显式选择的 macOS 每用户监督服务。
-安装仅保存配置，启动后监督本状态目录的 Rust bridge，崩溃退避重启；指定 `--app` 时另监督原生通知助手。
-开发 TCP 模式、IPC 根与构建包必须匹配。只控制自身固定任务，不扫描结束其他 RDrive 进程。
-服务不自动注册域/启用扩展，卸载保留配置、缓存、索引和恢复内容。
-私有配置不写密码，监督日志有限轮转；服务存活不等于服务器认证及同步成功。
-
-`macos/` 提供伴随 App、FinderSync 兼容菜单/图标和 replicated File Provider。
-构建、开发签名、系统注册、启用、Finder 可见以及按需读写分开验证，
-开发包不等于正式签名、公证的发行安装包。
-File Provider 使用系统支持的状态装饰与菜单；独立 FinderSync 仍受系统路径/角标限制。
-当前界面证据及限制见 [macOS 集成](MACOS_INTEGRATION.md)。
-
-## MCP 与 AI 操作入口
-
-`mcp tools` 输出当前工具的精确 JSON schema；`mcp serve` 提供本地 JSON-RPC stdio，
-通过同一可执行文件子进程复用 CLI 逻辑。默认只查询，`--allow-write` 才暴露写工具；
-本地文件还须在重复的 `--local-root` 现有绝对目录内，拒绝符号链接、遍历、内部状态及缓存越界。
-它用于防误访问，不是抵抗其他本地进程并发替换路径的操作系统隔离。
-
-同一时刻执行一项工具，队列内部仍可并行；等待时不持有 Store 锁。
-支持初始化、工具/资源、ping、取消、超时和有界文本读。
-默认每项 300 秒；输入帧最多 1 MiB，stdout/stderr 各最多 8 MiB，文本读最多 1 MiB UTF-8。
-取消/超时终止当前子进程，不能撤销已完成远端修改，需检查队列或事务状态。
-标准输出仅协议消息，不是 HTTP/SSE 服务。不提供任意 shell、密码参数或编辑器执行接口。
-
-工具覆盖文件、同步、挂载、队列、缓存、Smart、索引、规则、服务、版本与仓库；
-完整字段以 `mcp tools --allow-write` 为准。配套 `rdrive-files`、`rdrive-smart-sync`、
-`rdrive-transactions` 技能与配置生成/安装脚本见 [MCP](MCP.md)。
-技能安装不会自动注册 MCP。计划、入队或本地注册不能报告为已传输、挂载或部署成功。
-
-## 尚未提供的能力
-
-公开分享/文件请求、Cryptomator 保险库、静态加密、远程 ACL 编辑、目录标签、
-完整资源叉/安全属性备份、独立 Spotlight 搜索界面、完整 GUI 连接管理及正式原生发行安装包尚未提供。
-普通目录跨文件事务、自动全局冲突合并、仓库 GC 与服务器断电持久性不在当前保证范围。
-真实 NAS/云服务互操作性以对应版本验证记录为准，客户端条件与恢复日志不能替代服务端正确性。
+**Managed repositories** use a dedicated storage format accessible through the CLI or File Provider's logical view. Immutable objects and complete snapshots give cooperating clients a complete old or new tree. Ordinary mounts, file commands, and `sync` do not inherit these transactions. Mounting the physical repository directory exposes its internal storage rather than the logical tree.
+
+## Profiles, authentication, routing, and diagnostics
+
+`profile add/list/remove` manages connections. `info` performs an authenticated connection and reports backend capabilities and diagnostics. An existing profile cannot be silently replaced; removal checks pending uploads and cache ownership to prevent redirecting old state to new storage.
+
+Passwords come from an explicit environment variable or macOS Keychain. They are not command arguments or configuration values. WebDAV without a username can connect anonymously. Background processes need their own usable credential source.
+
+WebDAV requires HTTPS and verifies certificates by default. HTTP needs explicit permission. The Rust backend currently supports Basic authentication; Digest, OAuth, client certificates, custom CA configuration, and custom request headers are not provided. URLs reject embedded credentials, query parameters, and fragments. Redirects are rejected except for a limited same-resource trailing-slash case. The default timeout is 120 seconds; connection timeout is capped at 30 seconds while total requests use the configured value.
+
+WebDAV retains environment/system proxy support. `localhost` and literal loopback addresses always connect directly; other private-network targets retain normal proxy routing. macOS proxy discovery does not fully support PAC or exception lists. Use `NO_PROXY` for explicit direct destinations. See [configuration](reference/CONFIGURATION.md).
+
+SMB uses a Rust SMB2/3 client with required encryption by default and an explicit unencrypted compatibility option. Username/password authentication is supported; SMB1, Kerberos/SSO, DFS, domain browsing, and service discovery are not provided. Rust SMB diagnostics and native system mounts are independent implementations.
+
+## Paths and file operations
+
+Remote paths are UTF-8 and relative to the profile URL. The root is `""` and the separator is `/`. Absolute paths, `..`, backslashes, and NUL are rejected; repeated separators and `.` components normalize. Backends also validate decoded server paths and reject escaping children or directory cycles.
+
+`ls --recursive --contains TEXT` walks server directories and filters paths by a substring. It is distinct from offline `index search`. `stat` reports type, length, modification time, and revision.
+
+`get` writes a temporary file beside the destination, verifies remote length/revision, and then publishes locally. It preserves existing files by default. `cat` writes file bytes directly; `--max-bytes` bounds the advertised size before download. `put` retains an independent verified source snapshot and creates a new file unless `--overwrite` is explicit.
+
+`cp` and `mv` also preserve existing destinations. `mkdir --parents` creates ancestors. `rm` rejects the root and requires `--recursive` for a directory.
+
+SMB file upload/copy writes an independent sibling staging file before server-side rename publication. Failure may leave `.rdrive-upload-<UUID>` or `.rdrive-copy-<UUID>`; directory copy can leave a partial destination tree. Ordinary sync excludes these internal names; they are not automatically reclaimed.
+
+Recognized SMB reparse points/symlinks are rejected. WebDAV has no universal remote-link attribute, and server-transparent links may be impossible to identify. Local sync rejects symlinks.
+
+Large payloads stream rather than loading into memory. Hashing, strong SMB revision scans, and synchronization may read content again and add disk/network cost. WebDAV directory XML is limited to 16 MiB; an oversized or incomplete listing is not treated as empty. Original modification times are not universally preserved.
+
+`url` returns a resource address without changing permissions or creating a public/signed link. There is no uniform sharing, file-request, or remote ACL editor.
+
+## Protected editing
+
+`edit PROFILE REMOTE` downloads a file, invokes `EDITOR`, and queues a revision-protected upload after modification. `EDITOR` names one executable, without extra arguments; the default is `/usr/bin/vi`.
+
+WebDAV needs a reliable strong ETag. SMB verifies identity and SHA-256 and uses protected handles. Remote changes stop publication while retaining the local result. An editor failure reports its retained local path. This is not a GUI editor launcher or a multi-file editing transaction.
+
+## Persistent upload queue and history
+
+`put --queue` retains a persistent snapshot and job. Later modification or removal of the original source does not change queued content. `queue list/run/cancel` inspects, executes, or cancels jobs. `status` summarizes local queue/cache state offline. `history --limit N` shows local completion events, with a default of 20; it is not a server audit log.
+
+A job becomes `done` only after server confirmation. Restart changes unconfirmed `running` work to `interrupted`. `queue run` retries pending work and interrupted work that does not overwrite remote content. Failed work needs `--retry-failed`.
+
+An uncertain overwrite also needs `--retry-ambiguous-overwrite`, which may overwrite the path again. A create-only retry conflicts with an existing destination and preserves its snapshot instead of silently becoming an overwrite.
+
+Jobs created without `--resume` retransmit from the beginning. Ordinary queue cancellation removes the local upload snapshot, retains an existing upload checkpoint, and does not remove remote staging/recovery copies. Smart cancellation separately preserves local recovery snapshots. A one-shot CLI command does not leave a background synchronization process.
+
+## Progress, rate limits, and parallel jobs
+
+`--limit N` is a positive shared payload-bytes-per-second budget within one Rust process. It accounts for actual traffic from retry, prefix verification, strong-revision hashing, copy, and post-publication validation. A resumed prefix is not counted again as newly completed logical content.
+
+The budget excludes protocol headers, encryption overhead, and TCP retransmissions. It does not control native network-volume I/O.
+
+`--progress auto` shows a progress bar, speed, and ETA in a terminal and line-delimited JSON when redirected. `json` always emits JSON; `off` disables progress. Progress uses stderr; results use stdout. Events include job and aggregate counters with a two-second speed window, separating payload completion from server-confirmed publication.
+
+`--jobs 1..64`, default 4, controls concurrent remote targets in `queue run`. Jobs for the same profile and target remain ordered; a coordinator saves state. It does not parallelize every step of ordinary sync or managed transactions.
+
+## Resumable downloads and uploads
+
+`get --resume` persists flushed prefix length and SHA-256. Restart verifies the prefix, truncates unrecorded tail bytes, and requests the suffix under a protected remote revision. Remote changes, incorrect range replies, or concurrent local modification stop resumption and preserve data. A local overwrite retains the old file and reports its `previous_local` path.
+
+SMB `put --resume` verifies the private staging file's identity and every uploaded prefix byte before continuing. Repeating the same content and arguments can reuse unfinished work; changed source content creates a new job. Running checkpointed uploads can perform bounded authenticated reconnects. They do not rely on durable write handles or dirty write caching.
+
+Ordinary WebDAV has no generic upload-resume protocol; RDrive does not guess with partial PUT. An explicit same-origin `nextcloud_upload_url` enables Nextcloud chunking. A chunk is skipped only when confirmed, bound to the source hash, and still protected by an unchanged strong validator. Other chunks retransmit.
+
+Final publication protects the destination and is followed by a full SHA-256 read. An ambiguous result is inspected rather than blindly overwritten. Servers may expire sessions. Isolated protocol tests do not establish compatibility with every real Nextcloud deployment.
+
+Download records live in `transfers/`, with partial content beside the target in `.rdrive-partial-<UUID>/`. Upload checkpoints use `spool/<job-id>.upload.json`. `transfers list/discard` manages download records while preserving prior local recovery copies. These files, upload snapshots, and remote staging are not clean cache.
+
+## Clean cache, pinning, and relocation
+
+`cache fetch [--recursive] [--pin]` downloads and verifies content, reusing valid copies. `cache get` is entirely offline and verifies SHA-256 without establishing server freshness. `cache list/status` are local queries; `unpin` removes a pin; `prune --max-bytes` reclaims eligible unpinned content by LRU. Ordinary `get` does not pin content.
+
+`cache config --max-bytes N` persists the combined clean budget; `--unlimited` removes the limit. Accounting includes Rust cache, reported clean File Provider copies, and download reservations. Downloads reserve capacity first. Pins and active readers are protected. An impossible reduction fails without changing the previous limit.
+
+Upload snapshots, unsent edits, temporary transfers, databases, recovery content, and system overhead consume additional space. This is a clean-payload budget, not a partition quota or preallocated disk reservation.
+
+`cache clear` previews by default. `--apply` removes reclaimable Rust objects recorded by the state database; an unknown file is not removed merely because its name looks like a UUID.
+
+`cache directory` reports the path. `PATH [--dry-run]` migrates it; `--default` returns to the default root. Migration copies and verifies each object before committing configuration and cleaning old copies, requiring temporary capacity for both. Recovery checks old/new identity and stops on corruption or unknown files while preserving data.
+
+A custom root must be absolute, real, private, empty, and disjoint from state, sync, and system File Provider storage. An ownership marker binds it to its state/directory identity; separate state directories cannot share it. Migration includes pinned Rust cache but does not move Finder downloads, queues, or indexes.
+
+System copies must be reclaimed through native eviction APIs, which may refuse. Do not remove CloudStorage files manually to imitate cache cleanup. All cache/snapshot content is currently plaintext. See [cache management](CACHE_MANAGEMENT.md).
+
+## Ordinary directory synchronization and watch
+
+`sync` and `watch` require existing roots on both sides. Directions are `both` (default), `push`, and `pull`. The default is preview; `--apply` executes. Direction does not authorize unconditional mirroring.
+
+`watch` runs in the foreground at an interval, default 30 seconds, releasing the state lock between passes. Ctrl-C stops it. SMB notifications prompt checks while periodic scanning remains enabled.
+
+Without a common baseline, absence on one side does not establish deletion. Existing files at one path require a temporary remote download and SHA-256 comparison. Only equal content and stable revisions establish the initial baseline; size and time are insufficient.
+
+Subsequent plans compare local hashes, remote revisions, and the common baseline. Concurrent changes on both sides stop the complete plan. File/directory conflicts, case/Unicode-normalization collisions, symlinks, and failed/incomplete scans also stop it.
+
+Deletion propagation additionally requires `--delete` and a successful baseline. An insufficiently protected remote deletion fails and retains the file. Empty remote directories remain rather than being recursively deleted on an assumption of emptiness. SMB file deletion verifies identity/content and uses a protected handle.
+
+Replaced/deleted local content is retained at `.rdrive-versions/<id>/original` beneath the sync root and excluded from synchronization. This is separate from custom versions stored on the server.
+
+WebDAV overwrite requires a strong ETag. SMB overwrite verifies SHA-256 and identity, holds a deny-write/delete handle, moves the old file to a recovery copy, and publishes the new file with no-overwrite rename. The two renames have a brief path gap; this is not crash-atomic replacement. An unfinished recovery receipt prevents interpreting that gap as a user deletion.
+
+Strong SMB scans read complete contents and may add substantial traffic or stop while another client writes. Ordinary synchronization has no cross-file transaction: a mid-run failure retains the old baseline and prior copies but does not undo confirmed operations. Subsequent runs may require reconciliation. Losing state also loses the common baseline. `--metadata` adds an independent attribute baseline.
+
+## Finder tags and selected extended attributes
+
+`metadata capture/apply/recover/push/pull` and `sync --metadata` handle selected attributes on ordinary files. CLI policy includes Finder tags (`com.apple.metadata:_kMDItemUserTags`), `com.apple.FinderInfo`, safe `com.apple.metadata:*`, and `user.*`. Binary values use hexadecimal encoding and preserve the tag plist.
+
+Limits are 1 MiB per value, 4 MiB total, 1,024 attributes, and 64 MiB for an input record file. Reports identify exclusions. Attributes outside the selection or receiving policy remain untouched. Directory tags, resource forks, ACLs, quarantine, signatures, and system security attributes are outside this scope.
+
+Ordinary WebDAV/SMB uses portable `.rdrive-metadata/` sidecars bound to relative path, strong revision, and content SHA-256. Push verifies equal local/remote content before conditional update. It does not directly edit server-native xattrs, ACLs, or SMB ADS.
+
+Changes on both sides preserve content and report a metadata conflict. Missing reliable revisions or unequal content stop/defer the operation. Content and sidecars confirm separately. Managed repositories instead publish selected metadata in the same snapshot.
+
+Local application records prior values and rolls back after failure; macOS has no atomic multi-xattr syscall. `metadata apply --journal` saves a recovery journal in a dedicated private directory. `metadata recover` verifies file identity and content before restoring values and refuses a replacement file.
+
+File Provider bridges native `tagData` and `extendedAttributes` callbacks. Finder may supply an abstract keyed archive, which the companion validates and converts to a standard tag plist rather than writing the archive directly as an xattr. Native xattrs have a narrower policy: permitted `user.*` / `com.apple.metadata:*` names must end with `#S`, with a 32 KiB combined limit. Tags use a separate field.
+
+Compilation and actual bidirectional Finder tag callbacks are separate validation. See [macOS integration](MACOS_INTEGRATION.md).
+
+## Smart on-demand access and offline recovery
+
+`smart setup` creates an independent domain without converting an ordinary network volume. If the current clean budget is unlimited, setup assigns 5 GiB; an existing numeric limit remains. Reconfigure afterward if unlimited storage is intentional.
+
+`--register` asks a built companion to register the domain. The bridge, notification helper, and enabled system extensions still need matching settings. `provider domain-add` also creates ordinary or managed domains; `provider domains/domain-remove` manages local configuration. Removing local configuration does not unregister a system domain or release all disk usage.
+
+The first directory page is persisted in SQLite before background breadth-first discovery. Browsing an indexed directory does not wait for a complete scan. Content downloads when opened. Materialized system copies work offline; unmaterialized content needs a connection.
+
+Keep Offline pins a directory and descendants, including newly discovered children. Unpinning a parent preserves explicit child pins. Allow Automatic Removal removes pinning but does not promise immediate eviction.
+
+Offline changes retain independent verified snapshots. Reconnect uploads use the original revision conditions and complete receipts only after server confirmation. `smart status/list` inspects work; `pause/resume` controls publication; `run` performs one pass; `retry` marks eligible work without weakening its revision; `cancel` retains recovery copies; `export` writes a real file; and `discard` cleans snapshots only after completion, cancellation, or supersession.
+
+Pause/cancel cannot undo a completed remote operation. Unstarted edits against the same base may coalesce; started or uncertain edits keep their snapshots. Later edits advance conditions only through this client's prior confirmed receipt. External changes stop the replay chain. Repeated saves of a newly created file become protected modifications after initial confirmation.
+
+Confirmed transfer payloads can be reclaimed while receipts, hashes, and conditions remain. A changed request UUID does not repeat a confirmed write.
+
+Smart ordinary directories support file/directory creation, content/tags, rename, move, and recoverable deletion. Moves preserve destinations and update stable IDs, descendant paths, and pin policies. Directory deletion records a manifest, moves the tree to `.rdrive-trash-<UUID>` under protection, and verifies the tree. A concurrent change restores it or preserves a recovery path and reports conflict.
+
+`smart recovery` reports original/backup paths and phases. `space_reclaimed: false` means server space was not freed. This version does not automatically purge remote recovery copies. Combined content/name/tag operations have stepwise receipts; ordinary directories have no cross-request atomicity. See [Smart synchronization](SMART_SYNCHRONIZATION.md) and [management](SMART_OPERATIONS.md).
+
+## Filters, automatic versions, and conflicts
+
+`filter status/config/reset/test` manages global and profile rules. Common temporary files are excluded by default. Rules support repeated include/exclude globs, empty-list clearing, temporary-file switches, and per-field inheritance.
+
+Exclusion wins over inclusion. Directory rules apply to descendants, and matching is case-sensitive. Filters affect Smart listings, discovery/search, and new writes; they do not delete remote data or recovery snapshots or infer deletion. Excluded pending work may pause and continue when allowed again. Explicit CLI access and ordinary sync keep their own rules. See [configuration](reference/CONFIGURATION.md).
+
+`policy status/config/reset` controls Smart automatic versions and content-conflict strategy. Versions are off by default. When enabled, overwrite archives the observed revision first and prunes only after confirmed publication; the default retention is 5. Failed backup or uncertain publication does not prune first. Unconfirmed recovery versions from other writers remain protected, so counts can exceed the limit temporarily. History is path-based and does not follow rename automatically.
+
+The default conflict strategy is `stop`. `keep-both` uses a stable suffix and creates only a new file. `replace` saves the actual remote revision before conditional replacement. Decisions persist before writes; a further remote change still stops publication.
+
+`smart resolve --strategy keep-both|replace|remote` explicitly handles retained-content conflicts. `remote` abandons local publication while preserving the recovery snapshot. Directory, missing-target, and simultaneous move/rename conflicts may need manual handling. These policies do not grant ordinary `sync` automatic-overwrite permission.
+
+## SQLite indexes and offline search
+
+`index config/status/refresh` controls background metadata prebuilding, depth, refresh, and one-shot demands. Defaults are the full tree, 300-second ordinary refresh, and 30-second browsed/pinned refresh; root depth is 0.
+
+Disabling general prebuilding still permits root, browse, and offline demands. A manual recursive request can exceed the configured depth. Requests persist locally and need `provider serve` or the resident service to run. One-shot `info` and ordinary mounts do not start a background worker.
+
+Enumeration reads metadata. SMB's weak metadata token is not an overwrite condition. Workers reuse connections with backoff and fair scheduling. Slow network work may delay the next background job; existing SQLite directory reads do not wait for its lock. Complete directory comparison publishes changes transactionally; a failed listing preserves old items. `pending` counts discovered directories not successfully scanned, not currently executing jobs.
+
+`index search DOMAIN QUERY` reads indexed names/paths only. It does not search content or contact the server. Queries of at least three characters use FTS5 trigram; short queries use escaped LIKE. `%` and `_` are literal, and user FTS syntax is not executed.
+
+Search supports scope, type, and pagination with current filters and pending-deletion state. Index changes can affect later pages. Results do not establish that the entire server has been scanned.
+
+Each domain's WAL SQLite database retains transactional state and anchors bound to protocol, account, root, and repository mode. Migration preserves legacy JSON and makes SQLite authoritative. Derived search schemas upgrade atomically. Corrupt, unknown-version, or mismatched state fails without silently clearing receipts.
+
+Back up a live database through a WAL-aware SQLite backup procedure. Do not mix older writers with upgraded state. See [directory indexing](DIRECTORY_INDEXING.md).
+
+## Managed snapshots and multi-file transactions
+
+`repo init/begin/put/mkdir/rm/mv/status/commit/abort/transactions/ls/get` manages a dedicated logical tree. `repo put` retains a verified source snapshot; changing the original later does not change the transaction. A transaction can add, replace, rename, move, or delete multiple logical items and publish stable IDs and selected tags with the complete tree. Ordinary directories are not imported automatically.
+
+`.rdrive-repository/` stores its format, immutable SHA-256 objects, commit slots, and staged manifests. Publication verifies objects/the full manifest, then competes for the next immutable sequence slot through no-overwrite rename. It does not rely on mutable HEAD or a stranded remote lock.
+
+Readers validate parent chains, content binding, UUIDs, directories, and name conflicts. One concurrent writer wins; the other conflicts and retains staging. There is no automatic merge: read the latest tree and start a new transaction.
+
+For an uncertain result, retain the original state and replay `repo commit TX` to inspect that transaction's publication. Do not create duplicate commits. `repo abort` accepts only transactions not yet prepared for publication.
+
+Guarantees require correct same-filesystem atomic no-overwrite rename. They cover cooperating-client snapshot visibility and client-process crash recovery, not malicious servers or persistence through server power loss.
+
+Repository GC, history compaction, branch merging, automatic migration, and automatic conflict merging are not implemented. Old commits, unreachable objects, failed staging, and local snapshots consume space. Reads validate complete history and commits verify referenced objects, so costs grow with history/content. Repository control files are not cache. See [managed repositories](REPOSITORY.md).
+
+## SMB notifications, leases, and reconnects
+
+`notify` uses CHANGE_NOTIFY for create/change/delete/rename hints. `--recursive` requests descendants; `--count` counts non-ready events. Notifications are not a complete journal, and rename hints are not paired transactions.
+
+Overflow, invalid paths, disconnect, and cancellation require rescan/resubscription. A disconnect emits `rescan_required` and ends the subscription. Changes may be lost between subscriptions, so `watch` retains periodic verification.
+
+SMB3 reads request RH leases and durable-v2 handles; the server may decline or adjust timeouts. SMB2 uses ordinary protected opens. The client handles lease breaks/ACKs without dirty write caching or retaining closed application handles.
+
+Read recovery authenticates under the same identity/encryption policy, tries durable reconnect, and, if needed, verifies complete identity plus SHA-256 before reopening. Equal content with a changed identity is still rejected. There are at most 3 read recoveries and 5 bounded-backoff attempts per authentication.
+
+Client restart uses application download checkpoints; protocol durable tokens are not persisted. These features do not provide persistent CA handles, transparent failover, retained durable state after server restart, or power-loss guarantees. Diagnostics distinguish requests, grants, reconnect, verified reopen, and authentication failures. See [SMB lifecycle](SMB_LIFECYCLE.md).
+
+## Remote recovery markers and versions
+
+Protected SMB overwrite can retain `.rdrive-backup-<UUID>` and `.rdrive-recovery-<UUID>.json`, with a completion marker after publication. Sync excludes them and `.rdrive-upload-*` / `.rdrive-copy-*`.
+
+An unfinished receipt prevents interpreting a missing path as deletion. Without a usable checkpoint, inspect the target, receipt, complete staging, and prior copy before choosing recovery and removing the corresponding unfinished receipt. These copies have no automatic reclamation and are not independent backups.
+
+`versions save/list/restore/prune` manages custom file history. `put --overwrite --version` archives the target and persists retry conditions before replacement. It supports SMB and strong-ETag WebDAV.
+
+Payloads live at `.rdrive-versions/<path-hash>/<version-id>/content` with SHA-256 manifests verified before restore. Versions are file-only and transfer through local temporary storage rather than requiring server COPY. The format is incompatible with Mountain Duck's `.duckversions`.
+
+Pruning previews unless `--apply` is explicit. A failed multi-step save may leave an incomplete version directory; listing does not treat it as valid. Versions reside beside server data, not in an offline, off-site, or immutable backup.
+
+## WebDAV locks
+
+`lock --seconds` requests 600 seconds by default and requires LOCK/UNLOCK support. The server chooses the actual duration. Later mutations and `unlock` read `RDRIVE_WEBDAV_LOCK_TOKEN` and attach the condition.
+
+Locks do not renew automatically or provide general combined source/destination locking. SMB protected opens/share modes are a different mechanism; there is no SMB lock-management command.
+
+## Resident services and native macOS integration
+
+`service install/start/stop/restart/status/uninstall/run` manages an opt-in per-user macOS supervisor. Installation saves configuration. Starting supervises this state directory's Rust bridge with crash backoff; `--app` also supervises the native notification helper.
+
+Development TCP mode, IPC root, and bundle must match. The service controls its own fixed roles rather than scanning/killing arbitrary RDrive processes. It does not register domains or enable extensions. Uninstall retains profiles, caches, indexes, and recovery content.
+
+Private configuration contains no passwords, and logs have bounded rotation. A running supervisor does not establish server authentication or successful synchronization.
+
+`macos/` provides the companion, compatibility Finder Sync menus/badges, and replicated File Provider. Compilation, development signing, registration, enablement, Finder display, and on-demand reads/writes require separate checks. Development builds are not notarized distribution installers.
+
+File Provider uses native state decorations/actions. Independent Finder Sync remains subject to system path/badge restrictions. See [macOS integration](MACOS_INTEGRATION.md).
+
+## MCP and AI clients
+
+`mcp tools` exposes exact runtime JSON schemas; `mcp tools --allow-write` includes the write-tool catalog. `mcp serve` provides local JSON-RPC stdio by running the same executable as a child, reusing CLI semantics. Queries are exposed by default; `--allow-write` enables write tools.
+
+Local files must fall beneath repeated existing absolute `--local-root` directories. Paths reject symlinks, traversal, internal state, and cache escape. This prevents accidental access and is not OS isolation against concurrent replacement by another local process.
+
+One tool runs at a time, while queue jobs may still run in parallel. Waiting requests do not hold the Store lock. The server supports initialization, tools/resources, ping, cancellation, timeouts, and bounded UTF-8 text reads.
+
+Defaults/limits are 300 seconds per operation, 1 MiB input frames, 8 MiB each for stdout/stderr, and 1 MiB text content. Cancellation/timeouts terminate the child but cannot undo confirmed remote writes; inspect queue/transaction state.
+
+Stdout contains protocol messages only. This is not HTTP/SSE, and it exposes no arbitrary shell, password argument, or editor execution interface.
+
+Tools cover files, sync, mounts, queues, cache, Smart, indexes, rules, services, versions, and repositories. The [MCP guide](MCP.md) describes `rdrive-files`, `rdrive-smart-sync`, `rdrive-transactions`, configuration, and installation. Installing a Skill does not register an MCP server. A plan, queued job, or local domain is not a completed transfer, mount, or deployment.
+
+## Not implemented
+
+Public sharing/file requests, Cryptomator, encryption at rest, remote ACL editing, directory tags, complete resource-fork/security-attribute backup, a standalone Spotlight search interface, full GUI connection management, and production native installers are not provided.
+
+Ordinary-directory cross-file transactions, global automatic conflict merging, repository GC, and server power-loss persistence are outside current guarantees. Server interoperability is limited to versioned evidence; client conditions and recovery records depend on correct servers.

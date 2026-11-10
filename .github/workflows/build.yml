@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-build:
+    name: macOS release build
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select Rust 1.90
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          rustup override set 1.90.0
+      - name: Build the release CLI
+        run: cargo build --locked --release --bin rdrive
+      - name: Build and verify the optional native companion
+        run: python3 macos/build.py --cli target/release/rdrive --output target/native-ci
+      - name: Verify CLI, bundle, and tag versions
+        env:
+          RDRIVE_REF_TYPE: ${{ github.ref_type }}
+          RDRIVE_REF_NAME: ${{ github.ref_name }}
+        run: |
+          args=(--binary target/release/rdrive --app target/native-ci/RDrive.app --output target/build-artifacts/version-report.json)
+          if [[ "$RDRIVE_REF_TYPE" == tag ]]; then
+            args+=(--tag "$RDRIVE_REF_NAME")
+          fi
+          python3 tests/check_version.py "${args[@]}"
+      - name: Test version validation
+        run: python3 -m unittest discover -s tests -p 'test_version.py' -v
+      - name: Prepare build artifacts
+        run: |
+          tar -czf target/build-artifacts/rdrive-macos.tar.gz -C target/release rdrive
+          cp target/native-ci/build-report.json target/build-artifacts/native-build-report.json
+          cd target/build-artifacts
+          shasum -a 256 rdrive-macos.tar.gz version-report.json native-build-report.json > SHA256SUMS
+      - name: Upload CLI and build reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdrive-macos-${{ runner.arch }}-${{ github.sha }}
+          path: target/build-artifacts/
+          if-no-files-found: error
+          retention-days: 14

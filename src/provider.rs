@@ -1055,7 +1055,12 @@ async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S
  #[test]fn apple_tmp_alias_resolves_to_the_pinned_parent(){let temp=tempfile::Builder::new().prefix("rdrive-bridge-").tempdir_in("/private/tmp").unwrap();let root=temp.path().canonicalize().unwrap();let stage=root.join("Transfers");fs::create_dir(&stage).unwrap();fs::write(stage.join("x"),b"data").unwrap();let fd=open_staging(&stage).unwrap();let alias=PathBuf::from(stage.join("x").to_str().unwrap().replacen("/private/tmp/","/tmp/",1));assert!(staging_file(&stage,&fd,&alias).is_ok());}
  #[test]fn tag_clear_removes_attribute_and_staging_copy_keeps_user_xattrs(){
     use std::os::fd::AsRawFd;let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let stage=root.join("stage");fs::create_dir(&stage).unwrap();fs::set_permissions(&stage,fs::Permissions::from_mode(0o700)).unwrap();let source=root.join("source");fs::write(&source,b"data").unwrap();
-    let file=File::open(&source).unwrap();let name=std::ffi::CString::new("user.rdrive-test").unwrap();let value=b"attribute";let result=unsafe{libc::fsetxattr(file.as_raw_fd(),name.as_ptr(),value.as_ptr().cast(),value.len(),0,0)};assert_eq!(result,0);
+    let file=File::open(&source).unwrap();let name=std::ffi::CString::new("user.rdrive-test").unwrap();let value=b"attribute";
+    #[cfg(target_os="macos")]
+    let result=unsafe{libc::fsetxattr(file.as_raw_fd(),name.as_ptr(),value.as_ptr().cast(),value.len(),0,0)};
+    #[cfg(target_os="linux")]
+    let result=unsafe{libc::fsetxattr(file.as_raw_fd(),name.as_ptr(),value.as_ptr().cast(),value.len(),0)};
+    assert_eq!(result,0);
     let mut metadata=crate::metadata::capture(&source,&Default::default()).unwrap();metadata.attributes.insert("com.apple.metadata:_kMDItemUserTags".into(),"00".into());let cleared=apply_tags(metadata,Some("")).unwrap();assert!(!cleared.attributes.contains_key("com.apple.metadata:_kMDItemUserTags"));
     let delivered=staging_output(&stage,&open_staging(&stage).unwrap(),&source).unwrap();let copied=crate::metadata::capture(&delivered,&Default::default()).unwrap();assert_eq!(copied.attributes.get("user.rdrive-test"),Some(&"617474726962757465".to_owned()));
  }

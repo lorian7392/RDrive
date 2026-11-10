@@ -2,7 +2,10 @@ name: Checks
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -23,6 +26,9 @@ jobs:
       LLVM_PROFILE_FILE: ${{ github.workspace }}/target/coverage/post-export-%p-%m.profraw
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Freeze application source identities
         run: python3 tests/source_manifest.py --output target/coverage/source-manifest.json
       - name: Set up Rust
@@ -72,6 +78,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Set up Rust
         run: rustup toolchain install 1.90.0 --profile minimal --component llvm-tools-preview
       - name: Select Rust and install pinned coverage tool

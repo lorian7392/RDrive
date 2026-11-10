@@ -1,41 +1,41 @@
-# 生产代码覆盖率验收
+# Production coverage snapshot
 
-2026-11-10，本次交付的源码通过逐语言 **100% 生产可执行行覆盖率**门槛：
+On 2026-11-10, the source delivered in [commit `f831526`](https://github.com/lorian7392/RDrive/commit/f83152605c7a283bc7a09ba00f612344fc0d8467) passed **100% executable production line coverage for each language**:
 
-- Rust：**15,803 / 15,803 行**，覆盖当前 macOS 目标的自有 `src/` 生产代码。
-- Swift：**1,863 / 1,863 行**，十个 macOS 生产源文件全部纳入测量。
-- Python：**291 / 291 行**，四个分发脚本全部纳入测量；另测得 **94 / 94 分支**。
+- Rust: **15,803 / 15,803 lines**, covering first-party `src/` production code for the measured macOS target.
+- Swift: **1,863 / 1,863 lines**, including all ten macOS production source files.
+- Python: **291 / 291 lines**, covering all four distributed scripts, plus **94 / 94 measured branches**.
 
-[完整逐文件报告与 SHA-256](validation/production-coverage-2026-11-10.json)保存每个生产文件的可执行行数、命中数、未覆盖行、源码哈希、输入报告校验和及检查结果。全部文件的未覆盖行列表为空，来源检查完整。
+The [original file-level report and SHA-256 records](validation/production-coverage-2026-11-10.json) retain executable/covered lines, empty uncovered-line lists, source hashes, input checksums, and validation results. The original JSON is preserved unchanged.
 
-本记录来自提交前冻结的工作树；报告中的基准 Git HEAD 是当时已有提交，不能单独用来标识随后修改的源码。实际验收对象由报告中的逐文件 SHA-256 标识，与本记录一起交付。以后修改源码，应重新测量并保存新的记录，不能将本次数值直接归给新版。
+This is a historical snapshot of `f831526`, not a coverage claim for later English documentation, generator changes, CI fixes, or other revisions. The report was produced from a frozen working tree before that commit. Its recorded base HEAD identifies the preceding commit; the per-file SHA-256 values identify the actual measured source delivered in `f831526`. Any later source change requires fresh collection and a passing gate. Do not attribute these counts or hashes to the current checkout without verification.
 
-## 范围与计数
+## Scope and counting
 
-范围不包含第三方依赖、测试代码、生成文件及开发测试工具。生产系统适配器、失败处理、恢复逻辑与本次目标下编译的系统路径全部保留，没有使用覆盖率排除标记缩小生产范围。
+Dependencies, tests, generated files, and development test tools are outside application scope. Production system adapters, failure handling, recovery, and compiled platform paths were retained. No production coverage-exclusion markers reduced the denominator.
 
-Rust 和 Swift 按 LLVM LCOV 的唯一 `(文件, 行)` 记录计数，同一源码行被闭包、泛型或多个对象重复报告时取实际最大命中数。Rust 内联及独立测试模块由 `syn` 语法树识别；未测量的生产文件会使验收失败。Python 使用 `coverage.py` 的实际执行记录。
+Rust and Swift count unique LLVM LCOV `(file, line)` records, taking the maximum actual hit count when closures, generics, or several objects map to the same physical line. A `syn` syntax tree identifies Rust inline and external test modules. Missing production mappings fail acceptance. Python uses actual `coverage.py` execution records.
 
-**100% 行覆盖率不等于 100% 分支覆盖率或全部输入组合均已验证。** Rust 分支覆盖率未测量；Swift 没有在本记录中给出分支百分比。逐命令/参数契约、故障与协议工作流是行覆盖率之外的行为验证。
+**100% line coverage does not mean 100% branch coverage or every input combination.** Rust branches were unmeasured, and this record gives no Swift branch percentage. Command/parameter contracts, faults, and protocol workflows provide additional behavior checks.
 
-## 本次检查
+## Checks in this snapshot
 
-- 九个 Rust 测试可执行文件：**416 passed、0 failed、4 ignored**。
-- 其中三个默认 ignored 的 SMB guarded / resumable / lifecycle proof，在隔离 Samba fixture 中另行实际执行并通过；真实系统网络卷挂载测试仍为 ignored，未算作通过。
-- **16 组**真实 CLI / DAV / IPC / Samba 工作流通过，包括崩溃回执、缓存迁移、SQLite 索引、搜索、过滤与冲突策略、服务计划、原始及 Smart SMB provider。Rust 采集使用 1,127 个全新 profiles。
-- Python 测试 **59 passed**；文档格式收尾后的文档契约复验 **13 passed**；Rust 测试范围解析器 **2 passed**。
-- CLI 契约检查 **97 个叶子命令、727 项参数声明、1,034 个合法值解析用例**。帮助参考中的 788 条选项声明还包含命令组及 help/version 等入口，统计口径不同。
-- MCP 契约检查 **81 项工具、186 个字段、394 个合法用例及 2,392 个非法用例**；完整 schema 与运行时目录一致。
-- Swift 使用独立新目录复跑，通过真实 SDK 数据对象、回调与临时 Unix/TCP peer 验证全部十个源文件；源码哈希与报告一致。
+- Nine Rust test executables: **416 passed, 0 failed, 4 ignored**.
+- Three default-ignored SMB guarded/resumable/lifecycle proofs were separately executed and passed in the disposable Samba fixture. The real native network-mount test remained ignored and was not counted as passed.
+- **16 CLI/DAV/IPC/Samba workflow groups** passed: crash receipts, cache migration, SQLite indexing, search, filters/conflict policy, service plans, and raw/Smart SMB providers. Rust collection used 1,127 fresh profiles.
+- Python: **59 passed**. Documentation contracts after final formatting: **13 passed**. Rust test-scope parser: **2 passed**.
+- CLI contracts: **97 leaf commands, 727 parameter declarations, 1,034 accepted-value cases**. The help reference's 788 option declarations also include command groups and help/version entries, so the inventories use different counting rules.
+- MCP contracts: **81 tools, 186 fields, 394 valid cases, 2,392 invalid cases**, with complete runtime schema consistency.
+- Swift was rerun in a fresh directory using real SDK data objects, callbacks, and temporary Unix/TCP peers. All ten production sources were measured, and source hashes matched the reports.
 
-所有存储测试使用临时合成内容。系统管理、界面、进程及失败边界按测试需要使用 mock；默认生产实现继续调用真实接口。本次测试没有操作个人云盘、NAS、真实挂载或已注册域，也没有读取真实钥匙串或请求真实原生缓存驱逐。
+Storage tests used temporary synthetic content. System management, UI, process, and failure boundaries used mocks where needed; default production implementations retained real interfaces. The run did not operate personal cloud/NAS files, real mounts, or registered domains, query real Keychain credentials, or request native cache eviction.
 
-这些结果证明被测代码和断言的行为，不代表 Finder 已接受某个签名包、真实菜单/状态图标已经显示，或所有 WebDAV/SMB 服务端与 macOS 版本均已兼容。真实系统验收与历史部署证据分别见[测试指南](TESTING.md#实际系统验收另行执行)和[版本记录](README.md#版本验证记录)。
+These results establish the tested code and assertions. They do not establish that Finder accepted a particular signed bundle, displayed real menus/status icons, or interoperates with every WebDAV/SMB server and macOS version. See [real-system validation](TESTING.md#real-system-validation) and the [validation archives](README.md#historical-validation-records) for the separate system and deployment evidence.
 
-## 复现与后续门槛
+## Reproduce and enforce new results
 
-[测试指南](TESTING.md#测量生产代码行覆盖率)提供从源码构建、冻结输入、采集和汇总的完整命令。Rust 收集器只导出本次 Cargo 返回的明确对象，使用全新 profiles，前后检查源码及对象哈希；报告同时绑定 LCOV 与测试范围文件的校验和。严格报告检查要求每个生产文件都有匹配的来源清单。
+The [testing guide](TESTING.md#measure-production-line-coverage) covers building, freezing inputs, collection, and aggregation. The Rust collector exports only exact artifacts returned by Cargo, uses fresh profiles, and checks source/object identity before and after the run. Its report also binds LCOV and test-span checksums. Strict aggregation requires matching source provenance for every production file.
 
-原始 profiles、对象及完整 LCOV 保存在本地被忽略的 `target/` 测量目录；Git 提交保留精简的逐文件结果及输入校验和。持续集成配置会上传报告和日志，并分别对 Rust、Swift、Python 执行 100% 门槛。
+Original profiles, objects, and complete LCOV remain in local ignored `target/` directories. The Git snapshot retains compact file-level results and input checksums. Current CI uploads reports/logs and requires fresh 100% results separately for Rust, Swift, and Python.
 
-GitHub 上的实际工作流状态应以对应提交的 Actions 结果为准。本次本机通过记录不代替托管 CI 的运行结果。
+Use the Actions results for the specific commit to assess hosted CI. This local historical pass does not establish a hosted workflow result or waive the current coverage gate.

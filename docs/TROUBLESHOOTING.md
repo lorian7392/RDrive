@@ -1,153 +1,155 @@
-# 故障排查与恢复
+# Troubleshooting and recovery
 
-从版本、所用状态目录和明确的错误开始。生成计划、入队成功、构建 App 和注册域是不同阶段，不能用前一阶段代替最终操作结果。不要通过删除整个状态目录、检查点或恢复副本来“重置”故障。
+Start with the version, state directory, and exact error. A generated plan, queued job, built App, or registered domain describes a stage, not the final operation result. Preserve checkpoints and recovery copies while diagnosing a failure.
 
-## 收集诊断信息
+## Collect diagnostics
 
-```sh
+~~~sh
 rdrive --version
 rdrive profile list
 rdrive status
 rdrive queue list
 rdrive transfers list
 rdrive history --limit 20
-```
+~~~
 
-若使用自定义目录，为所有命令传入同一个 `--home`。输出可能包含用户名、服务器地址、远程路径和本地路径；提交 issue 前脱敏。不要发送密码、锁 token、完整私有状态目录或含业务内容的上传快照。
+Use the same `--home` on every command if state is customized. Output may contain usernames, server addresses, and local/remote paths; redact them before opening an issue. Do not submit passwords, lock tokens, complete private state directories, or user-content snapshots.
 
-功能的完整选项以 `rdrive COMMAND --help` 和[命令参考](reference/CLI.md)为准。测试与兼容性范围见[测试说明](TESTING.md)。
+Use `rdrive COMMAND --help` and the [CLI reference](reference/CLI.md) for options. See [testing](TESTING.md) for validation and interoperability scope.
 
-## 找不到命令或运行了旧版
+## Command missing or an old version runs
 
-源码构建结果位于 `target/release/rdrive`，仓库不保证有 `dist/rdrive`。先直接运行：
+Source builds produce `target/release/rdrive`; a checkout does not guarantee `dist/rdrive`.
 
-```sh
+~~~sh
 ./target/release/rdrive --version
 command -v rdrive
 rdrive --version
-```
+~~~
 
-两次版本不同意味着 PATH 指向另一份程序。重新编译 CLI 不会自动更新 App 内嵌副本、正在运行的桥接/MCP 进程或已注册扩展。升级顺序见[安装指南](INSTALLATION.md#升级)。
+Different versions mean `PATH` selects another executable. Rebuilding the CLI does not update an App's embedded copy, a running bridge/MCP process, or registered extensions. Follow the [upgrade procedure](INSTALLATION.md#upgrade).
 
-## 认证失败
+## Authentication fails
 
-`credential environment variable ... is missing` 表示当前 RDrive 进程没有获得指定变量。用交互终端重新隐藏输入并导出，再运行同一命令；不要将值打印到日志。只有 `--password-env` 未设置时才查询 macOS 钥匙串，服务名和账户必须匹配连接。
+`credential environment variable ... is missing` means the current RDrive process did not receive that variable. Read and export it again through hidden terminal input; do not print it into a log.
 
-终端中能连接，后台服务却失败时，优先检查认证来源。LaunchAgent 不继承终端的临时 `export`，服务安装器也不会将值写入服务文件。优先按[配置参考](reference/CONFIGURATION.md)准备可用于后台进程的钥匙串认证。
+Keychain is queried only when `--password-env` is absent. Its service and account must match the profile. If a terminal works but a background process fails, inspect the credential source first. LaunchAgents do not inherit temporary terminal exports, and the service installer does not write passwords into service files. Prepare appropriate Keychain credentials as described in [configuration](reference/CONFIGURATION.md).
 
-`401`、`403` 或 SMB 登录/权限错误时，确认账户、DAV 文件根目录、共享名及服务端权限。不要通过放宽本地目录权限或开启不加密传输解决账户错误。
+For `401`, `403`, or SMB login/permission errors, verify the account, DAV file root, share name, and server permissions. Weakening local permissions or transport encryption does not resolve an account error.
 
-原生 SMB 挂载使用 macOS 的凭据或终端提示；CLI 的 `password-env` 成功不证明系统已持有挂载凭据。脚本中的 `--no-prompt` 不会绕过认证。
+Native SMB mounting uses macOS credentials or a terminal prompt. Successful CLI password-environment authentication does not establish system mount credentials. `--no-prompt` cannot bypass authentication.
 
-## 连接超时、代理或证书错误
+## Timeout, proxy, or certificate errors
 
-- 先确认 URL 是协议端点：DAV 文件根目录或 `smb://主机/共享/子目录`，不是网页登录页。
-- WebDAV 默认校验证书和 HTTPS。检查主机名、系统时间及服务器证书链；没有跳过证书验证或自定义 CA 的通用选项。
-- 慢链路可在添加连接时适当提高 `--timeout`。它不能解决错误地址、阻断路由或认证失败。
-- WebDAV 保留环境变量和 macOS 系统代理支持；字面回环地址及 `localhost` 直连。当前代理库不完整支持 macOS PAC/例外表，需明确直连的目标可按环境设置 `NO_PROXY`。
-- 原生挂载由系统客户端执行，其代理、证书、缓存和超时行为与 Rust 传输不同。一个入口成功不代表另一个已验证。
-- SMB 默认要求传输加密。仅在明确接受不加密测试的可信服务中使用 `--allow-unencrypted-smb`，不要把它作为自动故障回退。
+- Confirm the protocol endpoint: a DAV file root or `smb://host/share/subtree`, rather than a website login page.
+- WebDAV validates HTTPS certificates. Check the hostname, clock, and certificate chain. There is no general certificate-verification bypass or custom CA option.
+- Increase `--timeout` when adding a profile for a slow link. It does not fix a wrong address, blocked route, or failed authentication.
+- WebDAV supports environment and macOS system proxies. Literal loopback addresses and `localhost` connect directly. PAC/exception-table support is incomplete in the proxy library; use `NO_PROXY` for explicit direct destinations when appropriate.
+- Native mounts use a different system client with independent proxy, certificate, cache, and timeout behavior.
+- SMB requires encryption by default. `--allow-unencrypted-smb` is an explicit trusted compatibility-test option, not a general failure fallback.
 
-不要据此直接修改全局代理、VPN、路由或服务器安全策略。真实服务器互操作性需按错误及实际请求继续定位。
+Diagnose actual requests before changing a global proxy, VPN, route, or server security policy. Real-server interoperability needs endpoint-specific evidence.
 
-## 路径、目标已存在或权限拒绝
+## Invalid path, existing destination, or permission error
 
-远程路径相对于连接根，不接受绝对路径、`..`、反斜杠。大小写、Unicode 规范化或文件/目录类型冲突会使操作停止。不要通过改写内部索引绕过它。
+Remote paths are relative to the profile root. Absolute paths, `..`, and backslashes are rejected. Case, Unicode-normalization, and file/directory conflicts stop operations. Do not bypass a failure by editing internal indexes.
 
-默认不覆盖是有意行为。先用 `stat` / `ls` 确认目标，确实需要替换才使用 `--overwrite`。上传父目录需要存在；可用 `mkdir ... --parents` 创建。连接名仅接受字母、数字、`-`、`_`。
+No-overwrite behavior is intentional. Inspect the target through `stat` or `ls`, and use `--overwrite` only for an intended replacement. Upload parents must exist; `mkdir ... --parents` can create them. Profile names accept letters, digits, `-`, and `_`.
 
-本地同步符号链接及可识别的 SMB 重解析点被拒绝。某些服务器会透明解析远端链接，客户端不能统一保证远端 no-follow；请同时检查服务器策略。
+Local sync symlinks and recognized SMB reparse points are rejected. Some servers transparently resolve links, so remote no-follow behavior also depends on server policy.
 
-## 状态目录被占用
+## State directory is busy
 
-相同状态目录的修改通过锁串行执行。检查是否仍有传输、`watch`、桥接、MCP 或旧版服务。停止你不再使用的实例后重试；不要在仍有进程运行时删除锁文件或状态文件。不同 `--home` 可以隔离测试，但不会拥有原目录的配置、快照或基线。
+Mutations sharing a state directory are serialized. Check for active transfers, `watch`, bridge/MCP processes, or old services. Stop an instance you no longer need and retry. Do not delete locks or state files while an owning process is running.
 
-## 上传失败或结果不明
+A separate `--home` isolates a test but does not inherit the original profiles, snapshots, or baselines.
 
-先检查 `queue list`、`history` 和远端 `stat`。上传任务的独立快照可能是尚未发布修改的唯一副本，先保留。
+## Upload failure or an uncertain result
 
-- `pending` 和符合条件的 `interrupted` 任务可由 `queue run` 处理。
-- `failed` 任务需明确 `queue run PROFILE --retry-failed`。
-- 曾使用 `--overwrite` 且结果不明的任务，还需要 `--retry-ambiguous-overwrite`。该选项可能再次覆盖同一路径，先确认服务器当前内容和任务意图。
-- `--resume` 仅用于有相应协议支持的任务。原来未启用续传的上传不会因普通重试自动获得检查点能力。
-- `queue cancel JOB_ID` 会删除其本地上传快照；存在的上传检查点和远端恢复文件可能保留。取消不能撤销已完成的服务器修改。
+Inspect `queue list`, `history`, and remote `stat` first. A job's retained snapshot may be the only unpublished copy.
 
-入队成功只说明快照已保存；只有服务器确认后才标记 `done`。状态不明时不要新建一个无条件覆盖任务来掩盖旧任务。
+- `queue run` handles pending and eligible interrupted work.
+- Failed jobs need `queue run PROFILE --retry-failed`.
+- An uncertain job created with `--overwrite` also needs `--retry-ambiguous-overwrite`. This can overwrite the path again; inspect current content and job intent first.
+- `--resume` requires matching protocol support. An upload created without it does not gain a checkpoint through an ordinary retry.
+- `queue cancel JOB_ID` removes the local upload snapshot. Existing upload checkpoints and remote recovery files may remain. Cancellation cannot undo an already-completed server operation.
 
-## 下载续传被拒绝
+Enqueue success means the snapshot was retained. A job becomes `done` only after server confirmation. Do not conceal uncertain work with a new unconditional overwrite.
 
-下载检查点保存已经落盘的前缀及 SHA-256。远端版本变化、前缀损坏、Range 响应不正确或已有目标在下载时被修改，都会停止续传。保留当前部分数据，核对服务器版本和目标后再决定另存新文件或重新开始。
+## Download resumption is rejected
 
-`transfers list` 查看下载记录；`transfers discard ID` 明确丢弃对应检查点及部分传输，旧本地恢复副本仍保留。不要把 `transfers/`、`.rdrive-partial-*` 或 `spool/` 当清洁缓存删除。下载覆盖结果中的 `previous_local` 指向旧本地文件副本。
+Checkpoints retain flushed prefix bytes and SHA-256. A changed remote revision, corrupt prefix, invalid Range response, or concurrent destination edit stops resumption. Retain the partial data and inspect the server/destination before choosing a fresh filename or restarting.
 
-SMB 上传恢复还会验证远端暂存身份和全部已上传前缀；Nextcloud 已确认块失去可靠修订时可能重传。安全核验带来的额外读取不等于重新上传了全部内容。
+`transfers list` inspects records. `transfers discard ID` explicitly discards the corresponding checkpoint/partial transfer while preserving prior local recovery copies. `transfers/`, `.rdrive-partial-*`, and `spool/` are not clean cache. An overwrite result's `previous_local` identifies its prior local copy.
 
-## 同步或编辑发生冲突
+SMB upload resumption also verifies remote staging identity and the complete uploaded prefix. A Nextcloud chunk without a reliable unchanged validator may retransmit. Extra verification reads do not mean all payload bytes were uploaded again.
 
-先停止重复执行 `--apply`，保留两端内容及本地恢复副本。同步在两端均变化、无共同基线且内容不同、扫描不完整或名称/类型冲突时停止；不是选出“时间较新”的一端自动覆盖。
+## Synchronization or edit conflicts
 
-普通同步需要你明确整理两端后重新预览。首次两端缺失关系不能证明删除；丢失状态目录会丢失共同基线。执行中失败不会回滚之前已经确认的网络操作，旧基线保留，后续可能需要人工核对。
+Stop repeatedly applying the same plan and preserve both sides and recovery copies. Sync stops on concurrent changes, differing content without a common baseline, incomplete scans, or name/type conflicts. It does not automatically choose the newer timestamp.
 
-`edit` 上传失败时修改保留在上传队列；编辑器本身失败会打印保留的本地路径。先导出或复制结果，再处理远端修订。
+Reconcile ordinary sync explicitly and preview again. Initial absence does not prove deletion. Losing state loses the common baseline. Execution failures do not roll back already-confirmed network operations; the old baseline remains, and later manual reconciliation may be necessary.
 
-Smart 冲突使用独立持久队列，先检查并导出：
+A failed `edit` upload remains in the queue. If the editor itself fails, the error reports the retained local file. Export/copy the result before resolving remote revision changes.
 
-```sh
+Smart conflicts use a separate persistent queue:
+
+~~~sh
 rdrive smart list DOMAIN
 rdrive smart export DOMAIN MUTATION_ID ./recovered.txt
-```
+~~~
 
-然后按[Smart 管理](SMART_OPERATIONS.md)选择 `keep-both`、`replace` 或 `remote`。`replace` 仍进行版本保护；`remote` 取消本地发布并保留独立恢复快照，后续仍可导出。`smart retry` 不移除原有版本条件，`smart discard` 是明确清理恢复快照的操作。
+Choose `keep-both`, `replace`, or `remote` through [Smart management](SMART_OPERATIONS.md). Replacement remains revision-protected. `remote` abandons local publication while retaining an exportable recovery snapshot. `smart retry` preserves original conditions; `smart discard` explicitly reclaims an eligible recovery snapshot.
 
-## SMB 恢复文件或路径暂时缺失
+## SMB recovery files or a temporarily missing path
 
-受保护覆盖可能保留 `.rdrive-backup-*`、`.rdrive-upload-*` 和 `.rdrive-recovery-*.json`。两次重命名之间发生中断时，原路径可能暂时不存在；同步会因未完成收据停止，不把缺失直接解释为用户删除。
+Protected overwrite may leave `.rdrive-backup-*`, `.rdrive-upload-*`, and `.rdrive-recovery-*.json`. An interruption between renames can leave the original path temporarily absent. Sync stops on the unfinished receipt rather than treating this as deletion.
 
-有上传检查点时，按原任务恢复，让客户端核验身份与发布阶段。没有检查点时：
+With an upload checkpoint, resume the original job so the client verifies identity and publication phase. Otherwise:
 
-1. 用 `cat` 阅读错误指出的收据，再用 `ls` / `stat` 核对目标、旧恢复副本和新暂存文件。
-2. 将需要保留的内容另行导出，确认哪份才是预期版本。
-3. 如需手工恢复，明确使用 `mv` 把核对过的旧副本或完整暂存移回原路径；默认不覆盖新出现的目标。
-4. 确认目标内容与恢复状态后，才考虑删除对应的一份未完成收据。
+1. Read the receipt named by the error with `cat` and inspect the target, prior copy, and staging through `ls` / `stat`.
+2. Export needed content and identify the intended version.
+3. If manual recovery is necessary, explicitly `mv` a verified prior copy or complete staging file back to the path. The default preserves a newly appeared destination.
+4. Only consider removing that specific unfinished receipt after confirming content and recovery state.
 
-不要批量删除所有 `.rdrive-*`。这些文件没有统一的自动垃圾回收保证，也不能代替异地备份。详细恢复与通知语义见[SMB 生命周期](SMB_LIFECYCLE.md)。
+Do not bulk-delete `.rdrive-*`. These files have no universal automatic GC and are not independent backups. See [SMB lifecycle](SMB_LIFECYCLE.md).
 
-## 缓存空间不足、无法清理或迁移
+## Cache full, cleanup refused, or migration blocked
 
-先查看 `cache status`、`cache list` 和 `cache clear` 的预览。固定、活跃读取、未上传修改、冲突和系统拒绝驱逐会阻止回收。降低上限失败时原配置保持不变；可解除不再需要的固定，再分别回收 Rust 缓存和原生下载副本。
+Inspect `cache status`, `cache list`, and the `cache clear` preview. Pins, active readers, unsent edits, conflicts, and refused system eviction can prevent reclamation. An impossible limit reduction preserves the previous setting. Unpin unneeded content, then reclaim Rust payloads and native copies through their respective interfaces.
 
-清洁缓存上限不是整个状态目录或磁盘分区的硬配额：数据库、上传快照、未上传编辑、恢复副本、临时传输和系统开销额外占空间。它也不约束原生 SMB/WebDAV 网络卷的缓存。
+The clean-cache budget is not a hard quota for the entire state directory or disk. Databases, snapshots, unsent edits, recovery copies, temporary transfers, and system overhead are additional. Native SMB/WebDAV network-volume caches are separate.
 
-迁移目标必须满足私有目录要求，且需要容纳完整新副本。活跃读取/下载、未知文件、符号链接、目录身份或校验变化会使迁移停止并保留内容。不要手工挪动活跃缓存。先按[缓存管理](CACHE_MANAGEMENT.md)使用预览和恢复流程。
+A migration destination must meet private-directory rules and fit the full new copy. Active reads/downloads, unknown files, symlinks, changed identity, or failed hashes stop migration and preserve content. Use the preview/recovery procedure in [cache management](CACHE_MANAGEMENT.md), rather than manually moving active data.
 
-`cache get` 只读本地已有副本，不证明服务器最新版本。`cache clear --apply` 也不会删除上传快照、未发送编辑、远端版本或恢复备份。
+`cache get` reads a local copy without establishing server freshness. `cache clear --apply` does not remove upload snapshots, unsent edits, remote versions, or recovery backups.
 
-## 挂载不出现或只读行为不同
+## Native mount missing or unexpected read-only behavior
 
-先运行 `mount ... --dry-run`，确认挂载点存在、为空、属于当前用户且权限为 `0700`。成功结果需通过 `mounts` 核对实际系统挂载，而不是只看系统命令退出码。默认不显示在桌面，必要时加 `--browse`。
+Run `mount ... --dry-run` first. The mountpoint must exist, be empty, belong to the current user, and have mode `0700`. Inspect `mounts` to confirm the actual kernel mount rather than relying only on the helper's exit status. Use `--browse` to request visibility; mounts are hidden from the desktop by default.
 
-`--read-only` 请求真正只读卷；可写 WebDAV 还取决于 macOS 客户端和服务器 DAV LOCK 支持。挂载不是离线副本，无法据此获得 RDrive 的固定缓存语义。先按[挂载说明](MOUNT.md)核对认证及系统约束，不要直接强制卸载仍有应用写入的卷。
+`--read-only` requests a genuinely read-only volume. Writable WebDAV also depends on macOS and server LOCK support. Mounts are not offline replicas and do not acquire RDrive pinning semantics. Follow [mounting](MOUNT.md) before forcing a detach while applications may still write.
 
-## Finder 域、状态或搜索不更新
+## Finder domain, status, or search does not update
 
-Smart 需要连接、域配置、已获系统接受的原生扩展、桥接和通知助手共同运行。`smart setup` 只建配置；编译和注册成功都不能证明 Finder 已启用或显示正确。
+Smart requires a profile, domain configuration, accepted/enabled native extensions, the bridge, and the notification helper. `smart setup` saves configuration; compilation or registration alone does not establish correct Finder display.
 
-检查 `provider domains`、`smart status`、`index status DOMAIN`，以及伴随程序的 `--diagnose` / `--list-domains`。确认 App 与桥接使用同一状态目录及同一 IPC 路径，升级后没有继续运行旧内嵌 CLI。必要的注册和启用步骤见[macOS 集成](MACOS_INTEGRATION.md)。
+Inspect `provider domains`, `smart status`, `index status DOMAIN`, and companion `--diagnose` / `--list-domains`. Verify the same state/IPC paths and ensure an old embedded CLI is not still running after upgrade. See [macOS integration](MACOS_INTEGRATION.md).
 
-`index refresh` 保存刷新请求，由后台服务执行。离线搜索只查询已取得的文件名/路径索引，不扫描文件内容或联系服务器；未扫描目录、暂停服务和过滤规则都会影响结果。见[目录索引](DIRECTORY_INDEXING.md)。
+`index refresh` retains a request for the background worker. Offline search reads acquired filename/path metadata without fetching content or contacting the server. Unscanned directories, paused services, and filters affect results. See [indexing](DIRECTORY_INDEXING.md).
 
-独立 Finder Sync 扩展的菜单/角标与 File Provider 原生状态不是同一机制。普通映射目录或网络卷不会仅因映射而变成 Smart 域；不要用一个机制的验证结果推断另一个可用。
+Independent Finder Sync menus/badges and native File Provider decorations are different mechanisms. Mapping an ordinary directory or network volume does not make it a Smart domain.
 
-## MCP 没有写入工具或本地路径被拒绝
+## MCP tools or local paths are unavailable
 
-默认 MCP 只开放查询。写入需要 `mcp serve --allow-write`，本地文件参数还必须落在声明的现有 `--local-root` 范围；状态目录和内部缓存有额外保护。不要把整个用户目录作为解决路径错误的默认范围。
+MCP exposes queries by default. Writes require `mcp serve --allow-write`, and local file arguments must fall beneath declared existing `--local-root` directories. Internal state/cache paths have additional protection. Do not default to granting your entire home directory to resolve a path error.
 
-配置生成器不会安装 MCP 服务或修改客户端设置。从源码构建后应明确传 `--binary ./target/release/rdrive`。客户端必须使用包含所需连接的状态目录，并获得对应认证环境；另一个进程能连接不代表本 MCP 会话已经能连接。
+The configuration generator does not install a service or edit client settings. For a source build, pass `--binary ./target/release/rdrive`. The client must select state containing the intended profiles and receive their credentials. Another connected process does not establish this MCP session's access.
 
-取消和超时会结束当前操作，但不能撤销此前确认的远端修改。查看返回的 `isError`、报告及队列/事务状态再重试，详见[MCP 指南](MCP.md)。
+Cancellation/timeouts end the current operation but cannot undo earlier confirmed writes. Inspect `isError`, reports, and queue/transaction state before retrying. See [MCP](MCP.md).
 
-## 托管提交结果不明
+## Uncertain managed commit
 
-保留原状态目录和事务 ID，先检查 `repo status TRANSACTION_ID`，再重放同一个 `repo commit TRANSACTION_ID` 核对是否已发布。不要通过新建事务绕过不明回执；已准备发布的事务也不能随意 `abort`。
+Retain the original state directory and transaction ID. Inspect `repo status TRANSACTION_ID`, then replay `repo commit TRANSACTION_ID` to determine whether that transaction published. Do not create a new transaction to bypass an uncertain receipt or abort a prepared publication.
 
-托管目录有专用内部格式，普通 `ls` 或原生网络卷看到的是存储结构。通过 `repo ls` / `repo get` 或托管 File Provider 域读取逻辑文件树。并发冲突不会自动合并，完整协议及空间保留边界见[托管仓库](REPOSITORY.md)。
+Managed directories have an internal storage format. Ordinary `ls` and native mounts expose that physical structure. Use `repo ls` / `repo get` or a managed File Provider domain for the logical tree. Concurrent conflicts do not merge automatically. See [managed repositories](REPOSITORY.md) for protocol and retained-space limits.

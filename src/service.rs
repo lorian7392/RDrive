@@ -1645,8 +1645,9 @@ mod native {
                     .to_string()
                     .contains("has not stopped")
             );
-            drop(held);
-            let held = lock(&service.join("supervisor.lock"), false).unwrap();
+            // Retain the original ownership until the releaser below. An
+            // immediate close/reopen adds a needless lock handoff while other
+            // tests may be spawning processes concurrently.
             let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
             write(
                 &status,

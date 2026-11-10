@@ -1,0 +1,108 @@
+site_name: RDrive
+site_description: WebDAV and SMB files, recoverable transfers, and Smart Synchronization for macOS.
+site_url: https://lorian7392.github.io/RDrive/
+repo_url: https://github.com/lorian7392/RDrive
+repo_name: lorian7392/RDrive
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: target/docs-site
+strict: true
+
+theme:
+  name: material
+  language: en
+  font: false
+  icon:
+    logo: material/harddisk
+    repo: fontawesome/brands/github
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.tracking
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+plugins:
+  - search:
+      lang: en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+
+exclude_docs: |
+  /requirements.txt
+  /archive/
+  /VALIDATION*.md
+  /*VALIDATION*.json
+  /NATIVE_ACTIVATION*.json
+  *.debug.json
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: README.md
+  - Getting started:
+      - Installation: INSTALLATION.md
+      - Quick start: QUICKSTART.md
+      - Features and limitations: FEATURES.md
+      - Troubleshooting: TROUBLESHOOTING.md
+  - Guides:
+      - Mounting network volumes: MOUNT.md
+      - Smart Synchronization: SMART_SYNCHRONIZATION.md
+      - Smart operations and management: SMART_OPERATIONS.md
+      - Cache management: CACHE_MANAGEMENT.md
+      - Directory indexing and search: DIRECTORY_INDEXING.md
+      - Managed repositories: REPOSITORY.md
+      - SMB lifecycle: SMB_LIFECYCLE.md
+      - Native macOS integration: MACOS_INTEGRATION.md
+      - MCP and agent skills: MCP.md
+  - Reference:
+      - CLI commands: reference/CLI.md
+      - Configuration: reference/CONFIGURATION.md
+      - MCP tools: reference/MCP.md
+  - Development:
+      - Architecture: ARCHITECTURE.md
+      - Testing: TESTING.md
+      - Coverage evidence: COVERAGE.md
+      - Versioning and tags: RELEASING.md
+      - Documentation website: WEBSITE.md
+      - Contributing: https://github.com/lorian7392/RDrive/blob/main/CONTRIBUTING.md
+      - Changelog: https://github.com/lorian7392/RDrive/blob/main/CHANGELOG.md
+      - Security: https://github.com/lorian7392/RDrive/blob/main/SECURITY.md
+      - License: https://github.com/lorian7392/RDrive/blob/main/LICENSE

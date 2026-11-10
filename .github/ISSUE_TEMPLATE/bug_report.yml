@@ -1,44 +1,44 @@
-name: Bug report / 问题报告
-description: 提供最小复现、预期和实际结果。
+name: Bug report
+description: Report a reproducible problem and its expected behavior.
 body:
   - type: markdown
     attributes:
-      value: 请使用合成示例。不要附上密码、token、完整账户地址、状态目录或业务文件；漏洞报告请先阅读 SECURITY.md。
+      value: Use a synthetic example. Omit passwords, tokens, account addresses, private state, and business files. For vulnerabilities, read SECURITY.md first.
   - type: input
     id: version
     attributes:
-      label: RDrive 版本 / 提交
+      label: RDrive version and commit
       placeholder: rdrive --version
     validations:
       required: true
   - type: input
     id: environment
     attributes:
-      label: 系统与服务端
-      description: macOS/CPU、WebDAV 或 SMB、可公开的服务端软件版本、CLI/mount/Smart/MCP 入口。
+      label: Environment and server
+      description: Include macOS and CPU architecture, WebDAV or SMB server software/version, and the CLI, mount, Smart, or MCP workflow.
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
-      label: 最小复现步骤
-      description: 脱敏命令、测试文件和相关选项；如有自定义缓存/状态目录请注明。
+      label: Steps to reproduce
+      description: Provide redacted commands, synthetic test files, relevant options, and any custom cache or state directory.
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: 预期结果
+      label: Expected behavior
     validations:
       required: true
   - type: textarea
     id: actual
     attributes:
-      label: 实际结果和脱敏错误
+      label: Actual behavior and redacted error
     validations:
       required: true
   - type: textarea
     id: isolation
     attributes:
-      label: 隔离复现与补充信息
-      description: 是否能在临时 DAV/Samba fixture 中复现？恢复数据是否仍然保留？
+      label: Isolated reproduction and additional context
+      description: Can you reproduce this with a temporary DAV/Samba fixture? Is recovery data still retained?

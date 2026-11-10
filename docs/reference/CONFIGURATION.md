@@ -1,193 +1,267 @@
-# 配置完整参考
+# Complete configuration reference
 
-本页按 `src/config.rs`、`src/filtering.rs`、`src/policies.rs` 的实际序列化字段与默认值说明。
-命令参数见 [CLI 完整参考](CLI.md)，使用流程见 [快速开始](../QUICKSTART.md)，
-恢复与协议边界见 [功能说明](../FEATURES.md)。
+This reference follows the actual serialized fields and defaults in
+`src/config.rs`, `src/filtering.rs`, and `src/policies.rs`. See the [complete CLI
+reference](CLI.md) for command arguments, [Quickstart](../QUICKSTART.md) for
+workflows, and [Features](../FEATURES.md) for recovery and protocol boundaries.
 
-## 状态目录与配置保存
+## State directory and configuration persistence
 
-路径选择顺序为全局 `--home PATH`、环境变量 `RDRIVE_HOME`、
-`$HOME/Library/Application Support/rdrive`。`--home` 不会改变 shell 的 `HOME`。
-配置文件是状态目录下的 `config.json`，UTF-8 JSON，无注释。文件不存在时使用完整默认配置；
-已有 JSON 必须包含 `profiles` 对象，其余四个顶层对象可省略并采用默认值。
+Path precedence is the global `--home PATH` option, then `RDRIVE_HOME`, then
+`$HOME/Library/Application Support/rdrive`. `--home` does not change the shell's
+`HOME`. Configuration is stored as UTF-8 JSON without comments in `config.json`
+inside that directory. A missing file uses all defaults. An existing JSON file
+must contain a `profiles` object; the other four top-level objects may be omitted
+and then receive their defaults.
 
-优先使用 `profile`、`cache`、`index`、`filter`、`policy` 命令保存配置。手动编辑前停止使用
-同一状态目录的 RDrive 进程，保留原文件，并保持状态目录私有且归当前用户所有（`0700`）。
-程序使用锁防止普通并发写入，配置以临时文件与重命名方式提交。
-不要把状态目录放在普通同步根、内容缓存或 `~/Library/CloudStorage` 内。
-配置文件不是全部恢复状态；单独复制配置不能恢复队列、离线修改与同步基线。
+Prefer the `profile`, `cache`, `index`, `filter`, and `policy` commands for saving
+configuration. Before editing manually, stop RDrive processes using the same
+state directory, preserve the original file, and keep the directory private,
+owned by the current user, with mode `0700`. A lock prevents ordinary concurrent
+writers; configuration is committed through a temporary file and rename. Do not
+place the state directory inside an ordinary synchronization root, the content
+cache, or `~/Library/CloudStorage`. Configuration is only part of recovery state:
+copying it alone cannot restore queues, offline edits, or synchronization baselines.
 
-## 顶层 Config 字段
+## Top-level Config fields
 
-- `profiles`：连接名到 `Profile` 的对象，空配置为 `{}`。已有配置文件中必填。
-- `cache`：`CachePolicy`，默认 `{"max_bytes":null,"directory":null}`。
-- `index`：`IndexPolicy`，默认启用完整元数据预建，刷新间隔 `300` / `30` 秒。
-- `filters`：全局过滤与连接覆盖，默认排除常见临时文件，无自定义包含/排除规则。
-- `policies`：自动版本与冲突处理，默认自动版本关闭，冲突停止。
+- `profiles`: an object mapping connection names to `Profile`; an empty
+  configuration uses `{}`. Required in an existing configuration file.
+- `cache`: `CachePolicy`, defaulting to `{"max_bytes":null,"directory":null}`.
+- `index`: `IndexPolicy`; full metadata prefetch is enabled by default, with
+  refresh intervals of `300` / `30` seconds.
+- `filters`: global filters and connection overrides; common temporary files
+  are excluded by default, with no custom include/exclude patterns.
+- `policies`: automatic versioning and conflict handling; automatic versioning
+  is off and conflicts stop synchronization by default.
 
-这些对象使用下面列出的字段；传输限速、并发数、MCP 本地范围不是 `config.json` 字段。
+The following sections describe these objects. Transfer rate limits, job
+concurrency, and MCP local roots are not `config.json` fields.
 
-## profiles：连接 Profile
+## profiles: connection Profile
 
-- `protocol`：必填字符串，`"webdav"` 或 `"smb"`，小写。
-- `url`：必填字符串，作为该连接的远端根。
-  WebDAV 使用 `https://host/path/`；只有 `allow_http: true` 时才允许 `http://`。
-  SMB 使用 `smb://server/share[/folder]`，共享路径不能为空。
-  两种协议都要求主机，不允许 URL 用户名、密码、查询参数或片段。
-- `username`：字符串或 `null`，默认 `null`。没有用户名的 WebDAV 可匿名访问。
-  SMB 的实际认证能力由服务端与 Rust 客户端协商决定，不提供 Kerberos/SSO 开关。
-- `password_env`：字符串或 `null`，默认 `null`。字符串是**环境变量名**，不是密码。
-  `profile add --password-env` 只接受非空 ASCII 字母、数字、`_` 组成的变量名。
-  配置此字段后，变量缺失直接报错，不会回退到钥匙串。
-- `allow_http`：布尔，默认 `false`。只改变 WebDAV HTTP 的显式许可，不禁用 HTTPS 证书验证。
-- `timeout_secs`：正整数秒，默认 `120`。WebDAV 总请求超时使用此值，连接超时取
-  `min(timeout_secs, 30)`。SMB 也使用连接配置的超时。原生 macOS 挂载由系统控制超时。
-- `smb_encryption`：布尔，默认 `true`。Rust SMB 客户端要求加密；
-  `profile add --allow-unencrypted-smb` 将其保存为 `false`。
-- `nextcloud_upload_url`：字符串或 `null`，默认 `null`。仅用于显式启用 Nextcloud 分块续传，
-  例如 `https://cloud.example.com/remote.php/dav/uploads/account/`。
-  必须是 WebDAV，且与 `url` 同 origin（协议、主机与有效端口一致），
-  不允许内嵌凭据、查询或片段。设置它不会把所有上传自动改成续传，仍需 `put --resume`。
+- `protocol`: required lowercase string, either `"webdav"` or `"smb"`.
+- `url`: required string defining the connection's remote root. WebDAV uses
+  `https://host/path/`; `http://` requires `allow_http: true`. SMB uses
+  `smb://server/share[/folder]`, with a nonempty share path. Both require a host
+  and reject URL usernames, passwords, query parameters, and fragments.
+- `username`: a string or `null`, defaulting to `null`. WebDAV without a username
+  can use anonymous access. Actual SMB authentication is negotiated by the
+  server and Rust client; there is no Kerberos/SSO switch.
+- `password_env`: a string or `null`, defaulting to `null`. The string is an
+  **environment-variable name**, not a password. `profile add --password-env`
+  accepts a nonempty name containing only ASCII letters, digits, and `_`.
+  Once configured, a missing variable is an error; it does not fall back to Keychain.
+- `allow_http`: a boolean, defaulting to `false`. It explicitly permits WebDAV
+  HTTP; it does not disable HTTPS certificate validation.
+- `timeout_secs`: positive integer seconds, defaulting to `120`. WebDAV's total
+  request timeout uses this value; its connection timeout is
+  `min(timeout_secs, 30)`. SMB also uses the connection profile's timeout. Native
+  macOS mounts use system-controlled timeouts.
+- `smb_encryption`: a boolean, defaulting to `true`; the Rust SMB client requires
+  encryption. `profile add --allow-unencrypted-smb` saves it as `false`.
+- `nextcloud_upload_url`: a string or `null`, defaulting to `null`. It explicitly
+  enables Nextcloud resumable chunk uploads, for example
+  `https://cloud.example.com/remote.php/dav/uploads/account/`. It requires WebDAV
+  and the same origin as `url` (scheme, host, and effective port). Embedded
+  credentials, queries, and fragments are rejected. Setting it does not make
+  every upload resumable; `put --resume` is still required.
 
-CLI 的对应名称为 `--protocol`、`--url`、`--username`、`--password-env`、
-`--allow-http`、`--timeout`、`--allow-unencrypted-smb`、`--nextcloud-upload-url`。
-连接名不能为空、不能以 `-` 开头，只接受 ASCII 字母、数字、`-`、`_`。
-同名连接不能直接覆盖；删除前要完成/取消未完成上传并处理该连接缓存。
-更换账户或服务器不能把旧缓存、域与上传回执自动当成新账户的数据，内部绑定会核验身份。
+The corresponding CLI names are `--protocol`, `--url`, `--username`,
+`--password-env`, `--allow-http`, `--timeout`, `--allow-unencrypted-smb`, and
+`--nextcloud-upload-url`. A connection name cannot be empty or start with `-`;
+only ASCII letters, digits, `-`, and `_` are accepted. Existing names cannot be
+overwritten directly. Before removing a connection, finish or cancel unfinished
+uploads and handle its cache. Changing an account or server does not make old
+cache, domains, or upload receipts belong to the new account: internal bindings
+verify their identity.
 
-## 认证与环境变量
+## Authentication and environment variables
 
-Rust 文件操作的密码查找顺序：
+Password lookup for Rust file operations follows this order:
 
-1. `password_env` 非空时读取指定环境变量，缺失即失败。
-2. 未指定时，在 macOS 用 `/usr/bin/security` 读取通用密码；
-   service 为 `rdrive:<连接名>`，account 为 `username`（无用户名时为空）。
-3. 未找到条目且没有用户名时，使用空密码；有用户名时，报告未找到凭据。
+1. If `password_env` is set, read that variable and fail if it is missing.
+2. Otherwise, on macOS use `/usr/bin/security` to look up a generic password
+   whose service is `rdrive:<connection-name>` and account is `username`
+   (an empty account when no username is configured).
+3. If no entry exists and no username was supplied, use an empty password.
+   With a username, report missing credentials.
 
-程序不接受密码命令行参数，不将密码写入连接配置。`profile list` 会显示用户名与环境变量名。
-后台 LaunchAgent 不继承当前终端临时导出的密码变量，持久后台连接宜使用钥匙串；
-`service status` 只报告变量在当前检查进程是否存在，不会显示其值。
+There is no password command-line argument, and passwords are not written to
+connection configuration. `profile list` displays usernames and variable names.
+A background LaunchAgent does not inherit passwords temporarily exported in the
+current terminal; use Keychain for persistent background connections.
+`service status` reports whether a variable exists in the checking process,
+never its value.
 
-原生 SMB `mount` 使用 macOS 已有认证或系统终端提示，不自动使用 `password_env`。
-原生 WebDAV 可通过匿名临时文件描述符向系统 helper 交付连接凭据；具体规则见 [挂载](../MOUNT.md)。
+Native SMB `mount` uses macOS credentials or a system terminal prompt; it does
+not automatically use `password_env`. Native WebDAV can pass credentials to the
+system helper through an anonymous temporary file descriptor. See [Mounting](../MOUNT.md).
 
-运行期环境变量包括：
+Runtime environment variables include:
 
-- `RDRIVE_HOME`：默认状态路径，被 `--home` 覆盖。
-- `HOME`：未设置 `RDRIVE_HOME` 时的默认状态目录，以及用户 LaunchAgents 的基础路径。
-- 连接指定的 `password_env` 名称：只有对应连接需要凭据时才读取。
-- `EDITOR`：`edit` 使用的单个可执行文件，默认 `/usr/bin/vi`，不解析附加参数或 shell 命令。
-- `RDRIVE_WEBDAV_LOCK_TOKEN`：已取得的 WebDAV 锁 token，用于修改及 `unlock`。
-  token 不通过 CLI 参数传入，不自动续约。
-- `HTTP_PROXY` / `http_proxy`、`HTTPS_PROXY` / `https_proxy`、`ALL_PROXY` / `all_proxy`、
-  `NO_PROXY` / `no_proxy`：WebDAV HTTP 依赖栈的代理设置，详见下一节。
+- `RDRIVE_HOME`: the default state path, overridden by `--home`.
+- `HOME`: the base for the default state directory when `RDRIVE_HOME` is absent,
+  and for user LaunchAgents.
+- The variable named by a profile's `password_env`: read only when that
+  connection needs credentials.
+- `EDITOR`: a single executable used by `edit`, defaulting to `/usr/bin/vi`.
+  Additional arguments and shell commands are not parsed.
+- `RDRIVE_WEBDAV_LOCK_TOKEN`: an acquired WebDAV lock token, used for mutations
+  and `unlock`. It is not passed as a CLI argument or renewed automatically.
+- `HTTP_PROXY` / `http_proxy`, `HTTPS_PROXY` / `https_proxy`, `ALL_PROXY` /
+  `all_proxy`, and `NO_PROXY` / `no_proxy`: proxy settings used by the WebDAV HTTP
+  dependency stack, as described below.
 
-测试代码中的 `RDRIVE_TEST_SMB_URL`、`RDRIVE_TEST_DOCKER`、`RDRIVE_TEST_SMB_CONTAINER`
-只用于隔离测试 fixture，普通 RDrive 操作不会读取它们。构建工具与系统 helper
-自身还可能使用标准工具链环境，不能把这些环境当成 RDrive 配置字段。
+`RDRIVE_TEST_SMB_URL`, `RDRIVE_TEST_DOCKER`, and `RDRIVE_TEST_SMB_CONTAINER` in test
+code are isolated-fixture controls; ordinary RDrive operations do not read them.
+Build tools and system helpers may also use their standard toolchain environment;
+those variables are not additional RDrive configuration fields.
 
-## 代理、TLS 与协议能力
+## Proxies, TLS, and protocol capabilities
 
-当前依赖启用了 reqwest `system-proxy`。非回环 WebDAV 目标使用底层库的环境变量及系统代理发现；
-`localhost`（忽略大小写）和字面 IPv4/IPv6 回环地址强制直连。私网地址不因“位于局域网”而自动绕过代理。
-按域名解析后才得到回环地址的其他主机名不在此显式检查范围内。
+The current reqwest dependency enables `system-proxy`. Non-loopback WebDAV
+hosts use the underlying library's environment and system-proxy discovery.
+Case-insensitive `localhost` and literal IPv4/IPv6 loopback addresses explicitly
+connect directly. Private addresses do not bypass a proxy simply because they
+are on a local network. Other hostnames that resolve to loopback addresses are
+outside this explicit check.
 
-依赖中的环境变量读取先检查大写，再检查小写；HTTP / HTTPS 专用设置优先于 `ALL_PROXY`。
-`NO_PROXY` 是逗号分隔的绕过列表，可包含主机、域名与 IP/CIDR，`*` 表示全部绕过。
-底层库在 CGI 环境（存在 `REQUEST_METHOD`）对 HTTP 代理使用有额外保护。
-这不是 RDrive 自建的代理引擎；当前 macOS 代理发现不完整支持系统例外表与 PAC。
-需明确直连的目标可通过 `NO_PROXY` 指定。SMB 与 macOS 原生卷不使用 Rust WebDAV 这条 HTTP 代理路径。
+The dependency checks uppercase environment variables before lowercase ones;
+HTTP / HTTPS settings take precedence over `ALL_PROXY`. `NO_PROXY` is a
+comma-separated bypass list accepting hosts, domains, and IP/CIDR entries; `*`
+bypasses all proxies. The underlying library applies additional HTTP-proxy
+protection in CGI environments where `REQUEST_METHOD` exists. This is not a
+separate RDrive proxy engine. Current macOS proxy discovery does not fully
+support the system exceptions list or PAC. Use `NO_PROXY` for explicit direct
+connections. SMB and native macOS volumes do not use the Rust WebDAV HTTP-proxy path.
 
-HTTPS 证书验证默认启用；没有 `insecure`、自定义 CA、客户端证书、OAuth、Digest 或自定义请求头配置项。
-重定向默认拒绝，仅允许实现中同一 WebDAV 资源补末尾 `/` 的有限情况。
-普通 WebDAV 没有通用分段 PUT 续传，`nextcloud_upload_url` 只明确选择 Nextcloud 协议。
+HTTPS certificate validation is enabled by default. There are no configuration
+options for `insecure`, custom CAs, client certificates, OAuth, Digest, or custom
+request headers. Redirects are rejected except for the implementation's limited
+same-resource WebDAV trailing-`/` handling. Generic WebDAV has no universal
+resumable segmented PUT; `nextcloud_upload_url` explicitly selects Nextcloud's protocol.
 
-## cache：CachePolicy
+## cache: CachePolicy
 
-- `max_bytes`：无符号整数字节或 `null`，默认 `null`（不限制清洁内容预算）。
-  `0` 是有效的零预算，不等于无限。使用 `cache config --max-bytes N` 或 `--unlimited` 修改。
-  `smart setup` 在当前值为 `null` 时将它设为 `5368709120`（5 GiB）；
-  这也包括此前显式选择 unlimited 的情况，需要无限时在建域后重新设置。
-- `directory`：路径字符串或 `null`，默认 `null`，使用状态目录下的 `cache/`。
-  自定义值必须通过 `cache directory PATH` 安全迁移后保存，使用绝对真实私有目录。
-  不要直接编辑此字段绕过缓存根绑定、活动读取检查和迁移日志。
+- `max_bytes`: unsigned integer bytes or `null`, defaulting to `null` (no clean
+  content-budget limit). `0` is a valid zero budget, not unlimited. Change it
+  with `cache config --max-bytes N` or `--unlimited`. When its current value is
+  `null`, `smart setup` sets it to `5368709120` (5 GiB), including when unlimited
+  was explicitly chosen earlier; set unlimited again after creating the domain
+  if that is required.
+- `directory`: a path string or `null`, defaulting to `null` for `cache/` under
+  the state directory. A custom value must be saved by safely migrating with
+  `cache directory PATH`, using an absolute real private directory. Do not edit
+  this field to bypass cache-root binding, active-reader checks, or the migration journal.
 
-预算合计 Rust 清洁缓存、客户端报告的 File Provider 清洁副本与已批准下载预留。
-固定、正在读取、未上传内容受保护；持久上传快照、Smart 本地修改、部分下载、索引与恢复备份不属于可逐出内容。
-降低预算无法容纳受保护内容时保持原配置并报错。迁移包含固定缓存但不迁移系统 Finder 下载目录、队列和索引。
-详细目录条件、迁移中断恢复见 [缓存管理](../CACHE_MANAGEMENT.md)。
+The budget combines Rust clean cache, client-reported File Provider clean copies,
+and approved download reservations. Pinned content, active readers, and content
+awaiting upload are protected. Durable upload snapshots, Smart local edits,
+partial downloads, indexes, and recovery backups are not evictable content.
+Reducing the budget below protected usage fails without changing the prior
+configuration. Migration includes pinned Rust cache, but does not move Finder's
+system download directory, queues, or indexes. See [Cache management](../CACHE_MANAGEMENT.md)
+for directory requirements and interrupted-migration recovery.
 
-## index：IndexPolicy
+## index: IndexPolicy
 
-- `enabled`：布尔，默认 `true`，启用一般后台元数据预建；`false` 仍允许根目录、浏览需求和离线固定目录刷新。
-- `prefetch_depth`：`u32` 非负整数或 `null`，默认 `null`，逐步遍历完整树。
-  根目录深度为 `0`；扫描某目录也会得到它的直接子项。CLI `--depth N` 设置，`--all` 恢复 `null`。
-- `refresh_secs`：整数秒，默认 `300`，范围 `1..=31536000`，一般目录刷新间隔。
-- `active_refresh_secs`：整数秒，默认 `30`，相同范围，已浏览或离线固定目录刷新间隔。
+- `enabled`: a boolean, defaulting to `true`; enables general background metadata
+  prefetch. `false` still allows root, browse-demand, and pinned-directory refreshes.
+- `prefetch_depth`: a nonnegative `u32` or `null`, defaulting to `null` for gradual
+  traversal of the full tree. Root depth is `0`; scanning a directory also finds
+  its immediate children. CLI `--depth N` sets it; `--all` restores `null`.
+- `refresh_secs`: integer seconds, defaulting to `300`, within `1..=31536000`;
+  the general directory-refresh interval.
+- `active_refresh_secs`: integer seconds, defaulting to `30`, with the same
+  range; the interval for browsed or offline-pinned directories.
 
-这些值是后台元数据调度策略，不下载文件、不授予离线固定，不等于硬实时定时器。
-保持 `provider serve` 或管理它的后台服务运行才能执行；`index refresh` 只保存一次性需求。
-手动递归刷新可超出一般预建深度。托管仓库按完整根快照刷新，不接受非空子路径刷新。
-失败目录退避，不完整列表不会被解释成删除。见 [目录索引](../DIRECTORY_INDEXING.md)。
+These values schedule background metadata work. They neither download files nor
+grant offline pinning, and are not hard real-time timers. Keep `provider serve`
+or its managing background service running to execute the work; `index refresh`
+only saves a one-time demand. Manual recursive refresh can exceed the general
+prefetch depth. Managed repositories refresh a complete root snapshot and reject
+nonempty subpath refreshes. Failed directories back off; incomplete listings are
+not treated as deletions. See [Directory indexing](../DIRECTORY_INDEXING.md).
 
-## filters：FilterConfig 与 ProfileFilter
+## filters: FilterConfig and ProfileFilter
 
-全局字段：
+Global fields:
 
-- `temporary_files`：布尔，默认 `true`，排除 `.DS_Store`、`._*`、`*.tmp`、`*.swp`、
-  `*.swo`、`*.part`、`~$*`、`.~lock.*`。
-- `include`：字符串数组，默认 `[]`（文件不限包含范围）。
-- `exclude`：字符串数组，默认 `[]`（无额外排除）。
-- `profiles`：连接名到覆盖对象的映射，默认 `{}`。
+- `temporary_files`: a boolean, defaulting to `true`; excludes `.DS_Store`, `._*`,
+  `*.tmp`, `*.swp`, `*.swo`, `*.part`, `~$*`, and `.~lock.*`.
+- `include`: an array of strings, defaulting to `[]` (no include restriction on files).
+- `exclude`: an array of strings, defaulting to `[]` (no additional exclusions).
+- `profiles`: a map of connection names to override objects, defaulting to `{}`.
 
-每个连接覆盖对象有三个可选字段：`temporary_files` 为布尔或 `null`，
-`include`、`exclude` 为字符串数组或 `null`。`null` / 省略表示逐字段继承全局值，
-显式 `[]` 表示空列表并覆盖全局列表，列表不会拼接。`filter reset PROFILE` 删除整个覆盖。
+Each connection override has three optional fields: `temporary_files` is a
+boolean or `null`; `include` and `exclude` are string arrays or `null`. Omission
+or `null` inherits the corresponding global field. Explicit `[]` overrides a
+global list with an empty one; lists are not concatenated. `filter reset PROFILE`
+removes the entire override.
 
-glob 区分大小写：无 `/` 的模式匹配任意深度 basename；有 `/` 的模式从域根匹配，
-`*` 不跨 `/`、`**` 可跨层；尾 `/` 只匹配目录，排除目录同时排除后代。
-排除优先于包含，目录遍历仍可继续寻找允许的文件。每个列表最多 `256` 个模式；
-模式不能为空、超过 `4096` 字节、以 `/` 开头、含反斜杠/控制字符或 `.` / `..` 路径段。
+Globs are case-sensitive. A pattern without `/` matches basenames at any depth;
+a pattern with `/` is relative to the domain root. `*` does not cross `/`; `**`
+can cross directory levels. Trailing `/` matches only directories; excluding a
+directory also excludes its descendants. Exclusion takes precedence over
+inclusion, while directory traversal can continue to find allowed files. Each
+list permits at most `256` patterns. Patterns cannot be empty, exceed `4096`
+bytes, start with `/`, contain backslashes or control characters, or contain
+`.` / `..` path components.
 
-规则用于 Smart 列表、后台发现、搜索与新写入目标；不自动删除被排除的远端文件，
-不会把排除解释为同步删除，不清除恢复记录与快照。已排队操作可能因规则暂停。
-普通显式 `get` / `put`、原生卷及普通 `sync` 不因此改变行为。
+Rules apply to Smart listings, background discovery, searches, and new mutation
+targets. They do not delete excluded remote files, interpret exclusion as a
+synchronized deletion, or remove recovery records and snapshots. Already queued
+operations can pause because of changed rules. Ordinary explicit `get` / `put`,
+native volumes, and ordinary `sync` are unaffected.
 
-## policies：PolicyConfig、VersionPolicy 与 ProfilePolicy
+## policies: PolicyConfig, VersionPolicy, and ProfilePolicy
 
-全局字段：
+Global fields:
 
-- `versions`：`VersionPolicy`，默认 `{"enabled":false,"keep":5,"include":["*"],"exclude":[]}`。
-- `conflicts`：`"stop"`、`"keep-both"` 或 `"replace"`，默认 `"stop"`。
-- `profiles`：连接名到 `ProfilePolicy` 的映射，默认 `{}`。
+- `versions`: `VersionPolicy`, defaulting to
+  `{"enabled":false,"keep":5,"include":["*"],"exclude":[]}`.
+- `conflicts`: `"stop"`, `"keep-both"`, or `"replace"`, defaulting to `"stop"`.
+- `profiles`: a map of connection names to `ProfilePolicy`, defaulting to `{}`.
 
-`VersionPolicy` 的全部字段：
+All `VersionPolicy` fields:
 
-- `enabled`：布尔，默认 `false`，启用 Smart 正文覆盖前的自动远端版本保存。
-- `keep`：整数，默认 `5`，范围 `1..=100000`。
-- `include`：字符串数组，默认 `["*"]`，没有匹配项时不自动保存。
-- `exclude`：字符串数组，默认 `[]`，匹配即排除，优先于 include。
+- `enabled`: a boolean, defaulting to `false`; enables automatic remote version
+  saving before Smart overwrites file contents.
+- `keep`: an integer, defaulting to `5`, within `1..=100000`.
+- `include`: a string array, defaulting to `["*"]`; unmatched files are not saved automatically.
+- `exclude`: a string array, defaulting to `[]`; a match excludes the file and
+  takes precedence over include patterns.
 
-两个版本模式列表合计最多 `512` 项，每项非空、最多 `4096` 字节、无控制字符，
-使用与过滤器相同的相对 glob 语法。自动裁剪只发生在新内容已确认发布后，
-未确认发布的其他写者备份受保护，因此实际保留数可暂时超过 `keep`。
-重命名不自动迁移旧路径的版本历史。
+The two version-pattern lists permit at most `512` entries combined. Each must
+be nonempty, contain no control characters, and be at most `4096` bytes, using
+the same relative-glob syntax as filters. Automatic pruning happens only after
+new content is confirmed published. Backups belonging to other unconfirmed
+writers are protected, so the actual retained count can temporarily exceed
+`keep`. Renaming a file does not migrate its old path's version history automatically.
 
-每个 `ProfilePolicy` 有 `versions`（完整 `VersionPolicy` 或 `null`）与 `conflicts`
-（策略字符串或 `null`）。省略 / `null` 继承全局值；`versions` 对象整体覆盖，
-对象内省略字段采用 `VersionPolicy` 自身默认值，不是逐项继承全局版本策略。
-连接覆盖名长度 `1..=120` 字节且不可含控制字符。`policy reset PROFILE` 恢复全局继承。
+Each `ProfilePolicy` contains `versions` (a complete `VersionPolicy` or `null`)
+and `conflicts` (a strategy string or `null`). Omission / `null` inherits the
+global value. A `versions` object replaces the global version policy as a whole;
+omitted fields inside it use `VersionPolicy`'s own defaults, not per-field global
+inheritance. Override connection names must be `1..=120` bytes without control
+characters. `policy reset PROFILE` restores global inheritance.
 
-`stop` 保留冲突等待处理；`keep-both` 使用稳定冲突文件名及只创建条件保留两份；
-`replace` 先归档观察到的远端修订，再按该修订条件替换。决定后远端再次改变仍会停止。
-`smart resolve --strategy remote` 是单条冲突决定，保留本地恢复快照，
-**不是**这里允许的持久自动策略值。策略针对 Smart 正文冲突，不把普通 `sync` 改成自动覆盖。
+`stop` retains conflicts for a decision. `keep-both` uses a stable conflict
+filename and create-only conditions to retain both copies. `replace` archives
+the observed remote revision before a revision-conditional replacement; another
+remote change after the decision still stops it. `smart resolve --strategy remote`
+is an individual conflict decision that preserves the local recovery snapshot;
+it is **not** an allowed persistent automatic policy. Policies apply to Smart
+content conflicts, not automatic overwriting in ordinary `sync`.
 
-## 无凭据的完整 JSON 示例
+## Complete credential-free JSON example
 
-下面是可解析的 `config.json` 示例：保留所有默认字段并展示 WebDAV、SMB 和连接覆盖。
-`example.invalid` 是占位地址；示例不含密码、token、环境变量值或真实账户。
-使用时通过 CLI 配置自己的连接。`directory: null` 不需要手动迁移。
+This parseable `config.json` example includes every default field, WebDAV and
+SMB profiles, and connection overrides. `example.invalid` is a placeholder;
+there are no passwords, tokens, environment-variable values, or real accounts.
+Configure your own connections through the CLI. `directory: null` requires no
+manual migration.
 
 ```json
 {
@@ -253,73 +327,104 @@ glob 区分大小写：无 `/` 的模式匹配任意深度 basename；有 `/` �
 }
 ```
 
-最小空配置为 `{"profiles":{}}`，其余对象会采用上述默认值。
+The smallest empty configuration is `{"profiles":{}}`; the other objects use
+the defaults above.
 
-## 域、后台服务及会话参数
+## Domains, resident services, and session options
 
-这些数据由专门命令维护，不嵌入 `config.json`：
+Dedicated commands maintain these records separately from `config.json`.
 
-`provider-domains.json` 保存域数组。每个 Domain 包含 `id`、`profile`、`remote`、
-`display_name`，以及默认 `false` 的 `repository` / `smart`、默认 `null` 的 `local_root`。
-`remote` 相对于连接根，`repository` 必须指向已初始化仓库；`local_root` 是兼容 Finder 映射的绝对真实本地路径。
-`smart setup` 保存 `smart: true`，display name 默认域 ID，local root 为 `null`。
-没有域文件时，`provider domains` 从连接派生普通域；保存显式域配置后使用该数组。
-移除本地域配置不等于注销系统 File Provider、回收系统下载副本或清空恢复快照。
+`provider-domains.json` stores an array of domains. Each Domain has `id`,
+`profile`, `remote`, and `display_name`, plus `repository` / `smart` (default
+`false`) and `local_root` (default `null`). `remote` is relative to the connection
+root; `repository` must reference an initialized repository. `local_root` is an
+absolute real local path for a compatible Finder mapping. `smart setup` saves
+`smart: true`, defaults the display name to the domain ID, and uses a `null`
+local root. Without a domain file, `provider domains` derives ordinary domains
+from profiles; once explicit domain configuration is saved, that array is used.
+Removing local domain configuration does not unregister a system File Provider,
+reclaim system-downloaded copies, or discard recovery snapshots.
 
-`service install` 保存 `ServiceOptions`：`home`、当前可执行文件 `executable`、
-`ipc_root`（默认状态目录下 `service/ipc`）、可选 `app`（默认无）、
-`development_tcp`（默认 `false`）、可选 `launch_agents_dir`
-（默认 `~/Library/LaunchAgents`）。服务运行于 macOS 用户 launchd，
-IPC 路径及 App 必须是匹配的真实私有路径；Unix socket 完整路径需短于实现的 `104` 字节限制。
-安装不自动启动/注册域，卸载保留用户数据。不要手动改生成的安装记录与 plist。
+`service install` saves `ServiceOptions`: `home`, the current CLI `executable`,
+`ipc_root` (default `service/ipc` under the state directory), optional `app`
+(default none), `development_tcp` (default `false`), and optional
+`launch_agents_dir` (default `~/Library/LaunchAgents`). The service runs under
+macOS user launchd. IPC paths and the App must be matching real private paths;
+the complete Unix-socket path must be shorter than the implementation's `104`
+byte limit. Installation does not start the service or register domains;
+uninstallation preserves user data. Do not edit generated installation records
+or plists manually.
 
-`--limit`、`--progress`、`--jobs` 只作用于当前 CLI / MCP 会话，不保存到 Config；
-`mcp serve` 的 `--allow-write`、`--local-root`、`--timeout` 同样是启动参数。
-`smart run --staging` 默认状态目录下的 `SmartTransfers/`。
-元数据选择策略当前固定为 CLI 内建安全范围，`MetadataPolicy` 不是用户配置入口。
-索引数据库、上传收据、检查点、cache marker 与迁移日志是恢复状态，不是供手改的配置项。
+`--limit`, `--progress`, and `--jobs` apply only to the current CLI / MCP session
+and are not saved to Config. `mcp serve` options `--allow-write`, `--local-root`,
+and `--timeout` are also startup arguments. `smart run --staging` defaults to
+`SmartTransfers/` under the state directory. Metadata selection is currently the
+CLI's built-in safe scope; `MetadataPolicy` is not a user-configurable entry
+point. Index databases, upload receipts, checkpoints, cache markers, and
+migration journals are recovery state, not configuration for manual editing.
 
-## 辅助脚本的全部参数
+## Complete helper-script options
 
-这些脚本的 `--help` 由 Python argparse 提供。它们不增加生产 CLI 参数。
-原生伴随程序的全部透传控制参数见 [CLI 参考](CLI.md#可选原生伴随-app-参数)。
+Python argparse supplies these scripts' `--help`; they do not add production
+CLI options. See the [CLI reference](CLI.md#optional-native-companion-options)
+for every native companion passthrough control.
 
-`scripts/mcp-config.py` 只向 stdout 生成客户端配置，不修改客户端设置、不读取密码：
+`scripts/mcp-config.py` prints client configuration to stdout without changing
+client settings or reading passwords:
 
-- `--binary PATH`：已有 RDrive 可执行文件。源码构建请明确传 `target/release/rdrive`；
-  当前脚本默认查找项目 `dist/rdrive`，源码 Git checkout 不要求包含分发产物。
-- `--home PATH`：必填，配置使用的状态目录，可以尚未创建；输出解析后的绝对路径。
-- `--local-root PATH`：可重复，必须为已有目录，默认没有本地文件授权根。
-- `--allow-write`：生成启用写工具的启动参数，默认不启用。
-- `--timeout SECONDS`：正整数，默认 `300`。
-- `--format json|toml`：默认 `json`，分别输出 `mcpServers` 或 `[mcp_servers.rdrive]` 配置。
-- `-h, --help`：显示脚本帮助。
+- `--binary PATH`: an existing RDrive executable. For a source build, explicitly
+  provide `target/release/rdrive`; the script defaults to the project's
+  `dist/rdrive`, which is not expected in a source checkout.
+- `--home PATH`: required state directory; it may not yet exist. The generated
+  configuration uses its resolved absolute path.
+- `--local-root PATH`: repeatable existing local directories. By default there
+  are no authorized local-file roots.
+- `--allow-write`: includes startup arguments enabling write tools; off by default.
+- `--timeout SECONDS`: a positive integer, defaulting to `300`.
+- `--format json|toml`: defaults to `json`; produces `mcpServers` or
+  `[mcp_servers.rdrive]` configuration respectively.
+- `-h, --help`: shows script help.
 
-`scripts/install-skills.py` 复制仓库内三个技能，不覆盖已有同名目录：
+`scripts/install-skills.py` copies the three repository skills without replacing
+existing directories with the same name:
 
-- `--target PATH`：目标 skills 目录，默认 `$CODEX_HOME/skills`，未设 `CODEX_HOME` 时为 `~/.codex/skills`。
-- `--skill NAME`：可重复选择 `rdrive-files`、`rdrive-smart-sync`、`rdrive-transactions`，默认全部。
-- `--dry-run`：只输出安装计划，不创建目录。
-- `-h, --help`：显示脚本帮助。安装技能不等于配置/注册 MCP。
+- `--target PATH`: destination skills directory, defaulting to
+  `$CODEX_HOME/skills`, or `~/.codex/skills` when `CODEX_HOME` is unset.
+- `--skill NAME`: repeatable selection from `rdrive-files`, `rdrive-smart-sync`,
+  and `rdrive-transactions`; all three by default.
+- `--dry-run`: prints the installation plan without creating directories.
+- `-h, --help`: shows script help. Installing skills does not configure or
+  register the MCP server.
 
-`macos/build.py` 构建可选原生 App，不自动注册/启用系统扩展：
+`macos/build.py` builds the optional native App without registering or enabling
+system extensions automatically:
 
-- `--identity IDENTITY`：codesign 身份，默认 `-` 为 ad-hoc 开发审阅签名。
-- `--team-id TEAM`：开发者团队标识，默认无。
-- `--app-group GROUP`：显式 App Group；未给时，有团队 ID 使用 `TEAM.io.rdrive.shared`，
-  否则使用 `group.io.rdrive.shared`。真实分发需要与签名/授权匹配。
-- `--development-ipc-root PATH`：开发包显式私有 IPC 根，默认无；
-  要求专用绝对路径，当前用户所有且 `0700`，禁止直接使用 `/`、用户 home 或 `/private/tmp`。
-  设置时构建开发模式，使用窄范围目录例外而非生产 App Group。
-- `--cli PATH`：嵌入的已有 Rust CLI，默认 `target/debug/rdrive`。
-- `--output PATH`：输出目录，默认 `macos/build`，最终 App 为其下 `RDrive.app`。
-- `-h, --help`：显示脚本帮助。构建工具可能创建输出/开发目录并调用 Xcode 工具与 codesign。
+- `--identity IDENTITY`: codesign identity, defaulting to `-` for an ad-hoc
+  development review signature.
+- `--team-id TEAM`: developer team identifier; none by default.
+- `--app-group GROUP`: explicit App Group. Without it, a team ID selects
+  `TEAM.io.rdrive.shared`; otherwise the value is `group.io.rdrive.shared`.
+  Actual distribution requires matching signing and entitlements.
+- `--development-ipc-root PATH`: an explicit development-only private IPC root;
+  none by default. It must be a dedicated absolute, current-user-owned `0700`
+  directory, not `/`, the user's home, or `/private/tmp`. This enables a
+  development build with a narrow directory exception rather than a production App Group.
+- `--cli PATH`: an existing Rust CLI to embed; defaults to `target/debug/rdrive`.
+- `--output PATH`: output directory, defaulting to `macos/build`; the final App
+  is `RDrive.app` inside it.
+- `-h, --help`: shows script help. Building can create output/development
+  directories and invokes Xcode tools and codesign.
 
-`scripts/generate-cli-docs.py` 只读取可执行文件帮助，生成本仓库 CLI 参考：
+`scripts/generate-cli-docs.py` reads executable help to generate the repository's
+CLI and MCP references:
 
-- `--binary PATH`：默认 `target/debug/rdrive`，须预先构建。
-- `--output PATH`：默认 `docs/reference/CLI.md`。
-- `--check`：比较实际帮助与文档，漂移时非零退出，不写文件。
-- `-h, --help`：显示脚本帮助。
+- `--binary PATH`: defaults to `target/debug/rdrive`; build it first.
+- `--output PATH`: defaults to `docs/reference/CLI.md`, or
+  `docs/reference/MCP.md` with `--mcp`.
+- `--mcp`: generates the complete MCP tool schema reference instead of CLI help.
+- `--check`: compares generated content with the reference and exits nonzero
+  on drift without writing the file.
+- `-h, --help`: shows script help.
 
-测试脚本、覆盖率及其隔离环境选项另见 [测试指南](../TESTING.md)。
+See [Testing](../TESTING.md) for test scripts, coverage, and their isolated
+environment options.
