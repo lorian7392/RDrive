@@ -84,6 +84,7 @@ nav:
       - Troubleshooting: TROUBLESHOOTING.md
   - Guides:
       - Mounting network volumes: MOUNT.md
+      - Sync conflicts and recovery: CONFLICTS.md
       - Smart Synchronization: SMART_SYNCHRONIZATION.md
       - Smart operations and management: SMART_OPERATIONS.md
       - Cache management: CACHE_MANAGEMENT.md
@@ -100,7 +101,7 @@ nav:
       - Architecture: ARCHITECTURE.md
       - Testing: TESTING.md
       - Coverage evidence: COVERAGE.md
-      - Versioning and tags: RELEASING.md
+      - Version tags and releases: RELEASING.md
       - Documentation website: WEBSITE.md
       - Contributing: https://github.com/lorian7392/RDrive/blob/main/CONTRIBUTING.md
       - Changelog: https://github.com/lorian7392/RDrive/blob/main/CHANGELOG.md

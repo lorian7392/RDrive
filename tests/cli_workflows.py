@@ -314,6 +314,35 @@ def main():
             assert (Dav.root / "sync/a.txt").read_bytes() == b"remote edit concurrently"
             checks.append("sync dry-run, confirmed baseline, pull changes, preserve both conflict copies")
 
+            conflicts = cli("conflict", "list", "test", local, "sync")
+            assert [conflict["path"] for conflict in conflicts] == ["a.txt"]
+            repair = ("conflict", "repair", "test", local, "sync", "a.txt", "--choose")
+            preview = cli(*repair, "local")
+            assert not preview["applied"] and preview["recovery_path"] is None
+            cli(*repair, "local", "--apply", ok=False)
+            (Dav.root / "sync/a.txt").write_bytes(b"new remote revision")
+            stale = cli(*repair, "local", "--apply", "--expect", preview["token"], ok=False)
+            assert b"preview this repair again" in stale.stderr
+            assert (local / "a.txt").read_bytes() == b"local edit"
+            assert (Dav.root / "sync/a.txt").read_bytes() == b"new remote revision"
+
+            preview = cli(*repair, "local")
+            result = cli(*repair, "local", "--apply", "--expect", preview["token"])
+            assert result["applied"] and result["baseline_updated"]
+            assert (local / result["recovery_path"]).read_bytes() == b"new remote revision"
+            assert (Dav.root / "sync/a.txt").read_bytes() == b"local edit"
+            assert cli("conflict", "list", "test", local, "sync") == []
+
+            (local / "a.txt").write_bytes(b"another local edit")
+            (Dav.root / "sync/a.txt").write_bytes(b"another remote edit")
+            preview = cli(*repair, "remote")
+            result = cli(*repair, "remote", "--apply", "--expect", preview["token"])
+            assert result["applied"] and result["baseline_updated"]
+            assert (local / result["recovery_path"]).read_bytes() == b"another local edit"
+            assert (local / "a.txt").read_bytes() == b"another remote edit"
+            assert cli("conflict", "list", "test", local, "sync") == []
+            checks.append("preview and repair one sync conflict from either side with stale-token rejection and recovery copies")
+
             cli("stat", "test", "../escape", ok=False)
             cli("profile", "add", "bad", "--protocol", "webdav", "--url", "https://user:secret@example.com/", ok=False)
             assert b"fixture-password" not in (root / "state/config.json").read_bytes()

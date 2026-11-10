@@ -156,12 +156,14 @@ extension access to that directory.
 
 ## Finder actions and availability
 
-The native File Provider menu provides Show Sync Status, Keep Offline, Allow
-Automatic Removal and Download Now; macOS also provides Remove Download. These
-menus and the pinned badge/label were observed in the historical system runs
-retained in the repository archive. The separate Finder Sync menu has all five commands and was
-observed in an ordinary mapped synthetic folder in those runs. Custom Finder Sync badge rendering in ordinary folders
-remains unverified. File Provider and Finder Sync are separate mechanisms.
+RDrive adds Show Sync Status, Keep Offline and Allow Automatic Removal to the
+File Provider menu. Use Finder's cloud download button or open an online-only
+item to download it. Finder offers Remove Download for eligible local copies.
+The separate Finder Sync menu also includes Download Now and Remove Download.
+The historical system runs in the repository archive observed that menu in an
+ordinary mapped synthetic folder and observed the File Provider pinned badge
+and label. Custom Finder Sync badge rendering in ordinary folders remains
+unverified.
 
 Native item/domain IDs come from public File Provider URL/identifier APIs.
 File Provider UI can receive an OS-private document ID rather than the backend
@@ -175,8 +177,8 @@ native `downloadEagerlyAndKeepDownloaded` content policy, which asks macOS to
 download the item and retain it. Folder pins apply to known descendants and
 new descendants discovered later. With a supporting SDK and macOS 27 or later,
 pinned directories also ask the OS to materialize their namespace eagerly.
-Unpinning restores inherited/lazy policy. Download Now and Remove Download use
-native download/eviction APIs. A native network mount is not an offline store:
+Unpinning restores inherited/lazy policy. The companion's `--download` and
+`--evict` commands use the system File Provider manager. A native network mount is not an offline store:
 Finder Sync refuses pin/unpin/download/evict for an ordinary mapped path without
 actual File Provider provenance and directs the user to the Smart Finder view.
 It can still query the mapped item's status.

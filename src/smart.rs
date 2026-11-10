@@ -108,6 +108,14 @@ pub struct Mutation {
     #[serde(default)]
     pub resolution: Option<crate::policies::ResolutionPlan>,
 }
+const STALE_DIRECTORY_CANCELLED: &str = "cancelled stale directory request before remote publication";
+
+impl Mutation {
+    pub(crate) fn stale_directory_cancelled(&self) -> bool {
+        self.state == MutationState::Cancelled
+            && self.error.as_deref() == Some(STALE_DIRECTORY_CANCELLED)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Index {
@@ -537,6 +545,9 @@ impl Queue {
     /// Explicit retry preserves the original base versions; it never forces an overwrite.
     pub fn retry(&mut self, id: &str) -> Result<Mutation> {
         let current = self.get(id)?;
+        if current.stale_directory_cancelled() {
+            bail!("stale directory request was cancelled; use the refreshed Finder item");
+        }
         if matches!(
             current.state,
             MutationState::Done | MutationState::Running | MutationState::Superseded
@@ -626,8 +637,12 @@ impl Queue {
         })
     }
     pub fn cancel(&mut self, id: &str) -> Result<Mutation> {
+        let current = self.get(id)?;
+        if current.stale_directory_cancelled() {
+            return Ok(current);
+        }
         if matches!(
-            self.get(id)?.state,
+            current.state,
             MutationState::Done | MutationState::Running | MutationState::Superseded
         ) {
             bail!("cannot cancel confirmed, superseded or running Smart work");
@@ -635,6 +650,12 @@ impl Queue {
         self.update(id, |mutation| {
             mutation.state = MutationState::Cancelled;
             mutation.error = Some("cancelled explicitly; local snapshot retained".into());
+        })
+    }
+    pub(crate) fn cancel_stale_directory(&mut self, mutation: &Mutation) -> Result<Mutation> {
+        self.update(&mutation.id, |mutation| {
+            mutation.state = MutationState::Cancelled;
+            mutation.error = Some(STALE_DIRECTORY_CANCELLED.into());
         })
     }
     pub fn discard_snapshot(&mut self, id: &str) -> Result<()> {

@@ -11,6 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod conflict;
+pub use conflict::{repair_conflict, ConflictChoice, ConflictRepairReport};
+
 const INTERNAL: &str = ".rdrive-versions";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,37 +121,12 @@ pub async fn run_with_metadata(
     if internal(&remote) {
         bail!("the internal version directory cannot be a sync root");
     }
-    let baseline_abs = crate::state::resolve_location(baseline_path)?;
-    if baseline_abs.starts_with(&root.path) {
-        bail!("sync baseline must be stored outside the local sync tree");
-    }
-    let mut baseline = match fs::read(baseline_path) {
-        Ok(bytes) => serde_json::from_slice::<Baseline>(&bytes)
-            .context("invalid sync baseline; refusing to guess deletion intent")?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Baseline {
-            version: 1,
-            local_root: root.path.to_string_lossy().into_owned(),
-            remote_root: remote.clone(),
-            entries: BTreeMap::new(),
-        },
-        Err(e) => return Err(e).context("cannot read sync baseline"),
-    };
-    if baseline.version != 1
-        || baseline.local_root != root.path.to_string_lossy()
-        || baseline.remote_root != remote
-    {
-        bail!("sync baseline belongs to a different root or unsupported format");
-    }
-    for (path, pair) in &baseline.entries {
-        validate_relative(path)?;
-        if internal(path)
-            || pair.remote.path != remote_path(&remote, path)
-            || pair.local.is_dir != pair.remote.is_dir
-            || pair.local.sha256.is_some() == pair.local.is_dir
-        {
-            bail!("invalid entry in sync baseline: {path}");
-        }
-    }
+    let mut baseline = load_baseline(&root, &remote, baseline_path)?.unwrap_or_else(|| Baseline {
+        version: 1,
+        local_root: root.path.to_string_lossy().into_owned(),
+        remote_root: remote.clone(),
+        entries: BTreeMap::new(),
+    });
     let local_entries = root.scan()?;
     let remote_entries = remote_scan(backend, &remote).await?;
     validate_collisions(
@@ -507,6 +485,36 @@ pub async fn run_with_metadata(
     report.applied = true;
     report.baseline_updated = true;
     Ok(report)
+}
+
+fn load_baseline(root: &LocalRoot, remote: &str, baseline_path: &Path) -> Result<Option<Baseline>> {
+    let baseline_abs = crate::state::resolve_location(baseline_path)?;
+    if crate::cache::path_is_within(&baseline_abs, &root.path)? {
+        bail!("sync baseline must be stored outside the local sync tree");
+    }
+    let baseline = match fs::read(baseline_path) {
+        Ok(bytes) => serde_json::from_slice::<Baseline>(&bytes)
+            .context("invalid sync baseline; refusing to guess deletion intent")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("cannot read sync baseline"),
+    };
+    if baseline.version != 1
+        || baseline.local_root != root.path.to_string_lossy()
+        || baseline.remote_root != remote
+    {
+        bail!("sync baseline belongs to a different root or unsupported format");
+    }
+    for (path, pair) in &baseline.entries {
+        validate_relative(path)?;
+        if internal(path)
+            || pair.remote.path != remote_path(remote, path)
+            || pair.local.is_dir != pair.remote.is_dir
+            || pair.local.sha256.is_some() == pair.local.is_dir
+        {
+            bail!("invalid entry in sync baseline: {path}");
+        }
+    }
+    Ok(Some(baseline))
 }
 
 async fn delete_remote_file(backend: &dyn Backend, path: &str, expected: &Entry) -> Result<()> {
@@ -1458,6 +1466,7 @@ mod tests {
     enum DuringDownload {
         ChangeRemote(String, Vec<u8>),
         ChangeLocal(PathBuf, Vec<u8>),
+        RemoveStagedFileAtNextStat,
     }
     type Hook = Box<dyn FnOnce(&MemoryBackend, &str) -> Result<()> + Send>;
     struct MemoryBackend {
@@ -1470,6 +1479,7 @@ mod tests {
         unfinished_receipt: Mutex<bool>,
         fail_upload: Mutex<bool>,
         download_bytes: Mutex<Option<Vec<u8>>>,
+        content_hashes: bool,
         after_upload: Mutex<Option<Hook>>,
         after_remove: Mutex<Option<Hook>>,
         after_stat: Mutex<Option<(String, Hook)>>,
@@ -1488,6 +1498,7 @@ mod tests {
                 unfinished_receipt: Mutex::new(false),
                 fail_upload: Mutex::new(false),
                 download_bytes: Mutex::new(None),
+                content_hashes: true,
                 after_upload: Mutex::new(None),
                 after_remove: Mutex::new(None),
                 after_stat: Mutex::new(None),
@@ -1530,14 +1541,17 @@ mod tests {
                 path: path.into(),
                 is_dir: node.bytes.is_none(),
                 size: node.bytes.as_ref().map_or(0, |v| v.len() as u64),
-                modified: Some(node.revision as i64),
-                etag: Some(format!("\"{}\"", node.revision)),
+                modified: (node.revision != 0).then_some(node.revision as i64),
+                etag: (node.revision != 0).then(|| format!("\"{}\"", node.revision)),
             }
         }
     }
     #[async_trait]
     impl Backend for MemoryBackend {
         fn content_sha256(&self, entry: &Entry) -> Option<String> {
+            if !self.content_hashes {
+                return None;
+            }
             let nodes = self.nodes.lock().unwrap();
             let node = nodes.get(&entry.path)?;
             if !Self::entry(&entry.path, node).same_revision(entry) {
@@ -1625,6 +1639,16 @@ mod tests {
             match mutation {
                 Some(DuringDownload::ChangeRemote(p, bytes)) => self.file(&p, &bytes),
                 Some(DuringDownload::ChangeLocal(p, bytes)) => fs::write(p, bytes)?,
+                Some(DuringDownload::RemoveStagedFileAtNextStat) => {
+                    let staged = local.to_path_buf();
+                    *self.after_stat.lock().unwrap() = Some((
+                        remote.into(),
+                        Box::new(move |_, _| {
+                            fs::remove_file(staged)?;
+                            Ok(())
+                        }),
+                    ));
+                }
                 None => (),
             }
             Ok(())
@@ -1734,6 +1758,501 @@ mod tests {
         .unwrap();
         assert!(r.baseline_updated);
     }
+    #[tokio::test]
+    async fn repair_conflict_retains_losing_contents_and_only_advances_the_selected_path() {
+        for choice in [ConflictChoice::Local, ConflictChoice::Remote] {
+            let (_temp, local, baseline) = fixture();
+            let backend = MemoryBackend::new();
+            fs::write(local.join("other.txt"), b"before").unwrap();
+            seed(&backend, &local, &baseline).await;
+            let original_baseline = fs::read(&baseline).unwrap();
+            fs::write(local.join("a.txt"), b"my edit").unwrap();
+            backend.file("a.txt", b"server edit");
+            fs::write(local.join("other.txt"), b"other local").unwrap();
+            backend.file("other.txt", b"other remote");
+
+            let preview = repair_conflict(&backend, &local, "", &baseline, "a.txt", choice, None)
+                .await
+                .unwrap();
+            assert!(!preview.applied);
+            assert!(!local.join(INTERNAL).exists());
+            assert_eq!(fs::read(&baseline).unwrap(), original_baseline);
+            assert_eq!(backend.bytes("a.txt"), b"server edit");
+            assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"my edit");
+
+            let applied = repair_conflict(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                "a.txt",
+                choice,
+                Some(&preview.token),
+            )
+            .await
+            .unwrap();
+            assert!(applied.applied && applied.baseline_updated);
+            let (winner, loser): (&[u8], &[u8]) = match choice {
+                ConflictChoice::Local => (b"my edit", b"server edit"),
+                ConflictChoice::Remote => (b"server edit", b"my edit"),
+            };
+            assert_eq!(fs::read(local.join("a.txt")).unwrap(), winner);
+            assert_eq!(backend.bytes("a.txt"), winner);
+            assert_eq!(
+                fs::read(local.join(applied.recovery_path.unwrap())).unwrap(),
+                loser
+            );
+            let old: serde_json::Value = serde_json::from_slice(&original_baseline).unwrap();
+            let new: serde_json::Value =
+                serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
+            assert_eq!(old["entries"]["other.txt"], new["entries"]["other.txt"]);
+            let next = run(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                &SyncOptions {
+                    apply: false,
+                    direction: Direction::Both,
+                    delete: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.conflicts.len(), 1);
+            assert_eq!(next.conflicts[0].path, "other.txt");
+        }
+    }
+    #[tokio::test]
+    async fn repair_conflict_rejects_a_stale_choice_and_an_edit_during_the_guarded_read() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        let original_baseline = fs::read(&baseline).unwrap();
+        fs::write(local.join("a.txt"), b"local change").unwrap();
+        backend.file("a.txt", b"remote change");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            None,
+        )
+        .await
+        .unwrap();
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            Some(&preview.token),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("preview this repair again"));
+        *backend.during_download.lock().unwrap() = Some(DuringDownload::ChangeRemote(
+            "a.txt".into(),
+            b"newer remote change".to_vec(),
+        ));
+        assert!(repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            Some(&preview.token)
+        )
+        .await
+        .is_err());
+        assert!(repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            Some(&preview.token)
+        )
+        .await
+        .is_err());
+        assert_eq!(fs::read(&baseline).unwrap(), original_baseline);
+        assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"local change");
+        assert_eq!(backend.bytes("a.txt"), b"newer remote change");
+        assert!(!local.join(INTERNAL).exists());
+    }
+    #[tokio::test]
+    async fn repair_conflict_requires_a_common_regular_file_baseline() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        fs::write(local.join("a.txt"), b"local").unwrap();
+        backend.file("a.txt", b"remote");
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("recorded common sync baseline"));
+        assert!(!baseline.exists());
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        backend.file("a.txt", b"remote changed");
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("both sides must have changed"));
+    }
+
+    #[tokio::test]
+    async fn repair_conflict_rejects_internal_paths_and_unguarded_remote_replacements() {
+        let (_temp, local, baseline) = fixture();
+        let mut backend = MemoryBackend::new();
+        backend.conditional = false;
+        seed(&backend, &local, &baseline).await;
+        fs::write(local.join("a.txt"), b"local edit").unwrap();
+        backend.file("a.txt", b"remote edit");
+
+        for (path, message) in [
+            (".rdrive-versions/a.txt", "internal RDrive paths"),
+            ("a.txt", "backend cannot guard replacement"),
+        ] {
+            let error = repair_conflict(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                path,
+                ConflictChoice::Local,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(message));
+        }
+        backend
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("a.txt")
+            .unwrap()
+            .revision = 0;
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no verifiable revision"));
+        assert_eq!(backend.bytes("a.txt"), b"remote edit");
+        assert!(!local.join(INTERNAL).exists());
+    }
+
+    #[tokio::test]
+    async fn repair_conflict_refuses_equal_contents_even_when_a_server_reuses_its_revision() {
+        let (_temp, local, baseline) = fixture();
+        let mut backend = MemoryBackend::new();
+        backend.content_hashes = false;
+        seed(&backend, &local, &baseline).await;
+        let prior = fs::read(&baseline).unwrap();
+        fs::write(local.join("a.txt"), b"local").unwrap();
+        backend.file("a.txt", b"other");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Reproduce a server that serves changed bytes under an unchanged token.
+        backend
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut("a.txt")
+            .unwrap()
+            .bytes = Some(b"local".to_vec());
+        for expected in [None, Some(preview.token.as_str())] {
+            let error = repair_conflict(
+                &backend,
+                &local,
+                "",
+                &baseline,
+                "a.txt",
+                ConflictChoice::Remote,
+                expected,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("contents already match"));
+        }
+        assert_eq!(fs::read(&baseline).unwrap(), prior);
+        assert!(!local.join(INTERNAL).exists());
+    }
+
+    #[tokio::test]
+    async fn repair_conflict_preserves_the_baseline_when_a_transfer_cannot_be_verified() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        let prior = fs::read(&baseline).unwrap();
+        fs::write(local.join("a.txt"), b"local edit").unwrap();
+        backend.file("a.txt", b"remote edit");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            None,
+        )
+        .await
+        .unwrap();
+
+        *backend.download_bytes.lock().unwrap() = Some(b"wrong bytes".to_vec());
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            Some(&preview.token),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("differs from the reviewed remote revision"));
+        assert!(!local.join(INTERNAL).exists());
+
+        *backend.after_upload.lock().unwrap() = Some(Box::new(|backend, path| {
+            backend.nodes.lock().unwrap().get_mut(path).unwrap().bytes =
+                Some(b"wrong edit".to_vec());
+            Ok(())
+        }));
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            Some(&preview.token),
+        )
+        .await
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("uploaded content differs"));
+        assert!(detail.contains("previous remote contents are retained"));
+        let recovery = fs::read_dir(local.join(INTERNAL))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("original");
+        assert_eq!(fs::read(recovery).unwrap(), b"remote edit");
+        assert_eq!(fs::read(&baseline).unwrap(), prior);
+        assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"local edit");
+    }
+
+    #[tokio::test]
+    async fn repair_conflict_reports_recovery_after_baseline_commit_failure() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        let prior = fs::read(&baseline).unwrap();
+        fs::write(local.join("a.txt"), b"local edit").unwrap();
+        backend.file("a.txt", b"remote edit");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let blocked_path = baseline.clone();
+        let saved = baseline.with_extension("original");
+        let saved_path = saved.clone();
+        *backend.after_upload.lock().unwrap() = Some(Box::new(move |_, _| {
+            fs::rename(&blocked_path, saved_path)?;
+            fs::create_dir(blocked_path)?;
+            Ok(())
+        }));
+        let error = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Local,
+            Some(&preview.token),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("could not confirm the repaired baseline"));
+        let recovery = fs::read_dir(local.join(INTERNAL))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("original");
+        assert!(error
+            .to_string()
+            .contains(recovery.strip_prefix(&local).unwrap().to_str().unwrap()));
+        assert_eq!(fs::read(recovery).unwrap(), b"remote edit");
+        assert_eq!(fs::read(saved).unwrap(), prior);
+        assert_eq!(backend.bytes("a.txt"), b"local edit");
+    }
+
+    #[tokio::test]
+    async fn repair_conflict_preserves_local_content_when_staging_or_replacement_fails() {
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        let prior = fs::read(&baseline).unwrap();
+        fs::write(local.join("a.txt"), b"previous local edit").unwrap();
+        backend.file("a.txt", b"reviewed remote edit");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            None,
+        )
+        .await
+        .unwrap();
+
+        *backend.during_download.lock().unwrap() = Some(DuringDownload::RemoveStagedFileAtNextStat);
+        assert!(repair_conflict(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            Some(&preview.token)
+        )
+        .await
+        .is_err());
+        assert!(!local.join(INTERNAL).exists());
+        assert_eq!(
+            fs::read(local.join("a.txt")).unwrap(),
+            b"previous local edit"
+        );
+        assert_eq!(fs::read(&baseline).unwrap(), prior);
+
+        let error = conflict::repair_conflict_with(
+            &backend,
+            &local,
+            "",
+            &baseline,
+            "a.txt",
+            ConflictChoice::Remote,
+            Some(&preview.token),
+            |root, downloaded, path| {
+                fs::write(local.join(path), b"concurrent local edit")?;
+                root.install_new(downloaded, path)
+            },
+        )
+        .await
+        .unwrap_err();
+        let recovery = fs::read_dir(local.join(INTERNAL))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("original");
+        assert!(error
+            .to_string()
+            .contains(recovery.strip_prefix(&local).unwrap().to_str().unwrap()));
+        assert_eq!(fs::read(recovery).unwrap(), b"previous local edit");
+        assert_eq!(
+            fs::read(local.join("a.txt")).unwrap(),
+            b"concurrent local edit"
+        );
+        assert_eq!(fs::read(&baseline).unwrap(), prior);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn repair_conflict_tokens_support_non_utf8_baseline_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let (_temp, local, baseline) = fixture();
+        let backend = MemoryBackend::new();
+        seed(&backend, &local, &baseline).await;
+        let unusual =
+            baseline.with_file_name(std::ffi::OsString::from_vec(b"baseline-\xff.json".to_vec()));
+        fs::rename(&baseline, &unusual).unwrap();
+        fs::write(local.join("a.txt"), b"local edit").unwrap();
+        backend.file("a.txt", b"remote edit");
+        let preview = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &unusual,
+            "a.txt",
+            ConflictChoice::Remote,
+            None,
+        )
+        .await
+        .unwrap();
+        let repaired = repair_conflict(
+            &backend,
+            &local,
+            "",
+            &unusual,
+            "a.txt",
+            ConflictChoice::Remote,
+            Some(&preview.token),
+        )
+        .await
+        .unwrap();
+        assert!(repaired.baseline_updated);
+        assert_eq!(fs::read(local.join("a.txt")).unwrap(), b"remote edit");
+    }
+
     #[tokio::test]
     async fn plan_is_read_only_and_apply_recurses_in_both_directions() {
         let (_temp, local, baseline) = fixture();

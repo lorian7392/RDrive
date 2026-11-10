@@ -13,14 +13,13 @@ private final class ProviderTestManager: NativeDomainManaging {
     var signals: [NSFileProviderItemIdentifier] = []
     var downloads: [NSFileProviderItemIdentifier] = []
     var evictions: [NSFileProviderItemIdentifier] = []
-    var failure: Error?
     var temporaryFailure: Error?
     init(_ temporary: URL) { self.temporary = temporary }
     func temporaryDirectoryURL() throws -> URL { if let failure = temporaryFailure { throw failure }; return temporary }
-    func signalEnumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { signals.append(containerItemIdentifier); completionHandler(failure) }
-    func requestDownloadForItem(withIdentifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { downloads.append(itemIdentifier); completionHandler(failure) }
-    func evictItem(identifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { evictions.append(itemIdentifier); completionHandler(failure) }
-    func getUserVisibleURL(for itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void) { completionHandler(temporary, failure) }
+    func signalEnumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { signals.append(containerItemIdentifier); completionHandler(nil) }
+    func requestDownloadForItem(withIdentifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { downloads.append(itemIdentifier); completionHandler(nil) }
+    func evictItem(identifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { evictions.append(itemIdentifier); completionHandler(nil) }
+    func getUserVisibleURL(for itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void) { completionHandler(temporary, nil) }
     func enumeratorForMaterializedItems() -> NSFileProviderEnumerator { ProviderTestEnumerator() }
 }
 private final class ProviderTestSystem: NativeSystemManaging {
@@ -167,24 +166,26 @@ enum ProviderCoverageTests {
         _ = rejectedPin.performAction(identifier: NSFileProviderExtensionActionIdentifier("rdrive.pin"), onItemsWithIdentifiers: [providerID("stable-0")]) { pinFailure = $0; pinDone.signal() }
         try wait(pinDone); try expect(pinFailure != nil, "Failed pin was acknowledged")
         rejectedPin.invalidate()
-        for action in ["rdrive.pin", "rdrive.unpin", "rdrive.download", "rdrive.evict", "unsupported"] {
+        for action in ["rdrive.pin", "rdrive.unpin"] {
             let done = DispatchSemaphore(value: 0); var failure: Error?
             _ = active.performAction(identifier: NSFileProviderExtensionActionIdentifier(action), onItemsWithIdentifiers: [providerID("stable-0")]) { failure = $0; done.signal() }
             try wait(done)
-            try expect((failure != nil) == (action == "unsupported"), "Provider custom action response changed")
+            try expect(failure == nil, "Provider pin policy action failed")
         }
-        try expect(manager.downloads == [providerID("stable-0")] && manager.evictions == [providerID("stable-0")], "Custom action did not use the injected manager")
-        manager.failure = NativeFailure.bridge("Synthetic manager error")
-        for action in ["rdrive.download", "rdrive.evict"] {
-            let done = DispatchSemaphore(value: 0); var failure: Error?
-            _ = active.performAction(identifier: NSFileProviderExtensionActionIdentifier(action), onItemsWithIdentifiers: [providerID("stable-0")]) { failure = $0; done.signal() }
-            try wait(done); try expect(failure != nil, "Manager failure was acknowledged as success")
+        let signalsBeforeUnsupportedActions = manager.signals
+        for action in ["rdrive.download", "rdrive.evict", "unsupported"] {
+            let done = DispatchSemaphore(value: 0)
+            var failure: NSError?
+            _ = active.performAction(identifier: NSFileProviderExtensionActionIdentifier(action), onItemsWithIdentifiers: [providerID("stable-0")]) {
+                failure = $0 as NSError?
+                done.signal()
+            }
+            try wait(done)
+            try expect(failure?.domain == NSCocoaErrorDomain && failure?.code == NSFeatureUnsupportedError,
+                       "A stale or unknown custom action did not return the unsupported-feature error")
         }
-        manager.failure = nil
-        let missingManager = provider(manager: nil)
-        let missingDone = DispatchSemaphore(value: 0); var missingError: Error?
-        _ = missingManager.performAction(identifier: NSFileProviderExtensionActionIdentifier("rdrive.download"), onItemsWithIdentifiers: [providerID("stable-0")]) { missingError = $0; missingDone.signal() }
-        try wait(missingDone); try expect(missingError != nil, "Missing manager was treated as success")
+        try expect(manager.downloads.isEmpty && manager.evictions.isEmpty && manager.signals == signalsBeforeUnsupportedActions,
+                   "A stale or unknown custom action entered the system manager")
         let cancelled = provider("provider-cancel")
         let cancelDone = DispatchSemaphore(value: 0); var cancelError: Error?; var callbacks = 0
         let progress = cancelled.item(for: providerID("stable-0"), request: request) { _, error in cancelError = error; callbacks += 1; cancelDone.signal() }

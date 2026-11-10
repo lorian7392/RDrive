@@ -87,6 +87,13 @@ list every positional argument and option.
   `--delete` propagates observed deletions only after a successful baseline;
   `--metadata` synchronizes selected attributes. `watch --interval` defaults to
   `30` and must be greater than `0`.
+- `update` checks GitHub Releases. `--apply` installs the newer standalone CLI
+  after verifying the release checksum.
+- `conflict repair --choose local|remote` previews the selected file repair.
+  `--apply` and `--expect TOKEN` must be used together. The displaced content
+  stays under `.rdrive-versions/` within the local sync root.
+- `smart refresh-conflict DOMAIN MUTATION` refreshes the parent of an eligible
+  stale Finder directory request and cancels that request locally.
 - `cache config` requires either `--max-bytes N` or `--unlimited`, never both.
   `cache directory PATH` conflicts with `--default`; omitting both queries the
   current directory. `--dry-run` previews migration. `cache prune --max-bytes`
@@ -194,7 +201,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.1`: **111 command entries** (including groups, excluding the root and automatic `help`), **97 executable leaf commands**, and **788 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.2`: **116 command entries** (including groups, excluding the root and automatic `help`), **101 executable leaf commands**, and **822 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -204,6 +211,8 @@ WebDAV and SMB files, offline cache, durable uploads, and conservative sync
 Usage: rdrive [OPTIONS] <COMMAND>
 
 Commands:
+  update     Check for a stable CLI release on GitHub
+  conflict   Inspect and repair ordinary two-way sync conflicts
   mcp        Expose existing operations to AI clients over MCP standard input/output
   profile    Add/list/remove connection profiles. Never accepts a password argument
   info       Test connection and show backend capabilities
@@ -250,6 +259,90 @@ Options:
       --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
   -h, --help                 Print help
   -V, --version              Print version
+```
+
+### `rdrive update`
+
+```text
+Check for a stable CLI release on GitHub
+
+Usage: rdrive update [OPTIONS]
+
+Options:
+      --apply                Install the newer release over the standalone CLI
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive conflict`
+
+```text
+Inspect and repair ordinary two-way sync conflicts
+
+Usage: rdrive conflict [OPTIONS] <COMMAND>
+
+Commands:
+  list    List conflicting paths from a read-only two-way sync plan
+  repair  Preview a file repair, or apply it using its current preview token
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive conflict list`
+
+```text
+List conflicting paths from a read-only two-way sync plan
+
+Usage: rdrive conflict list [OPTIONS] <PROFILE> <LOCAL> [REMOTE]
+
+Arguments:
+  <PROFILE>
+  <LOCAL>
+  [REMOTE]   [default: ]
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive conflict repair`
+
+```text
+Preview a file repair, or apply it using its current preview token
+
+Usage: rdrive conflict repair [OPTIONS] --choose <CHOOSE> <PROFILE> <LOCAL> <REMOTE> <PATH>
+
+Arguments:
+  <PROFILE>
+  <LOCAL>
+  <REMOTE>
+  <PATH>     Relative path within the paired sync directories
+
+Options:
+      --choose <CHOOSE>      [possible values: local, remote]
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --apply                Back up the displaced file and apply the chosen side
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --expect <EXPECT>      Token from a preview of this repair
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
 ```
 
 ### `rdrive mcp`
@@ -1368,19 +1461,20 @@ Configure on-demand offline domains and manage retained local edits
 Usage: rdrive smart [OPTIONS] <COMMAND>
 
 Commands:
-  setup     Save a Smart domain; configure a 5 GiB clean-content budget if none exists
-  status    Show local Smart state, durable mutations and clean-cache accounting
-  list      List retained mutations, optionally restricted to one domain
+  setup             Save a Smart domain; configure a 5 GiB clean-content budget if none exists
+  status            Show local Smart state, durable mutations and clean-cache accounting
+  list              List retained mutations, optionally restricted to one domain
   pause
   resume
-  retry     Mark retained work retryable without changing its original version guards
-  cancel    Cancel pending work while preserving its independent local snapshot
-  resolve   Resolve a conflict using a durable decision; remote retains a local recovery copy
-  recovery  List retained remote namespace recovery backups (space is retained)
-  export    Export a retained local edit to a separate real file for recovery
-  discard   Discard only a completed/cancelled/superseded recovery snapshot
-  run       Perform one reconnect/replay pass; provider serve also runs automatically
-  help      Print this message or the help of the given subcommand(s)
+  retry             Mark retained work retryable without changing its original version guards
+  cancel            Cancel pending work while preserving its independent local snapshot
+  resolve           Resolve a conflict using a durable decision; remote retains a local recovery copy
+  refresh-conflict  Refresh a directory after a stale Finder request that never reached the server
+  recovery          List retained remote namespace recovery backups (space is retained)
+  export            Export a retained local edit to a separate real file for recovery
+  discard           Discard only a completed/cancelled/superseded recovery snapshot
+  run               Perform one reconnect/replay pass; provider serve also runs automatically
+  help              Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>          State/config directory (also RDRIVE_HOME)
@@ -1533,6 +1627,26 @@ Arguments:
 Options:
       --home <HOME>          State/config directory (also RDRIVE_HOME)
       --strategy <STRATEGY>  [possible values: keep-both, replace, remote]
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive smart refresh-conflict`
+
+```text
+Refresh a directory after a stale Finder request that never reached the server
+
+Usage: rdrive smart refresh-conflict [OPTIONS] <DOMAIN> <MUTATION>
+
+Arguments:
+  <DOMAIN>
+  <MUTATION>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
       --json                 Compact machine-readable JSON. Errors are JSON on stderr
       --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
       --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]

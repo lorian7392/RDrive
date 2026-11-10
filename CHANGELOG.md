@@ -2,6 +2,14 @@
 
 Changes are organized from source history and versioned validation records. Dates identify the recorded changes or checks; they do not imply that a signed distribution was published. Historical test counts and deployment observations remain in their original reports and do not establish current coverage or installation status.
 
+## 0.8.2 — 2026-11-11
+
+- Publish an Apple Silicon CLI, checksum manifest, and installation script after tagged builds pass the release checks.
+- Check for newer stable releases with `rdrive update` and apply them explicitly with `--apply`.
+- Inspect two-way sync conflicts and resolve individual file conflicts with a preview token and a recovery copy.
+- Refresh stale Finder directory conflicts without replaying the obsolete operation.
+- Use Finder's download and eviction controls while keeping RDrive's offline pin and unpin actions.
+
 ## 0.8.1 — 2026-11-10
 
 - Account for credits granted by SMB `STATUS_PENDING` responses before waiting for final completion, so interim grants remain available to other requests.

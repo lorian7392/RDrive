@@ -10,7 +10,7 @@ mod index;
 mod index_scheduler;
 mod namespace;
 mod resolution;
-pub use resolution::resolve_smart;
+pub use resolution::{refresh_stale_smart_directory,resolve_smart};
 #[async_trait::async_trait]
 trait Connector: Send + Sync {
     async fn connect(&self, profile: &config::Profile, name: &str, context: crate::transfer::TransferContext) -> Result<Arc<dyn Backend>>;
@@ -204,10 +204,10 @@ fn emit_namespace(store:&Store,d:&Domain,j:&mut Journal,old:&BTreeMap<String,Rec
 }
 /// A successful Depth:1 listing is evidence only about this parent's direct
 /// children. Unvisited sibling directories are never interpreted as deletion.
-async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,parent_id:&str)->Result<()> {
+async fn refreshed_directory(b:&dyn Backend,d:&Domain,j:&Journal,parent_id:&str)->Result<BTreeMap<String,Record>> {
     let parent=scope_parent(j,parent_id)?;let backend_parent=remote(d,&parent)?;
     let incoming=b.list_metadata(&backend_parent).await?;
-    let old=j.items.clone();let mut next=old.clone();let mut entries=BTreeMap::new();
+    let old=&j.items;let mut next=old.clone();let mut entries=BTreeMap::new();
     for entry in incoming {
         if backend::normalize(&entry.path)?!=entry.path||entry.path.rsplit_once('/').map(|(p,_)|p).unwrap_or("")!=backend_parent{bail!("unsafe provider child path");}
         let path=relative(&d.remote,&entry.path)?;if !keep_internal(&path){continue;}
@@ -231,8 +231,16 @@ async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,
         let item=Item{id:id.clone(),parent_id:parent_id.into(),name:path.rsplit('/').next().unwrap().into(),kind:if entry.is_dir{"directory"}else{"file"}.into(),size:entry.size,modified:entry.modified.and_then(chrono::DateTime::from_timestamp_millis).map(|value|value.to_rfc3339()),content_version:version(&entry)?,metadata_version:metadata_version(&path,&tags,&attributes,false),pinned:false,capabilities,tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
         next.insert(id,Record{path,item,entry:Some(entry),strong,client_id:previous.and_then(|r|r.client_id.clone()),metadata_known:previous.is_some_and(|r|r.metadata_known),metadata_checked:previous.filter(|_|same).map_or(0,|r|r.metadata_checked)});
     }
+    Ok(next)
+}
+fn publish_directory(store:&Store,d:&Domain,j:&mut Journal,parent_id:&str,next:BTreeMap<String,Record>)->Result<()> {
+    let old=j.items.clone();
     let mut candidate=j.clone();candidate.directory_scans.insert(parent_id.into(),chrono::Utc::now().timestamp_millis());
     emit_namespace(store,d,&mut candidate,&old,next)?;*j=candidate;Ok(())
+}
+async fn refresh_directory(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,parent_id:&str)->Result<()> {
+    let next=refreshed_directory(b,d,j,parent_id).await?;
+    publish_directory(store,d,j,parent_id,next)
 }
 fn check_fresh_metadata_base(req:&Request,path:&str,pinned:bool,prior:Option<&crate::metadata::MetadataRecord>)->Result<()> {
     // No sidecar means there is no remote metadata to overwrite. Publication
@@ -363,7 +371,8 @@ fn staging_output_file(staging:&Path,directory:&File,source:&File)->Result<PathB
 fn open_staging(staging:&Path)->Result<File>{use std::os::unix::fs::OpenOptionsExt;Ok(fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(staging)?)}
 
 fn check_fetch_base(req:&Request,item:&Item)->Result<()> {if req.base_content_version.as_ref().is_some_and(|version|version!=&item.content_version){bail!("version_conflict: file content changed since the system snapshot");}Ok(())}
-fn check_base(req:&Request,item:&Item)->Result<()> {if req.base_content_version.as_ref().is_some_and(|v|v!=&item.content_version)||req.base_metadata_version.as_ref().is_some_and(|v|metadata_base(v)!=metadata_base(&item.metadata_version)){bail!("version_conflict: item changed since the system snapshot");}Ok(())}
+const STALE_SYSTEM_SNAPSHOT:&str="version_conflict: item changed since the system snapshot";
+fn check_base(req:&Request,item:&Item)->Result<()> {if req.base_content_version.as_ref().is_some_and(|v|v!=&item.content_version)||req.base_metadata_version.as_ref().is_some_and(|v|metadata_base(v)!=metadata_base(&item.metadata_version)){bail!("{STALE_SYSTEM_SNAPSHOT}");}Ok(())}
 fn child_path(j:&Journal,parent:&str,name:&str)->Result<String>{if name.is_empty()||name.contains('/')||backend::normalize(name)?!=name||name.chars().any(|c|c.is_control()){bail!("invalid item name");}let p=if parent=="root"{""}else{let r=j.items.get(parent).context("no_such_item: parent missing")?;if r.item.kind!="directory"{bail!("parent is not a directory");}&r.path};backend::join(p,name)}
 fn apply_tags(mut record:crate::metadata::MetadataRecord,tags:Option<&str>)->Result<crate::metadata::MetadataRecord>{if let Some(tags)=tags{if tags.len()>128*1024||tags.len()%2!=0||!tags.bytes().all(|b|b.is_ascii_hexdigit()){bail!("invalid Finder tag data");}if tags.is_empty(){record.attributes.remove("com.apple.metadata:_kMDItemUserTags");}else{record.attributes.insert("com.apple.metadata:_kMDItemUserTags".into(),tags.into());}}record.validate()?;Ok(record)}
 fn native_cached_path(home:&Path,id:&str)->PathBuf{home.join("provider").join(format!("native-cached-{}.json",state::key(id)))}
@@ -527,6 +536,7 @@ fn smart_failure(error:&anyhow::Error)->crate::smart::FailureKind {
 async fn replay(home:&Path,staging:&Path,fd:&File,d:&Domain,queue:&mut crate::smart::Queue,mutation:&crate::smart::Mutation)->Result<Value> {
     use crate::smart::MutationState;
     if mutation.state==MutationState::Done{release_confirmed_payload(home,d,queue,mutation);return mutation.response.clone().context("Smart receipt missing");}
+    if mutation.stale_directory_cancelled(){bail!("version_conflict: stale directory request was cancelled; use the refreshed Finder item");}
     if matches!(mutation.state,MutationState::Conflict|MutationState::Failed){bail!("version_conflict: retained Smart edit requires attention: {}",mutation.error.as_deref().unwrap_or("replay stopped"));}
     let prepared=(||->Result<_>{
         queue.start(&mutation.id)?;let lease=queue.snapshot(&mutation.id)?;let store=Store::open(home.to_path_buf())?;

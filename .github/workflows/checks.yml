@@ -3,10 +3,10 @@ name: Checks
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -72,6 +72,7 @@ jobs:
             target/native-tests-coverage/coverage.lcov
             target/validation/*.json
           if-no-files-found: error
+          overwrite: true
 
   smb:
     runs-on: ubuntu-24.04
@@ -103,6 +104,7 @@ jobs:
             target/coverage/rust-linux/*.json
             target/coverage/rust-linux/logs/
           if-no-files-found: error
+          overwrite: true
 
   production-coverage:
     needs: [macos, smb]
@@ -146,3 +148,4 @@ jobs:
             target/coverage/rust.lcov
             target/coverage/rust.manifest.json
           if-no-files-found: error
+          overwrite: true

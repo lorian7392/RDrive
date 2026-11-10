@@ -26,3 +26,5 @@ pub mod policies;
 pub mod service;
 
 pub mod cache_directory;
+
+pub mod update;

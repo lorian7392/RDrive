@@ -51,6 +51,17 @@ enum SyncDirection {
 #[derive(Clone,Copy,ValueEnum)]enum ProgressMode{Auto,Off,Json}
 #[derive(Subcommand)]
 enum Command {
+    /// Check for a stable CLI release on GitHub.
+    Update {
+        /// Install the newer release over the standalone CLI.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Inspect and repair ordinary two-way sync conflicts.
+    Conflict {
+        #[command(subcommand)]
+        command: ConflictCommand,
+    },
     /// Expose existing operations to AI clients over MCP standard input/output.
     Mcp {
         #[command(subcommand)]
@@ -299,6 +310,39 @@ enum McpCommand {
     /// Invoke the built native companion (build first with macos/build.py).
     Native{#[arg(long)]app:Option<PathBuf>,#[arg(trailing_var_arg=true,allow_hyphen_values=true)]args:Vec<String>},
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum ConflictSide {
+    Local,
+    Remote,
+}
+
+#[derive(Subcommand)]
+enum ConflictCommand {
+    /// List conflicting paths from a read-only two-way sync plan.
+    List {
+        profile: String,
+        local: PathBuf,
+        #[arg(default_value = "")]
+        remote: String,
+    },
+    /// Preview a file repair, or apply it using its current preview token.
+    Repair {
+        profile: String,
+        local: PathBuf,
+        remote: String,
+        /// Relative path within the paired sync directories.
+        path: String,
+        #[arg(long, value_enum)]
+        choose: ConflictSide,
+        /// Back up the displaced file and apply the chosen side.
+        #[arg(long, requires = "expect")]
+        apply: bool,
+        /// Token from a preview of this repair.
+        #[arg(long, requires = "apply")]
+        expect: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum SmartCommand {
     /// Save a Smart domain; configure a 5 GiB clean-content budget if none exists.
@@ -318,6 +362,8 @@ enum SmartCommand {
     Cancel { domain:String, mutation:String },
     /// Resolve a conflict using a durable decision; remote retains a local recovery copy.
     Resolve { domain:String, mutation:String, #[arg(long,value_parser=["keep-both","replace","remote"])] strategy:String },
+    /// Refresh a directory after a stale Finder request that never reached the server.
+    RefreshConflict { domain: String, mutation: String },
     /// List retained remote namespace recovery backups (space is retained).
     Recovery { domain:String },
     /// Export a retained local edit to a separate real file for recovery.
@@ -548,16 +594,12 @@ fn sync_options(direction: SyncDirection, apply: bool, delete: bool) -> sync::Sy
         },
     }
 }
-async fn do_sync(
-    store: &mut Store,
-    json: bool,
+fn sync_roots(
+    store: &Store,
     name: &str,
     local: &Path,
     remote: &str,
-    options: sync::SyncOptions,
-    metadata:bool,
-) -> Result<()> {
-    let backend = connect(store, name).await?;
+) -> Result<(PathBuf, String, PathBuf)> {
     let remote = path(remote)?;
     if std::fs::symlink_metadata(local)?.file_type().is_symlink() {
         bail!("sync root cannot be a symbolic link");
@@ -580,6 +622,20 @@ async fn do_sync(
         .home
         .join("baselines")
         .join(format!("{}.json", state::key(&identity)));
+    Ok((local, remote, baseline))
+}
+
+async fn do_sync(
+    store: &mut Store,
+    json: bool,
+    name: &str,
+    local: &Path,
+    remote: &str,
+    options: sync::SyncOptions,
+    metadata:bool,
+) -> Result<()> {
+    let backend = connect(store, name).await?;
+    let (local, remote, baseline) = sync_roots(store, name, local, remote)?;
     let report = sync::run_with_metadata(backend.as_ref(), &local, &remote, &baseline, &options, metadata).await?;
     if metadata&&report.conflicts.is_empty(){
         let meta=rdrive::metadata_remote::sync(backend.as_ref(),&local,&remote,&baseline.with_extension("metadata.json"),&rdrive::metadata_remote::SyncOptions{apply:options.apply,direction:options.direction}).await?;
@@ -598,7 +654,43 @@ async fn do_sync(
 async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
     let json = cli.json;
     match &cli.command {
-        Command::Mcp { .. } | Command::Service { .. } => unreachable!(),
+        Command::Mcp { .. } | Command::Service { .. } | Command::Update { .. } => unreachable!(),
+        Command::Conflict { command } => match command {
+            ConflictCommand::List { profile, local, remote } => {
+                let (local, remote, baseline) = sync_roots(store, profile, local, remote)?;
+                let backend = connect(store, profile).await?;
+                let options = sync_options(SyncDirection::Both, false, false);
+                let report = sync::run(backend.as_ref(), &local, &remote, &baseline, &options).await?;
+                emit(json, &report.conflicts)?;
+            }
+            ConflictCommand::Repair {
+                profile,
+                local,
+                remote,
+                path,
+                choose,
+                expect,
+                ..
+            } => {
+                let (local, remote, baseline) = sync_roots(store, profile, local, remote)?;
+                let backend = connect(store, profile).await?;
+                let choice = match choose {
+                    ConflictSide::Local => sync::ConflictChoice::Local,
+                    ConflictSide::Remote => sync::ConflictChoice::Remote,
+                };
+                let report = sync::repair_conflict(
+                    backend.as_ref(),
+                    &local,
+                    &remote,
+                    &baseline,
+                    path,
+                    choice,
+                    expect.as_deref(),
+                )
+                .await?;
+                emit(json, &report)?;
+            }
+        },
         Command::Filter { command } => match command {
             FilterCommand::Status {profile} => {
                 if let Some(name)=profile { self_profile(store,name)?; }
@@ -710,7 +802,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 }else{None};
                 emit(json,&serde_json::json!({"configured_domain":domain,"native_registration":registration,"provider_service_started":false,"cache":rdrive::cache::status(store)?,"next_step":"Run provider serve with the companion's shared IPC socket and staging paths; register/enable its File Provider domain to show on-demand files in Finder."}))?;
             },
-            SmartCommand::Resolve{..}=>unreachable!(),
+            SmartCommand::Resolve{..} | SmartCommand::RefreshConflict{..}=>unreachable!(),
             SmartCommand::Recovery{domain}=>emit(json,&rdrive::provider::namespace_recovery(&store.home,domain)?)?,
             SmartCommand::Status=>emit(json,&rdrive::provider::smart_summary(store)?)?,
             SmartCommand::List{domain}=>{
@@ -1294,6 +1386,9 @@ impl Default for NativeCalls {
 }
 
 async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
+    if let Command::Update { apply } = &cli.command {
+        return emit(cli.json, &rdrive::update::run(*apply).await?);
+    }
     let home = cli.home.clone().unwrap_or_else(config::default_home);
     match &cli.command {
         Command::Service {command} => {
@@ -1309,6 +1404,12 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
             };return emit(cli.json,&value);
         },
         Command::Smart {command:SmartCommand::Resolve{domain,mutation,strategy}}=>return emit(cli.json,&rdrive::provider::resolve_smart(&home,domain,mutation,strategy).await?),
+        Command::Smart {
+            command: SmartCommand::RefreshConflict { domain, mutation },
+        } => {
+            let report = rdrive::provider::refresh_stale_smart_directory(&home, domain, mutation).await?;
+            return emit(cli.json, &report);
+        },
         Command::Index {command:IndexCommand::Search{domain,query,scope,kind,page_size,offset}}=>return emit(cli.json,&rdrive::provider::index_search(&home,domain,query,scope,kind.as_deref(),*page_size,*offset)?),
         Command::Index { command:IndexCommand::Status { domain } } => {
             return emit(cli.json,&rdrive::provider::index_status(&home,domain.as_deref())?);

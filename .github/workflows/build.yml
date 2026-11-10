@@ -3,10 +3,10 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -60,3 +60,23 @@ jobs:
           path: target/build-artifacts/
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
+      - name: Stage Apple Silicon release files
+        if: github.ref_type == 'tag'
+        run: |
+          test "$(lipo -archs target/release/rdrive)" = arm64
+          bash -n scripts/install.sh
+          mkdir -p target/release-assets
+          cp target/release/rdrive target/release-assets/rdrive-macos-arm64
+          cp scripts/install.sh target/release-assets/install.sh
+          cd target/release-assets
+          shasum -a 256 rdrive-macos-arm64 > SHA256SUMS
+      - name: Upload staged release files
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ github.sha }}
+          path: target/release-assets/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true

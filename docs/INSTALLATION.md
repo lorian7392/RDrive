@@ -2,7 +2,30 @@
 
 Start with the standalone CLI. The optional native companion provides Finder and File Provider integration; CLI transfers, caching, synchronization, and MCP do not require it.
 
-## Requirements
+## Install the release
+
+The standalone release targets Apple Silicon Macs. Install the [GitHub CLI](https://cli.github.com/) and sign in to an account with access to the private RDrive repository.
+
+~~~sh
+gh auth login --hostname github.com
+RDRIVE_INSTALL_DIR="$(mktemp -d)"
+gh release download --repo github.com/lorian7392/RDrive \
+  --pattern install.sh --dir "$RDRIVE_INSTALL_DIR"
+/bin/bash "$RDRIVE_INSTALL_DIR/install.sh"
+export PATH="$HOME/.local/bin:$PATH"
+rdrive --version
+~~~
+
+The script downloads the CLI and its SHA-256 checksum from the same stable release. It verifies the checksum before replacing the executable in a single step. The default destination is `~/.local/bin/rdrive`. Set `--prefix /absolute/path` for a different user-owned directory, or `--version v0.8.2` to install a particular published version. Add the selected `bin` directory to your shell's startup configuration to keep it on your path.
+
+```sh
+rdrive update          # Check for a newer stable release
+rdrive update --apply  # Install it over the standalone CLI
+```
+
+The update command uses the same authenticated GitHub CLI and verifies the downloaded binary before replacing it. It does not use your RDrive state directory. For the Finder companion, follow the native build and upgrade steps below.
+
+## Build requirements
 
 - **macOS** is the primary development and validation platform. The native App targets macOS 13.0+, with observed compatibility limited to the systems recorded in [testing](TESTING.md).
 - **Rust and Cargo 1.90+**, as declared in `Cargo.toml`.
@@ -101,7 +124,7 @@ Follow [macOS integration](MACOS_INTEGRATION.md) for enablement and registration
 1. Read the [changelog](https://github.com/lorian7392/RDrive/blob/main/CHANGELOG.md) and the target version's validation scope.
 2. Check `queue list`, `smart status`, `smart list DOMAIN`, and `transfers list`. Export unsent edits that need an additional copy.
 3. Stop the relevant `watch`, bridge, MCP, and companion processes. For an installed user service, use `rdrive service stop`. Confirm that no old process continues writing the state directory.
-4. Preserve state and required partial downloads. Back them up, update the source, and rebuild with `cargo build --release --locked`.
+4. Preserve state and required partial downloads. Run `rdrive update --apply` for the standalone release. For a source checkout, update it and rebuild with `cargo build --release --locked`.
 5. Rebuild and switch the App, bridge, and notification helper if native integration is used. Verify the CLI version, embedded version, state directory, and IPC path.
 6. Inspect profiles, jobs, and domains through read-only commands before resuming background work.
 

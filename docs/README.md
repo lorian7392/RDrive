@@ -9,7 +9,7 @@ Start with the CLI. Add Smart Synchronization or a managed snapshot repository w
 
 ## Start here
 
-1. **[Install](INSTALLATION.md)** the CLI from source with Rust 1.90 or later.
+1. **[Install](INSTALLATION.md)** the CLI from a release on Apple Silicon, or build it from source.
 2. **[Connect](QUICKSTART.md#authentication-and-connections)** to your own WebDAV or SMB server using an environment variable or macOS Keychain credential.
 3. **[Browse and transfer files](QUICKSTART.md#browse-and-transfer-files)**, then configure caching, synchronization, or Finder integration as needed.
 
@@ -41,7 +41,7 @@ See [features and limitations](FEATURES.md) for protocol differences, overwrite 
 - **Browsing and discovery:** [SQLite indexing and incremental refresh](DIRECTORY_INDEXING.md), including local index search.
 - **Native integration:** [macOS companion and extensions](MACOS_INTEGRATION.md); [SMB notifications and handle recovery](SMB_LIFECYCLE.md).
 - **Commands and settings:** [complete CLI reference](reference/CLI.md), [configuration reference](reference/CONFIGURATION.md), and [all MCP tool schemas](reference/MCP.md).
-- **Failures:** [troubleshooting](TROUBLESHOOTING.md), including conflicts, retained edits, uncertain commit results, and Finder activation.
+- **Failures:** [troubleshooting](TROUBLESHOOTING.md), including retained edits, uncertain commit results, and Finder activation. See [conflict repair](CONFLICTS.md) for ordinary sync and Smart recovery.
 
 ## Develop and contribute
 

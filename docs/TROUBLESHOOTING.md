@@ -88,7 +88,7 @@ SMB upload resumption also verifies remote staging identity and the complete upl
 
 Stop repeatedly applying the same plan and preserve both sides and recovery copies. Sync stops on concurrent changes, differing content without a common baseline, incomplete scans, or name/type conflicts. It does not automatically choose the newer timestamp.
 
-Reconcile ordinary sync explicitly and preview again. Initial absence does not prove deletion. Losing state loses the common baseline. Execution failures do not roll back already-confirmed network operations; the old baseline remains, and later manual reconciliation may be necessary.
+Use `rdrive conflict list` to inspect ordinary sync conflicts. For files with a common baseline, [preview and apply a repair](CONFLICTS.md) while keeping a recovery copy. Initial absence does not prove deletion. Losing state loses the common baseline. Execution failures do not roll back already-confirmed network operations; the old baseline remains, and later manual reconciliation may be necessary.
 
 A failed `edit` upload remains in the queue. If the editor itself fails, the error reports the retained local file. Export/copy the result before resolving remote revision changes.
 

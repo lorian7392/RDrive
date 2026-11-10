@@ -227,6 +227,157 @@ pub async fn resolve_smart(
     )
 }
 
+/// Abandon a stale directory rename, move, or deletion after reading its
+/// authoritative parent listing. Only a request with no publication intent
+/// or local payload is eligible.
+pub async fn refresh_stale_smart_directory(
+    home: &Path,
+    domain_id: &str,
+    mutation_id: &str,
+) -> Result<Value> {
+    refresh_stale_smart_directory_with(home, domain_id, mutation_id, &NetworkConnector).await
+}
+
+async fn refresh_stale_smart_directory_with(
+    home: &Path,
+    domain_id: &str,
+    mutation_id: &str,
+    connector: &dyn Connector,
+) -> Result<Value> {
+    let store = Store::open(home.to_path_buf())?;
+    let d = domains(home)?
+        .into_iter()
+        .find(|d| d.id == domain_id && d.smart && !d.repository)
+        .context("ordinary Smart domain not found")?;
+    let mut queue = Queue::open(&store, &d.id, &journal_binding(&store.config, &d)?)?;
+    let mutation = queue.get(mutation_id)?;
+    let mut journal = checked_journal(home, &store.config, &d)?;
+    let request: Request = serde_json::from_value(mutation.request.clone())?;
+    let directory = stale_directory_source(&d, &journal, &mutation, &request)?.clone();
+    let parent_id = request_parent(&journal, &d, &request)?;
+    let parent_path = scope_parent(&journal, &parent_id)?;
+    let other_references = active_mutation_references(&queue, &journal, &mutation.id);
+    if other_references.iter().any(|id| {
+        journal.items.get(id).is_some_and(|record| {
+            let path = &record.path;
+            path == &directory.path
+                || path.starts_with(&format!("{}/", directory.path))
+                || directory.path.starts_with(&format!("{path}/"))
+        })
+    }) {
+        bail!("another active Smart request refers to this directory or its tree");
+    }
+
+    let profile = store.config.profiles.get(&d.profile).context("Smart profile not found")?;
+    let next = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let backend = connector.connect(profile, &d.profile, crate::transfer::global()).await?;
+        refreshed_directory(backend.as_ref(), &d, &journal, &parent_id).await
+    })
+    .await
+    .context("timed out reading the remote directory listing")??;
+    crate::sync::validate_path_collisions(next.values().map(|record| &record.path))?;
+    if other_references.iter().any(|id| journal.items.contains_key(id) && !next.contains_key(id)) {
+        bail!("the refreshed listing would remove an item used by another active Smart request");
+    }
+
+    let directory_present = next.get(&directory.item.id).is_some_and(|r| r.item.kind == "directory");
+    let mutation = queue.cancel_stale_directory(&mutation)?;
+    // If this local write fails, the durable cancellation still prevents
+    // replay. The original catalog is intact and this command can retry it.
+    publish_directory(&store, &d, &mut journal, &parent_id, next)
+        .context("stale request cancelled; retry refresh-conflict to update the Finder catalog")?;
+    Ok(json!({
+        "mutation": mutation,
+        "directory_path": directory.path,
+        "refreshed_parent_id": parent_id,
+        "refreshed_parent_path": parent_path,
+        "directory_present": directory_present,
+        "remote_changed": false,
+    }))
+}
+
+fn stale_directory_source<'a>(
+    d: &Domain,
+    journal: &'a Journal,
+    mutation: &Mutation,
+    request: &Request,
+) -> Result<&'a Record> {
+    let exact_conflict = mutation.state == MutationState::Conflict
+        && mutation.error.as_deref() == Some(STALE_SYSTEM_SNAPSHOT);
+    if !exact_conflict && !mutation.stale_directory_cancelled() {
+        bail!("Smart request is not stopped on a stale system snapshot");
+    }
+    if mutation.snapshot.is_some() || mutation.payload_discarded
+        || mutation.response.is_some() || mutation.resolution.is_some()
+        || request.content_path.is_some() || request.tag_data_hex.is_some()
+        || request.extended_attributes.is_some()
+    {
+        bail!("Smart request includes content, metadata, or prior resolution");
+    }
+
+    let record = request.id.as_deref().and_then(|id| journal.items.get(id))
+        .filter(|r| r.item.kind == "directory" && r.entry.as_ref().is_some_and(|e| e.is_dir))
+        .context("Smart request source is no longer indexed as a remote directory")?;
+    match request.op.as_str() {
+        "delete" => (),
+        "modify" => {
+            let parent = request_parent(journal, d, request)?;
+            let name = record.path.rsplit('/').next().unwrap();
+            let target = child_path(
+                journal,
+                request.parent_id.as_deref().unwrap_or(&parent),
+                request.name.as_deref().unwrap_or(name),
+            )?;
+            if target == record.path {
+                bail!("Smart request does not rename or move the directory");
+            }
+        }
+        _ => bail!("Smart request is not a directory rename, move, or deletion"),
+    }
+
+    let key_prefix = state::key(&d.id);
+    let request_id = request.request_id.as_deref().context("Smart request identity missing")?;
+    if journal.requests.contains_key(&format!("{key_prefix}:{request_id}")) {
+        bail!("Smart request has a durable provider intent or receipt");
+    }
+    if let Some(replay) = journal.smart_replays.get(&mutation.id) {
+        let replay_id = replay.request_id.as_deref().context("Smart replay identity missing")?;
+        if journal.requests.contains_key(&format!("{key_prefix}:{replay_id}")) {
+            bail!("Smart replay has a durable provider intent or receipt");
+        }
+        if replay.op != request.op || replay.domain != request.domain || replay.id != request.id
+            || replay.name != request.name || replay.parent_id != request.parent_id
+            || replay.recursive != request.recursive || replay.content_path.is_some()
+            || replay.tag_data_hex.is_some() || replay.extended_attributes.is_some()
+        {
+            bail!("saved Smart replay differs from the original directory request");
+        }
+    }
+    Ok(record)
+}
+
+fn active_mutation_references(
+    queue: &Queue,
+    journal: &Journal,
+    excluded_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for mutation in queue.list().into_iter().filter(|m| m.id != excluded_id && m.state.active()) {
+        let requests = std::iter::once(&mutation.request)
+            .chain(mutation.resolution.as_ref().map(|plan| &plan.request));
+        for request in requests {
+            for field in ["id", "parent_id"] {
+                ids.extend(request[field].as_str().map(str::to_owned));
+            }
+        }
+        if let Some(replay) = journal.smart_replays.get(&mutation.id) {
+            ids.extend(replay.id.clone());
+            ids.extend(replay.parent_id.clone());
+        }
+    }
+    ids
+}
+
 /// Automatic policy can plan once. An additional external version after that
 /// decision leaves a conflict instead of repeatedly rebasing and overwriting.
 pub(super) async fn auto_resolve(
@@ -391,6 +542,156 @@ mod tests {
         assert!(plan_with(&store,&domain,&mut queue,&failed,ConflictStrategy::Replace,true,&connector).await.unwrap_err().to_string().contains("cannot guard"));
         fs::remove_file(disk.root.join("file")).unwrap();assert!(plan_with(&store,&domain,&mut queue,&failed,ConflictStrategy::Replace,true,&connector).await.unwrap_err().to_string().contains("target is absent"));
         assert!(queue.get(&failed.id).unwrap().resolution.is_none());
+    }
+
+    async fn stale_directory_fixture() -> (
+        tempfile::TempDir, Store, Domain, Queue, Mutation, Arc<super::super::test_backend::Disk>,
+    ) {
+        let (temporary, store, domain, mut queue, _) = setup();
+        let disk = super::super::test_backend::Disk::new(temporary.path().join("remote"));
+        fs::create_dir_all(disk.root.join("parent/folder")).unwrap();
+        fs::create_dir_all(disk.root.join("other")).unwrap();
+        let mut journal = checked_journal(&store.home, &store.config, &domain).unwrap();
+        refresh_directory(&store, disk.as_ref(), &domain, &mut journal, "root").await.unwrap();
+        let parent = journal.items.values().find(|record| record.path == "parent").unwrap().item.id.clone();
+        refresh_directory(&store, disk.as_ref(), &domain, &mut journal, &parent).await.unwrap();
+        let folder = journal.items.values().find(|record| record.path == "parent/folder").unwrap();
+        let mutation = queue.enqueue(json!({
+            "v":1, "op":"modify", "domain":domain.id, "id":folder.item.id, "request_id":"directory-edit",
+            "name":"abandoned", "base_content_version":"old", "base_metadata_version":folder.item.metadata_version,
+        }), None).unwrap();
+        let mutation = queue.fail(&mutation.id, crate::smart::FailureKind::Conflict, STALE_SYSTEM_SNAPSHOT).unwrap();
+        let replay = request(mutation.request.clone());
+        journal.smart_replays.insert(mutation.id.clone(), replay);
+        save_journal(&store, &domain.id, &journal).unwrap();
+        update_overlay(&store, &domain).unwrap();
+        (temporary, store, domain, queue, mutation, disk)
+    }
+
+    #[tokio::test]
+    async fn stale_directory_refresh_requires_an_authoritative_read_before_cancellation() {
+        use super::super::test_backend::Connected;
+        let (_temporary, store, domain, queue, mutation, disk) = stale_directory_fixture().await;
+        let home = store.home.clone();
+        let binding = queue.binding().to_owned();
+        let connector = Connected(disk.clone());
+        drop(queue);
+        drop(store);
+
+        fs::rename(disk.root.join("parent"), disk.root.join("renamed-externally")).unwrap();
+        let failed = refresh_stale_smart_directory_with(&home, &domain.id, &mutation.id, &connector).await;
+        assert!(failed.is_err());
+        assert_eq!(crate::smart::read_only(&home, &domain.id, &binding).unwrap()
+            .into_iter().find(|row| row.id == mutation.id).unwrap().state, MutationState::Conflict);
+        fs::rename(disk.root.join("renamed-externally"), disk.root.join("parent")).unwrap();
+        // Simulate the cancellation being saved before an interrupted catalog write.
+        let store = Store::open(home.clone()).unwrap();
+        let mut queue = Queue::open(&store, &domain.id, &binding).unwrap();
+        queue.cancel_stale_directory(&mutation).unwrap();
+        drop(queue);
+        drop(store);
+        fs::remove_dir(disk.root.join("parent/folder")).unwrap();
+        let result = refresh_stale_smart_directory_with(&home, &domain.id, &mutation.id, &connector).await.unwrap();
+        assert_eq!(result["directory_present"], false);
+        assert_eq!(result["mutation"]["state"], "cancelled");
+        let store = Store::open(home).unwrap();
+        let journal = checked_journal(&store.home, &store.config, &domain).unwrap();
+        let item_id = mutation.request["id"].as_str().unwrap();
+        assert!(!journal.items.contains_key(item_id));
+        assert!(journal.events.iter().any(|event| event.deleted.as_deref() == Some(item_id)));
+        assert_eq!(disk.removals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_directory_refresh_refuses_related_work_and_catalog_removal_of_a_queued_item() {
+        use super::super::test_backend::Connected;
+        let (_temporary, store, domain, mut queue, mutation, disk) = stale_directory_fixture().await;
+        let connector = Connected(disk.clone());
+        let home = store.home.clone();
+        let binding = queue.binding().to_owned();
+        let mut journal = checked_journal(&home, &store.config, &domain).unwrap();
+        let original = request(mutation.request.clone());
+        let other = journal.items.values().find(|r| r.path == "other").unwrap();
+        let related = queue.enqueue(json!({
+            "v":1, "op":"create", "domain":domain.id, "client_item_id":"child",
+            "parent_id":other.item.id, "name":"local-child", "kind":"directory",
+        }), None).unwrap();
+        let mut related_replay = request(related.request.clone());
+        related_replay.parent_id = original.id.clone();
+        journal.smart_replays.insert(related.id.clone(), related_replay);
+        save_journal(&store, &domain.id, &journal).unwrap();
+        drop(queue);
+        drop(store);
+        let failure = refresh_stale_smart_directory_with(&home, &domain.id, &mutation.id, &connector).await.unwrap_err();
+        assert!(failure.to_string().contains("another active Smart request"));
+        assert_eq!(disk.connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let store = Store::open(home.clone()).unwrap();
+        let mut queue = Queue::open(&store, &domain.id, &binding).unwrap();
+        queue.cancel(&related.id).unwrap();
+        fs::create_dir(disk.root.join("parent/sibling")).unwrap();
+        let parent = request_parent(&journal, &domain, &original).unwrap();
+        refresh_directory(&store, disk.as_ref(), &domain, &mut journal, &parent).await.unwrap();
+        let sibling = journal.items.values().find(|r| r.path == "parent/sibling").unwrap();
+        let sibling_edit = queue.enqueue(json!({
+            "v":1, "op":"delete", "domain":domain.id, "request_id":"sibling-delete",
+            "id":sibling.item.id, "base_content_version":sibling.item.content_version,
+            "base_metadata_version":sibling.item.metadata_version, "recursive":true,
+        }), None).unwrap();
+        fs::remove_dir(disk.root.join("parent/sibling")).unwrap();
+        drop(queue);
+        drop(store);
+        let failure = refresh_stale_smart_directory_with(&home, &domain.id, &mutation.id, &connector).await.unwrap_err();
+        assert!(failure.to_string().contains("would remove an item"));
+        let mutations = crate::smart::read_only(&home, &domain.id, &binding).unwrap();
+        assert_eq!(mutations.iter().find(|m| m.id == mutation.id).unwrap().state, MutationState::Conflict);
+        assert_eq!(mutations.iter().find(|m| m.id == sibling_edit.id).unwrap().state, MutationState::Pending);
+    }
+
+    #[tokio::test]
+    async fn stale_directory_validation_preserves_payload_metadata_and_namespace_receipts() {
+        let (_temporary, store, domain, queue, mutation, _) = stale_directory_fixture().await;
+        let mut journal = checked_journal(&store.home, &store.config, &domain).unwrap();
+        let original = request(mutation.request.clone());
+        let mut unsafe_edit = mutation.clone();
+        unsafe_edit.error = Some("version_conflict: different conflict".into());
+        let error = |j: &Journal, m: &Mutation, r: &Request| {
+            stale_directory_source(&domain, j, m, r).unwrap_err().to_string()
+        };
+        assert!(error(&journal, &unsafe_edit, &original).contains("not stopped on a stale"));
+        unsafe_edit.error = mutation.error.clone();
+        unsafe_edit.snapshot = queue.list().into_iter().find_map(|m| m.snapshot);
+        assert!(unsafe_edit.snapshot.is_some());
+        assert!(error(&journal, &unsafe_edit, &original).contains("includes content"));
+        let mut metadata = original.clone();
+        metadata.extended_attributes = Some(BTreeMap::new());
+        assert!(error(&journal, &mutation, &metadata).contains("includes content"));
+        let mut no_namespace = original.clone();
+        no_namespace.name = Some("folder".into());
+        assert!(error(&journal, &mutation, &no_namespace).contains("does not rename or move"));
+        let mut missing_target = original.clone();
+        missing_target.parent_id = Some("stale-target-parent".into());
+        assert!(error(&journal, &mutation, &missing_target).contains("parent missing"));
+        no_namespace.op = "create".into();
+        assert!(error(&journal, &mutation, &no_namespace).contains("is not a directory"));
+        no_namespace.op = "delete".into();
+        journal.smart_replays.clear();
+        assert!(stale_directory_source(&domain, &journal, &mutation, &no_namespace).is_ok());
+
+        let key_prefix = state::key(&domain.id);
+        let intent: Pending = serde_json::from_value(json!({"fingerprint":"before-move"})).unwrap();
+        journal.requests.insert(format!("{key_prefix}:directory-edit"), intent.clone());
+        assert!(error(&journal, &mutation, &original).contains("request has a durable provider"));
+        journal.requests.clear();
+        let mut replay = original.clone();
+        replay.request_id = Some("saved-replay".into());
+        journal.smart_replays.insert(mutation.id.clone(), replay.clone());
+        journal.requests.insert(format!("{key_prefix}:saved-replay"), intent);
+        assert!(error(&journal, &mutation, &original).contains("replay has a durable provider"));
+        journal.requests.clear();
+        replay.name = Some("unexpected-other-target".into());
+        journal.smart_replays.insert(mutation.id.clone(), replay);
+        assert!(error(&journal, &mutation, &original).contains("differs from the original"));
     }
 
 }

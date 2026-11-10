@@ -111,6 +111,13 @@ list every positional argument and option.
   `--delete` propagates observed deletions only after a successful baseline;
   `--metadata` synchronizes selected attributes. `watch --interval` defaults to
   `30` and must be greater than `0`.
+- `update` checks GitHub Releases. `--apply` installs the newer standalone CLI
+  after verifying the release checksum.
+- `conflict repair --choose local|remote` previews the selected file repair.
+  `--apply` and `--expect TOKEN` must be used together. The displaced content
+  stays under `.rdrive-versions/` within the local sync root.
+- `smart refresh-conflict DOMAIN MUTATION` refreshes the parent of an eligible
+  stale Finder directory request and cancels that request locally.
 - `cache config` requires either `--max-bytes N` or `--unlimited`, never both.
   `cache directory PATH` conflicts with `--default`; omitting both queries the
   current directory. `--dry-run` previews migration. `cache prune --max-bytes`

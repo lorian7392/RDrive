@@ -62,6 +62,18 @@ rdrive smart export cloud-smart MUTATION_ID ./recovered.txt
 
 `remote` cancels local publication but retains the independent recovery snapshot for later export. Decisions apply only to create/modify conflicts with retained file content. Guarded replacement handles content conflicts at the original path. Compound rename/move conflicts require a person to reconcile the naming intent; keep-both can still preserve content. Directories and missing targets require handling appropriate to their state. Managed repositories use existing immutable snapshot history; ordinary file versions do not provide multi-file transactions.
 
+## Refresh a stale Finder directory conflict
+
+Use `rdrive smart list DOMAIN` to find the mutation ID when Finder reports that the item changed since its system snapshot.
+
+```sh
+rdrive smart refresh-conflict DOMAIN MUTATION_ID
+```
+
+This command accepts a stopped directory request in an ordinary Smart domain when the request has no retained contents and no recorded remote publication intent. It refreshes the directory's parent listing and cancels the stale request. Reopen the parent in Finder and repeat the intended operation against the refreshed item if it is still appropriate.
+
+For a request that reached namespace publication, inspect `rdrive smart recovery DOMAIN` and the server before deciding how to proceed.
+
 ## Resident service
 
 ```sh

@@ -243,7 +243,7 @@ class BuildPeer:
         if arguments == ["uname", "-m"]:
             return "arm64\n"
         if arguments == [str(self.cli), "--version"]:
-            return "rdrive 0.8.1\n"
+            return "rdrive 0.8.2\n"
         raise AssertionError("unexpected external query: " + repr(arguments))
 
     def run(self, arguments, *, check, **options):
@@ -303,9 +303,9 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual((self.output / "RDrive.app/Contents/Resources/rdrive").read_bytes(), self.cli.read_bytes())
         self.assertEqual(report["source_cli_sha256"], hashlib.sha256(self.cli.read_bytes()).hexdigest())
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
-        self.assertEqual(report["cli_version"], "rdrive 0.8.1")
-        self.assertEqual(report["version"], "0.8.1")
-        self.assertEqual(report["bundle_build"], "11")
+        self.assertEqual(report["cli_version"], "rdrive 0.8.2")
+        self.assertEqual(report["version"], "0.8.2")
+        self.assertEqual(report["bundle_build"], "12")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])
@@ -318,7 +318,9 @@ class NativeBuildScriptTests(TemporaryFiles):
         provider = self.read_plist("RDrive.app/Contents/PlugIns/RDriveProvider.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(provider["NSExtensionFileProviderDocumentGroup"], "group.io.rdrive.shared")
         self.assertEqual(len(provider["NSFileProviderDecorations"]), 13)
-        self.assertEqual(len(provider["NSExtensionFileProviderActions"]), 4)
+        self.assertEqual([action["NSExtensionFileProviderActionIdentifier"]
+                          for action in provider["NSExtensionFileProviderActions"]],
+                         ["rdrive.pin", "rdrive.unpin"])
         finder = self.read_plist("RDrive.app/Contents/PlugIns/RDriveFinder.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(finder["NSExtensionAttributes"], {})
         status_ui = self.read_plist("RDrive.app/Contents/PlugIns/RDriveStatus.appex/Contents/Info.plist")["NSExtension"]

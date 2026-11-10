@@ -80,7 +80,7 @@ def main():
     namespace_policy = namespace_policy_supported(flags)
     if namespace_policy:
         flags += ["-D", "RDRIVE_HAS_NAMESPACE_POLICY"]
-    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "11", "CFBundleShortVersionString": "0.8.1",
+    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "12", "CFBundleShortVersionString": "0.8.2",
             "LSMinimumSystemVersion": "13.0", "RDriveAppGroup": app_group}
     if development_root:
         base.pop("RDriveAppGroup")
@@ -125,10 +125,6 @@ def main():
                      "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"},
                     {"NSExtensionFileProviderActionIdentifier": "rdrive.unpin", "NSExtensionFileProviderActionName": "Allow Automatic Removal",
                      "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"},
-                    {"NSExtensionFileProviderActionIdentifier": "rdrive.download", "NSExtensionFileProviderActionName": "Download Now",
-                     "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"},
-                    {"NSExtensionFileProviderActionIdentifier": "rdrive.evict", "NSExtensionFileProviderActionName": "Remove Download",
-                     "NSExtensionFileProviderActionActivationRule": "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdrivePinned != YES).@count > 0"},
                 ])
             titles = {"online": "Online only", "cached": "Available offline", "pinned": "Kept offline", "syncing": "Syncing",
                       "queued": "Waiting to sync", "conflict": "Sync conflict", "error": "Needs attention"}
@@ -163,7 +159,7 @@ def main():
         shutil.rmtree(final_app)
     app.rename(final_app)
     build_root.rmdir()
-    report = {"app": str(final_app), "version": "0.8.1", "bundle_build": "11", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
+    report = {"app": str(final_app), "version": "0.8.2", "bundle_build": "12", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
               "app_group": None if development_root else app_group, "development_ipc_root": str(development_root) if development_root else None,
               "distribution_ready": options.identity != "-" and development_root is None, "installed": False, "activated": False,
               "signing_status": "ad-hoc review build; no Developer Team identity" if options.identity == "-" else "signed with requested identity"}

@@ -262,31 +262,27 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                        onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
                        completionHandler: @escaping (Error?) -> Void) -> Progress {
         work({ bridge, operation in
-            guard ["rdrive.pin", "rdrive.unpin", "rdrive.download", "rdrive.evict"].contains(actionIdentifier.rawValue) else { throw remoteError(["code": "unsupported"]) }
+            let pinned: Bool
+            switch actionIdentifier.rawValue {
+            case "rdrive.pin": pinned = true
+            case "rdrive.unpin": pinned = false
+            default:
+                throw remoteError(["code": "unsupported", "message": "Use Finder’s download and storage controls for this item."])
+            }
             for identifier in itemIdentifiers {
                 try operation.check()
-                if actionIdentifier.rawValue == "rdrive.pin" || actionIdentifier.rawValue == "rdrive.unpin" {
-                    let budget = self.budgetFactory(bridge, self.domain.identifier.rawValue)
-                    var reservation: [String]?
-                    if actionIdentifier.rawValue == "rdrive.pin" {
-                        let item = try bridge.item(["op": "item", "domain": self.domain.identifier.rawValue, "id": wireID(identifier)], operation: operation)
-                        reservation = try budget.reserve(item, pin: true, operation: operation)
-                    }
-                    do {
-                        _ = try bridge.request(["op": "pin", "domain": self.domain.identifier.rawValue,
-                            "id": wireID(identifier), "pinned": actionIdentifier.rawValue == "rdrive.pin"], operation: operation)
-                    } catch { budget.release(reservation); throw error }
-                } else {
-                    guard let manager = self.manager else { throw NativeFailure.invalid("The File Provider domain is unavailable.") }
-                    let done = DispatchSemaphore(value: 0)
-                    var failure: Error?
-                    let complete: (Error?) -> Void = { failure = $0; done.signal() }
-                    if actionIdentifier.rawValue == "rdrive.download" {
-                        manager.requestDownloadForItem(withIdentifier: identifier) { complete($0) }
-                    } else { manager.evictItem(identifier: identifier) { complete($0) } }
-                    guard done.wait(timeout: .now() + 30) == .success else { throw NativeFailure.bridge("The system download or eviction request timed out.") }
-                    try operation.check()
-                    if let failure = failure { throw failure }
+                let budget = self.budgetFactory(bridge, self.domain.identifier.rawValue)
+                var reservation: [String]?
+                if pinned {
+                    let item = try bridge.item(["op": "item", "domain": self.domain.identifier.rawValue, "id": wireID(identifier)], operation: operation)
+                    reservation = try budget.reserve(item, pin: true, operation: operation)
+                }
+                do {
+                    _ = try bridge.request(["op": "pin", "domain": self.domain.identifier.rawValue,
+                        "id": wireID(identifier), "pinned": pinned], operation: operation)
+                } catch {
+                    budget.release(reservation)
+                    throw error
                 }
             }
             self.signal()

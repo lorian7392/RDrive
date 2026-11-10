@@ -58,7 +58,7 @@ def run(binary):
     with tempfile.TemporaryDirectory(prefix="rdrive-ns-", dir="/private/tmp" if Path("/private/tmp").is_dir() else None) as temporary:
         root = Path(temporary).resolve()
         remote = root / "remote"
-        for name in ("files", "target", "folder/sub", "race/sub", "erase/sub", "offline/sub", "crash", "filter-delete/sub", "filter-move/sub", "filter-background/sub"):
+        for name in ("files", "target", "folder/sub", "race/sub", "erase/sub", "offline/sub", "crash", "filter-delete/sub", "filter-move/sub", "filter-background/sub", "stale-parent/stale/sub"):
             (remote / name).mkdir(parents=True, exist_ok=True)
         for path in ("files/doc.txt", "files/collision.txt", "files/compound.txt", "target/occupied.txt", "folder/sub/child.txt", "race/sub/child.txt", "erase/sub/child.txt", "offline/sub/child.txt", "crash/doc.txt", "filter-delete/sub/child.txt", "filter-move/sub/child.txt", "filter-background/sub/child.txt", "filter-file.txt"):
             (remote / path).write_bytes(("original " + path).encode())
@@ -123,6 +123,38 @@ def run(binary):
             assert renamed_child["id"] == child["id"] and renamed_child["pinned"]
             assert (remote / "target/moved-folder/sub/child.txt").is_file()
             passed("directory moves preserve descendant IDs and inherited pins while updating all canonical paths")
+
+            stale, stale_child = item("stale-parent/stale"), item("stale-parent/stale/sub")
+            old_request = modify(stale, name="not-published", parent_id=item("target")["id"])
+            old_request["base_content_version"] = "stale-system-snapshot"
+            before = len(NamespaceDav.requests_seen)
+            assert not broker.rpc(**old_request)["ok"]
+            conflict = next(m for m in mutations() if m["request"].get("id") == stale["id"])
+            assert conflict["state"] == "conflict" and conflict["error"] == "version_conflict: item changed since the system snapshot"
+            projected = current(stale["id"])
+            assert projected["name"] == "not-published" and projected["parent_id"] == old_request["parent_id"]
+            anchor = broker.ok(op="changes", anchor="current")["anchor"]
+            broker.stop()
+            resolved = broker.cli("smart", "refresh-conflict", broker.domain, conflict["id"])
+            assert resolved["mutation"]["state"] == "cancelled" and resolved["remote_changed"] is False
+            assert resolved["directory_present"] and resolved["directory_path"] == "stale-parent/stale"
+            assert resolved["refreshed_parent_path"] == "stale-parent"
+            retry = broker.cli("smart", "retry", broker.domain, conflict["id"], success=False)
+            assert "use the refreshed Finder item" in retry.stderr
+            cancelled = broker.cli("smart", "cancel", broker.domain, conflict["id"])
+            assert cancelled["error"] == resolved["mutation"]["error"]
+            broker.start()
+            refreshed = current(stale["id"])
+            assert refreshed["name"] == "stale" and refreshed["parent_id"] == item("stale-parent")["id"]
+            assert refreshed["sync_state"] != "conflict" and not refreshed["has_unsynced_changes"]
+            assert item("stale-parent/stale/sub")["id"] == stale_child["id"]
+            assert any(row["id"] == stale["id"] and row["name"] == "stale"
+                       for row in broker.ok(op="changes", anchor=anchor)["items"])
+            assert not broker.rpc(**old_request)["ok"]
+            assert next(m for m in mutations() if m["id"] == conflict["id"])["state"] == "cancelled"
+            assert (remote / "stale-parent/stale/sub").is_dir() and not (remote / "target/not-published").exists()
+            assert not any(method in ("MOVE", "DELETE", "PUT", "MKCOL") for method, _ in NamespaceDav.requests_seen[before:])
+            passed("refresh-conflict restores the canonical Finder location and never replays an abandoned stale rename")
 
             collision = item("files/collision.txt")
             response = broker.rpc(**modify(collision, name="occupied.txt", parent_id=item("target")["id"]))

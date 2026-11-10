@@ -38,6 +38,8 @@ cargo build --release --locked
 export PATH="$PWD/target/release:$PATH"
 ~~~
 
+Apple Silicon users with repository access can also [install the CLI from a GitHub Release](docs/INSTALLATION.md#install-the-release). Check for updates with `rdrive update`.
+
 The CLI runs without FUSE, Docker, or the companion App. See [installation](docs/INSTALLATION.md) for the optional native bundle, signing, and upgrades. A source checkout does not include local build artifacts or account configuration.
 
 ## Connect
