@@ -1,5 +1,5 @@
 {
-  "app": "/private/tmp/rdrive-live-upgrade-0.8.0-dceg0kt4/build/RDrive.app",
+  "app": "/Users/neo/.codex/.chatgpt-projects/g-p-6a9cd7d9d6988191a112eeb62a5aeccf/rdrive/macos/build/RDrive.app",
   "version": "0.8.0",
   "bundle_build": "10",
   "sdk": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
@@ -9,11 +9,15 @@
   "app_group": null,
   "development_ipc_root": "/private/tmp/rdrive-native-ipc-501",
   "distribution_ready": false,
-  "installed": false,
-  "activated": false,
+  "installed": true,
+  "activated": true,
   "signing_status": "ad-hoc review build; no Developer Team identity",
   "source_cli_sha256": "78ddbbac8b6aaca8d13a5a763061f64af47b68bcddfeeee580b122baba2fcf56",
   "embedded_cli_sha256": "2083d5000c1d2c8f8ed39b84fb0a80e429b2ee1e730611664b8374dcc5e53bc6",
   "cli_version": "rdrive 0.8.0",
-  "scope": "Compiled and ad-hoc verified; pending final activation via user-authorized Keychain read"
+  "scope": "Existing Smart domain retained during in-place upgrade; authenticated remote root read and local directory enumeration succeeded; no real remote writes/deletes or cache migration applied",
+  "existing_domain_preserved": true,
+  "bridge_and_watcher_restarted": true,
+  "old_provider_process_reloaded": true,
+  "activation_utc": "2026-11-10T05:27:18.143680+00:00"
 }

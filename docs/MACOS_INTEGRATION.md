@@ -405,3 +405,7 @@ The synthetic cleanup report above describes the completed 0.4 test fixtures. It
 ## 0.7 构建验证
 
 0.7.0/build9 已在隔离目录编译并通过 ad-hoc 签名检查，嵌入同一份最终 CLI。未注册或激活该包，现有 Finder 实例仍使用原已安装版本。新命名操作的桥接协议测试通过不等同于 Finder 实机回调验证。详见 [0.7 验证](VALIDATION_0.7.0.md)及[Smart 操作与服务管理](SMART_OPERATIONS.md)。
+
+## 0.8 实际升级
+
+0.8.0/build10 已沿用原域和 IPC 路径切换现有原生包、Rust 桥接与通知助手。核对了扩展注册版本、新进程及原域目录；使用现有凭据完成远端只读根目录验证。0.7 阶段已实际观察 Finder 文件列表和在线云图标。缓存目录保持默认，没有对真实云盘做文件写入/删除测试；原生下载位置仍由 macOS 管理。详见 [0.8 激活记录](NATIVE_ACTIVATION_0.8.0.json)。
