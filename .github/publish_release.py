@@ -67,9 +67,9 @@ def verify_tag(repo, tag, commit):
         raise ValueError(f"Tag {tag} no longer points to the verified build commit")
 
 
-def missing_assets(repo, release, hashes):
+def missing_assets(assets, hashes):
     seen = set()
-    for asset in list_pages(f"repos/{repo}/releases/{release['id']}/assets"):
+    for asset in assets:
         name = asset["name"]
         if name in seen or name not in hashes:
             raise ValueError(f"Unexpected or duplicate asset on GitHub release: {name}")
@@ -84,17 +84,25 @@ def publish(repo, tag, commit, directory, installer):
     verify_tag(repo, tag, commit)
     prerelease = "-" in tag.split("+", 1)[0]
     release = get_release(repo, tag)
+    created = release is None
     if release is None:
-        flags = ["--prerelease"] if prerelease else []
-        gh("release", "create", tag, "--repo", repo, "--verify-tag", "--draft",
-           "--generate-notes", *flags)
-        release = get_release(repo, tag)
-        if release is None:
-            raise ValueError(f"New draft for {tag} was not found")
+        # The release list can lag behind a successful creation. Use the ID
+        # from the creation response throughout the rest of this attempt.
+        release = json.loads(gh("api", "--method", "POST", f"repos/{repo}/releases",
+                                "-f", f"tag_name={tag}", "-F", "draft=true",
+                                "-F", f"prerelease={str(prerelease).lower()}",
+                                "-F", "generate_release_notes=true"))
+        if release["tag_name"] != tag or not release["draft"]:
+            raise ValueError(f"GitHub did not return the requested draft for {tag}")
     if release["prerelease"] != prerelease:
         raise ValueError(f"Existing release prerelease status differs from {tag}")
 
-    missing = missing_assets(repo, release, hashes)
+    release_id = release["id"]
+    if type(release_id) is not int or release_id <= 0:
+        raise ValueError("GitHub returned an invalid release ID")
+    endpoint = f"repos/{repo}/releases/{release_id}"
+    assets = release["assets"] if created else list_pages(endpoint + "/assets")
+    missing = missing_assets(assets, hashes)
     if not release["draft"]:
         if missing:
             raise ValueError("Published release is missing required assets: " + ", ".join(missing))
@@ -102,13 +110,18 @@ def publish(repo, tag, commit, directory, installer):
         return
 
     if missing:
-        gh("release", "upload", tag, "--repo", repo, *(str(directory / name) for name in missing))
-    missing = missing_assets(repo, release, hashes)
+        upload_url = release["upload_url"].removesuffix("{?name,label}")
+        if upload_url != f"https://uploads.github.com/{endpoint}/assets":
+            raise ValueError("GitHub returned an unexpected release asset upload URL")
+        for name in missing:
+            gh("api", "--method", "POST", f"{upload_url}?name={quote(name, safe='')}",
+               "--hostname", "github.com", "--header", "Content-Type: application/octet-stream",
+               "--input", str(directory / name))
+    missing = missing_assets(list_pages(endpoint + "/assets"), hashes)
     if missing:
         raise ValueError("Draft release is missing required assets: " + ", ".join(missing))
     verify_tag(repo, tag, commit)
-    result = json.loads(gh("api", "--method", "PATCH", f"repos/{repo}/releases/{release['id']}",
-                           "-F", "draft=false"))
+    result = json.loads(gh("api", "--method", "PATCH", endpoint, "-F", "draft=false"))
     if result["draft"] or result["tag_name"] != tag:
         raise ValueError(f"GitHub did not confirm publication of {tag}")
     print(f"Published release {tag} with verified assets")
