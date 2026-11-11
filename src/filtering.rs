@@ -126,12 +126,15 @@ impl Selector {
         })
     }
     pub fn allowed(&self, path: &str, is_dir: bool) -> Result<bool> {
+        Ok(self.exclusion_reason(path, is_dir)?.is_none())
+    }
+    pub fn exclusion_reason(&self, path: &str, is_dir: bool) -> Result<Option<String>> {
         let path = backend::normalize(path)?;
         if path.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
         let matches = |rules: &[(String, GlobMatcher)], part: &str, directory: bool| {
-            rules.iter().any(|(pattern, matcher)| {
+            rules.iter().position(|(pattern, matcher)| {
                 (!pattern.ends_with('/') || directory)
                     && matcher.is_match(if pattern.trim_end_matches('/').contains('/') {
                         part
@@ -149,12 +152,12 @@ impl Selector {
             let part = &path[..end];
             let directory = end != path.len() || is_dir;
             let name = part.rsplit('/').next().unwrap_or("");
-            if matches(&self.exclude, part, directory) {
-                return Ok(false);
+            if let Some(index) = matches(&self.exclude, part, directory) {
+                let pattern = &self.exclude[index].0;
+                return Ok(Some(format!("Excluded by pattern {pattern} at {part}.")));
             }
             static TEMP_MATCHERS: OnceLock<Vec<GlobMatcher>> = OnceLock::new();
-            if self.temporary
-                && TEMP_MATCHERS
+            if let Some(index) = self.temporary.then(|| TEMP_MATCHERS
                     .get_or_init(|| {
                         TEMPORARY
                             .iter()
@@ -162,17 +165,33 @@ impl Selector {
                             .collect()
                     })
                     .iter()
-                    .any(|matcher| matcher.is_match(name))
+                    .position(|matcher| matcher.is_match(name))).flatten()
             {
-                return Ok(false);
+                return Ok(Some(format!("Excluded by built-in temporary-file rule {} at {part}.", TEMPORARY[index])));
             }
         }
         // Keep directory traversal possible when the allowlist contains files.
-        Ok(is_dir || self.include.is_empty() || matches(&self.include, &path, false))
+        Ok(if is_dir || self.include.is_empty() || matches(&self.include, &path, false).is_some() {
+            None
+        } else {
+            Some("The file does not match the configured include patterns.".into())
+        })
     }
 }
 pub fn allowed(config: &Config, profile: &str, path: &str, is_dir: bool) -> Result<bool> {
     Selector::new(config, profile)?.allowed(path, is_dir)
+}
+pub fn exclusion_reason(config: &Config, profile: &str, path: &str, is_dir: bool) -> Result<Option<String>> {
+    Selector::new(config, profile)?.exclusion_reason(path, is_dir)
+}
+
+/// Recognize both the legacy mislabeled network failure and the typed local
+/// exclusion without treating arbitrary server failures as repairable.
+pub fn exclusion_path(message: &str) -> Option<&str> {
+    ["excluded_by_filter: synchronization filters exclude ", "server_unreachable: synchronization filters exclude "]
+        .iter().find_map(|prefix| message.strip_prefix(*prefix))?
+        .strip_suffix("; local mutation retained until the rules allow it")
+        .filter(|path| !path.is_empty())
 }
 
 #[cfg(test)]
@@ -218,5 +237,32 @@ mod tests {
         assert!(Selector::new(&config, "p").unwrap().allowed("", true).unwrap());
         config.filters.exclude = vec!["*.tmp".into(); 257];
         assert!(config.filters.validate().unwrap_err().to_string().contains("256"));
+    }
+
+    #[test]
+    fn reasons_identify_inherited_rules_and_share_the_visibility_decision() {
+        let mut config = Config::default();
+        assert!(exclusion_reason(&config,"p","Backup/book.part",false).unwrap().unwrap().contains("temporary-file rule *.part"));
+        assert!(exclusion_reason(&config,"p","Backup/.DS_Store/child",false).unwrap().unwrap().contains(".DS_Store"));
+        assert_eq!(exclusion_reason(&config,"p","",true).unwrap(),None);
+        assert_eq!(exclusion_reason(&config,"p","Backup/book.epub",false).unwrap(),None);
+        config.filters.exclude = vec!["private/".into()];
+        assert!(exclusion_reason(&config,"p","private/child/book.epub",false).unwrap().unwrap().contains("pattern private/ at private"));
+        config.filters.include = vec!["*.epub".into()];
+        assert!(exclusion_reason(&config,"p","book.pdf",false).unwrap().unwrap().contains("include patterns"));
+        assert_eq!(exclusion_reason(&config,"p","Backup",true).unwrap(),None);
+        config.filters.profiles.insert("p".into(), ProfileFilter { temporary_files:Some(false),include:Some(vec![]),exclude:Some(vec![])});
+        config.filters.validate().unwrap();
+        assert_eq!(exclusion_reason(&config,"p","Backup/book.part",false).unwrap(),None);
+        assert!(exclusion_reason(&config,"p","../escape",false).is_err());
+        config.filters.exclude = vec!["[".into()];
+        assert!(exclusion_reason(&config,"other","book.epub",false).is_err());
+        for prefix in ["server_unreachable", "excluded_by_filter"] {
+            let message = format!("{prefix}: synchronization filters exclude Backup/book.part; local mutation retained until the rules allow it");
+            assert_eq!(exclusion_path(&message),Some("Backup/book.part"));
+        }
+        for message in ["server_unreachable: timed out", "excluded_by_filter: synchronization filters exclude Backup/book.part", "excluded_by_filter: synchronization filters exclude ; local mutation retained until the rules allow it"] {
+            assert_eq!(exclusion_path(message),None);
+        }
     }
 }

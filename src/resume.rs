@@ -606,6 +606,7 @@ mod tests {
                 allow_http: false,
                 timeout_secs: 10,
                 smb_encryption: true,
+                keychain_internet: false,
                 nextcloud_upload_url: None,
             },
         );

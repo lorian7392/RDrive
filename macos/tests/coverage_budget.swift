@@ -55,6 +55,7 @@ final class BudgetPeer {
         calls.append(request)
         switch request["op"] as? String {
         case "domains": return ["ok": true, "domains": configured]
+        case "transfer_status": return ["ok": true, "transfers": []]
         case "item":
             if let id = request["id"] as? String, let item = items[id] { return ["ok": true, "item": item] }
             return ["ok": false, "error": ["code": "no_such_item"]]
@@ -175,6 +176,7 @@ private final class BudgetManager: NativeDomainManaging {
         if !evictionSilent { completionHandler(evictionError) }
     }
     func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { signalled.append(wireID(identifier)); completionHandler(signalError) }
+    func signalErrorResolved(_ error: NSError, completionHandler: @escaping (Error?) -> Void) { completionHandler(nil) }
     func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { downloads.append(wireID(identifier)); completionHandler(nil) }
     func temporaryDirectoryURL() throws -> URL { temporary }
 }

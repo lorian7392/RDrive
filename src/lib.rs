@@ -28,3 +28,5 @@ pub mod service;
 pub mod cache_directory;
 
 pub mod update;
+pub mod client_read;
+pub mod shared_home;

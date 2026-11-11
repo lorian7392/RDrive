@@ -53,7 +53,7 @@ impl Backend for Peer {
 }
 fn store(root: &Path) -> Store {
     let mut store = Store::open(root.join("state")).unwrap();
-    store.config.profiles.insert("test".into(), Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: None, password_env: None, allow_http: false, timeout_secs: 10, smb_encryption: true, nextcloud_upload_url: None });
+    store.config.profiles.insert("test".into(), Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: None, password_env: None, allow_http: false, timeout_secs: 10, smb_encryption: true, keychain_internet:false,nextcloud_upload_url: None });
     store.save_config().unwrap(); store
 }
 fn message(result: Result<impl std::fmt::Debug>) -> String { result.unwrap_err().to_string() }

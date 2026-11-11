@@ -479,10 +479,18 @@ exec smbd --foreground --no-process-group --debug-stdout --configfile=/etc/samba
             assert "original.bin" in cli("ls", "fixture", "folder").stdout
             assert json.loads(cli("stat", "fixture", "folder/original.bin").stdout)["size"] == len(content)
             downloaded = root / "download.bin"
-            cli("get", "fixture", "folder/original.bin", str(downloaded))
+            download_result = cli("get", "fixture", "folder/original.bin", str(downloaded))
             assert hashlib.sha256(downloaded.read_bytes()).digest() == hashlib.sha256(content).digest()
+            events = [json.loads(line) for line in download_result.stderr.splitlines() if line.startswith("{")]
+            events = [event for event in events if event.get("type") == "transfer_progress"]
+            payload_jobs = [event["job"] for event in events if event.get("job") and event["job"]["operation"] == "download" and event["job"]["path"] == "folder/original.bin"]
+            assert payload_jobs and len({job["id"] for job in payload_jobs}) == 1, payload_jobs
+            assert all(job["total"] == len(content) and job["bytes"] <= len(content) for job in payload_jobs), payload_jobs
+            assert any(job["state"] == "complete" and job["bytes"] == len(content) for job in payload_jobs), payload_jobs
+            assert any(event.get("job", {}).get("operation") == "smb.read-and-verify" for event in events if event.get("job")), "SMB verification traffic was not exercised separately"
             assert not list((share / "folder").rglob(".rdrive-upload-*"))
             passed_test("multi-chunk upload/list/stat/download, publication and byte equality")
+            passed_test("SMB payload download has one known-size byte meter; preflight and checksum reads remain separate verification traffic")
 
             cli("cp", "fixture", "folder/original.bin", "folder/copy.bin")
             cli("cp", "fixture", "folder/original.bin", "folder/copy.bin", success=False)

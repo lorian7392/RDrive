@@ -48,12 +48,13 @@ final class ProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDecora
         return wire.id == "root" ? .materializeLazily : .inherited
     }
     #endif
-    var isUploaded: Bool { !(wire.has_unsynced_changes ?? [.syncing, .queued, .conflict].contains(NativeSyncState.item(wire))) }
+    var isUploaded: Bool { !(wire.has_unsynced_changes ?? [.syncing, .queued, .conflict, .blocked].contains(NativeSyncState.item(wire))) }
     var isUploading: Bool { NativeSyncState.item(wire) == .syncing }
     var uploadingError: Error? {
         switch NativeSyncState.item(wire) {
         case .conflict: return remoteError(["code": "version_conflict", "message": wire.sync_message ?? "The local change conflicts with the remote version."])
         case .error: return remoteError(["code": "server_unreachable", "message": wire.sync_message ?? "The storage connection needs attention."])
+        case .blocked: return remoteError(["code": "excluded_by_filter", "message": wire.sync_message ?? "Synchronization filters exclude this item."])
         default: return nil
         }
     }

@@ -288,6 +288,7 @@ fn profile(protocol: Protocol, address: &str) -> Profile {
         allow_http: false,
         timeout_secs: 120,
         smb_encryption: true,
+        keychain_internet: false,
         nextcloud_upload_url: None,
     }
 }

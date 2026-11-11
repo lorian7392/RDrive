@@ -4,12 +4,14 @@ No real cloud account, mount, or Finder domain is used by this script.
 """
 import http.server
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import signal
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -36,9 +38,12 @@ def run(binary):
         (remote / "preserved" / "nested").mkdir(parents=True)
         (remote / "preserved" / "nested" / "keep.txt").write_bytes(b"cached subtree")
         (remote / "pinned-lazy").mkdir()
+        (remote / "Backup").mkdir()
+        (remote / "Backup" / "remote.part").write_bytes(b"existing excluded temporary contents")
         class Fixture(Dav):
             online = True
             requests_seen = []
+            request_attempts = []
             uploads = 0
             directory_requests = []
             directory_delays = {"/dav/slow": 2.2, "/dav/slow/level-one": 2.2, "/dav/slow/level-one/level-two": 2.2}
@@ -46,6 +51,7 @@ def run(binary):
             failed_directory_requests = []
             directory_lock = threading.Lock()
             def handle_dav(self):
+                type(self).request_attempts.append((self.command, self.path))
                 path = self.path.rstrip("/")
                 delay = 0
                 if self.command == "PROPFIND" and self.headers.get("Depth") == "1":
@@ -120,9 +126,10 @@ def run(binary):
                     return result
                 assert time.monotonic() < deadline, label
                 time.sleep(.2)
-        def start():
+        def start(limited=False):
             nonlocal process
-            process = subprocess.Popen(cli_base + ["provider", "serve", "--socket", str(endpoint), "--staging", str(stage), "--development-tcp"], env=env, stdout=subprocess.DEVNULL, stderr=log)
+            command = cli_base + (["--limit", "65536"] if limited else [])
+            process = subprocess.Popen(command + ["provider", "serve", "--socket", str(endpoint), "--staging", str(stage), "--development-tcp"], env=env, stdout=subprocess.DEVNULL, stderr=log)
             def ready():
                 assert process.poll() is None, "bridge exited"
                 try:
@@ -259,6 +266,77 @@ def run(binary):
             assert all(not i["pinned"] for i in ok(op="list", parent_id=folder["id"])["items"])
             passed("folder pin is inherited by existing and new descendants and reverses on unpin")
 
+            # A stale metadata-only directory callback can contain no actual
+            # name, parent, tag, or content change. Repair only that callback
+            # while retained descendant edits keep their original guards.
+            folder_now = ok(op="item", id=folder["id"])["item"]
+            stale = rpc(op="modify", id=folder["id"], name=folder_now["name"],
+                        parent_id=folder_now["parent_id"], base_content_version="obsolete-directory-snapshot",
+                        base_metadata_version=folder_now["metadata_version"])
+            assert not stale["ok"], stale
+            stale_entry = next(mutation for mutation in cli("smart", "status")["domains"][0]["mutations"]
+                               if mutation["request"].get("id") == folder["id"] and mutation["state"] == "conflict")
+            assert stale_entry["error"] == "version_conflict: item changed since the system snapshot", stale_entry
+            assert stale_entry.get("snapshot") is None
+
+            cli("smart", "pause")
+            child = next(item for item in ok(op="list", parent_id=folder["id"])["items"] if item["name"] == "child.txt")
+            staged.write_bytes(b"retained descendant edit during parent repair")
+            assert not rpc(op="modify", id=child["id"], content_path=str(staged),
+                           base_content_version=child["content_version"], base_metadata_version=child["metadata_version"])["ok"]
+            assert not rpc(op="create", parent_id=folder["id"], name="pending-child", kind="directory",
+                           client_item_id="pending-parent-repair-child")["ok"]
+            staged.unlink()
+            cli("index", "config", "--disable", "--refresh-seconds", "3600", "--active-refresh-seconds", "3600")
+            smart_root = home / "smart" / hashlib.sha256(b"smart-fixture").hexdigest()
+            queue_path = smart_root / "queue.json"
+            before = json.loads(queue_path.read_text())["mutations"]
+            child_entry = next(mutation for mutation in before.values()
+                               if mutation["request"].get("id") == child["id"] and mutation.get("snapshot"))
+            snapshot = smart_root / "dirty" / child_entry["snapshot"]["file"]
+            child_contents = snapshot.read_bytes()
+            Fixture.online = False
+            request_offset = len(Fixture.request_attempts)
+            with (smart_root / "queue.lock").open("r+b") as queue_lock:
+                fcntl.flock(queue_lock, fcntl.LOCK_EX)
+                availability = ok(op="smart_repair_status", id=folder["id"])
+                assert availability["eligible"] and availability["mutation_id"] == stale_entry["id"], availability
+                assert availability["related_pending"] >= 2, availability
+
+            for incomplete in (dict(id=folder["id"]), dict(mutation_id=stale_entry["id"])):
+                assert not rpc(op="repair_stale_directory", **incomplete)["ok"]
+            wrong = rpc(op="repair_stale_directory", id=folder["id"], mutation_id=child_entry["id"])
+            assert not wrong["ok"], wrong
+            repaired = ok(op="repair_stale_directory", id=folder["id"], mutation_id=stale_entry["id"])
+            assert repaired["repaired"] and repaired["refresh_queued"] and not repaired["remote_changed"], repaired
+            repeated = ok(op="repair_stale_directory", id=folder["id"], mutation_id=stale_entry["id"])
+            assert repeated["repaired"] and repeated["refresh_queued"] and not repeated["remote_changed"], repeated
+            after = json.loads(queue_path.read_text())["mutations"]
+            assert after[stale_entry["id"]]["state"] == "cancelled"
+            assert {key: value for key, value in after.items() if key != stale_entry["id"]} == {
+                key: value for key, value in before.items() if key != stale_entry["id"]
+            }, "repair changed another mutation or its original request guards"
+            assert snapshot.read_bytes() == child_contents
+            assert (remote / "folder/child.txt").read_bytes() == b"child"
+            assert not (remote / "folder/pending-child").exists()
+            assert Fixture.request_attempts[request_offset:] == [], "offline no-op repair contacted the server"
+            acknowledged = ok(**stale_entry["request"])
+            assert acknowledged["item"]["id"] == folder["id"]
+            assert acknowledged["item"]["sync_state"] != "conflict", acknowledged
+            assert json.loads(queue_path.read_text())["mutations"] == after, "acknowledging the obsolete callback changed queue history"
+            assert snapshot.read_bytes() == child_contents and not Fixture.request_attempts[request_offset:]
+            denied_retry = subprocess.run(cli_base + ["smart", "retry", "smart-fixture", stale_entry["id"]],
+                                          env=env, capture_output=True, text=True, timeout=30)
+            assert denied_retry.returncode != 0 and "cancelled" in denied_retry.stderr
+            assert not ok(op="smart_repair_status", id=folder["id"])["eligible"]
+            Fixture.online = True
+            cli("index", "config", "--refresh-seconds", "3", "--active-refresh-seconds", "3")
+            cli("smart", "resume")
+            wait(lambda: (remote / "folder/child.txt").read_bytes() == child_contents,
+                 "preserved descendant edit replays after parent no-op repair")
+            wait(lambda: (remote / "folder/pending-child").is_dir(), "preserved descendant creation")
+            passed("offline stale-directory no-op repair stays readable under queue locks and preserves descendant requests, snapshots and write guards")
+
             cli("smart", "pause")
             current = ok(op="item", id=folder["id"])["item"]
             ok(op="native_error", id=folder["id"], base_content_version=current["content_version"], native_message="Cache budget cannot fit this file")
@@ -346,6 +424,148 @@ def run(binary):
             assert discovered["pinned"]
             assert ok(op="item", id=pinned["id"])["item"]["pinned"]
             passed("pinned directory policy recursively discovers new nested descendants without browsing those children")
+
+
+            # Network payload progress remains attached to the actual Finder
+            # callback even though Smart first retains an immutable local copy.
+            stop()
+            start(limited=True)
+            payload = b"finder-progress-payload" * 4096
+            source = stage / "progress-source"
+            source.write_bytes(payload)
+            def measured(**message):
+                settings = json.loads((ipc / "bridge-endpoint.json").read_text())
+                message.update(v=1, auth_token=settings["token"], domain="smart-fixture", request_id=uuid.uuid4().hex)
+                frames = []
+                during = None
+                with socket.create_connection(("127.0.0.1", settings["port"]), timeout=40) as client:
+                    client.sendall(json.dumps(message).encode() + b"\n")
+                    with client.makefile("rb") as stream:
+                        for line in stream:
+                            value = json.loads(line)
+                            if "progress" not in value:
+                                assert value.get("ok"), value
+                                return value, frames, during
+                            progress = value["progress"]
+                            frames.append(progress)
+                            if during is None and progress.get("completed", 0) > 0:
+                                started = time.monotonic()
+                                during = ok(op="transfer_status")["transfers"]
+                                assert time.monotonic() - started < 1.5, "payload progress query waited for the uploader's writer lock"
+                raise AssertionError("payload callback disconnected")
+            uploaded, upload_frames, during = measured(op="create", parent_id="root", name="progress.bin", kind="file", client_item_id="progress-local", content_path=str(source))
+            numeric = [frame for frame in upload_frames if frame.get("total") == len(payload)]
+            assert numeric and any(0 < frame["completed"] < len(payload) for frame in numeric), upload_frames
+            assert all(frame["completed"] < len(payload) for frame in numeric), "transport completion was shown as a committed receipt"
+            assert any(row["id"] == "progress-local" and row["background"] is False and row["mutation_id"] and row["total"] == len(payload) for row in during), during
+            final = next(row for row in ok(op="transfer_status")["transfers"] if row["id"] == "progress-local")
+            assert final["state"] == "completed" and final["completed"] == len(payload), final
+            assert (remote / "progress.bin").read_bytes() == payload
+            passed("foreground Smart upload reports primary byte progress during the original callback; polling bypasses writer locks and completion waits for a durable receipt")
+            downloaded, download_frames, _ = measured(op="fetch", id=uploaded["item"]["id"])
+            assert Path(downloaded["content_path"]).read_bytes() == payload
+            Path(downloaded["content_path"]).unlink()
+            assert any(frame.get("total") == len(payload) and 0 < frame["completed"] < len(payload) for frame in download_frames), download_frames
+            passed("on-demand download reports bounded primary byte progress without counting metadata or verification traffic")
+            cli("smart", "pause")
+            background_source = stage / "background-progress-source"
+            background_source.write_bytes(payload)
+            queued = rpc(op="create", parent_id="root", name="background-progress.bin", kind="file", client_item_id="background-local", content_path=str(background_source))
+            assert not queued.get("ok"), queued
+            cli("smart", "resume")
+            def background_progress():
+                return next((row for row in ok(op="transfer_status")["transfers"] if row["id"] == "background-local" and row["background"] is True and row["state"] == "transferring" and row["completed"] > 0), None)
+            active = wait(background_progress, "active background payload progress", 30)
+            assert active["mutation_id"] and active["total"] == len(payload), active
+            completed = wait(lambda: next((row for row in ok(op="transfer_status")["transfers"] if row["transfer_id"] == active["transfer_id"] and row["state"] == "completed"), None), "background durable receipt", 30)
+            assert completed["completed"] == len(payload) and (remote / "background-progress.bin").read_bytes() == payload
+            assert not ok(op="transfer_status", domain="different-domain")["transfers"]
+            passed("background reconnect exposes stable item and mutation identities plus live bytes; terminal success is retained only after receipt publication")
+
+            # Reproduce an index created before temporary-file exclusion was
+            # enabled. These are test-only rule changes in the disposable home.
+            stop()
+            cli("filter", "config", "--include-temporary")
+            cli("index", "config", "--disable", "--refresh-seconds", "3600", "--active-refresh-seconds", "3600")
+            start()
+            backup = next(item for item in ok(op="list")["items"] if item["name"] == "Backup")
+            ok(op="refresh_index", id=backup["id"])
+            part = wait(lambda: next((item for item in ok(op="list", parent_id=backup["id"])["items"] if item["name"] == "remote.part"), None),
+                        "legacy temporary-file catalog")
+            database = home / "provider" / (hashlib.sha256(b"smart-fixture").hexdigest() + ".sqlite3")
+            def backup_refresh_complete():
+                with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as catalog:
+                    control = json.loads(catalog.execute("SELECT control_json FROM meta").fetchone()[0])
+                return "finder:" + backup["id"] in control.get("completed_demands", {})
+            wait(backup_refresh_complete, "legacy directory refresh completion")
+            cli("smart", "pause")
+            stop()
+            cli("filter", "config", "--exclude-temporary")
+            start()
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as catalog:
+                assert catalog.execute("SELECT COUNT(*) FROM items WHERE path=?", ("Backup/remote.part",)).fetchone()[0] == 1
+            cli("smart", "resume")
+            backup_now = ok(op="item", id=backup["id"])["item"]
+            assert ok(op="modify", id=backup["id"], name=backup_now["name"], parent_id=backup_now["parent_id"],
+                      base_content_version=backup_now["content_version"], base_metadata_version=backup_now["metadata_version"])["item"]["id"] == backup["id"]
+            retained_bytes = b"genuine user edit to an excluded file"
+            filtered_source = stage / "retained-filter-source"
+            filtered_source.write_bytes(retained_bytes)
+            excluded_modify = rpc(op="modify", id=part["id"], content_path=str(filtered_source),
+                                  base_content_version=part["content_version"], base_metadata_version=part["metadata_version"])
+            assert not excluded_modify["ok"] and excluded_modify["error"]["code"] == "excluded_by_filter", excluded_modify
+            assert ok(op="status", id=part["id"])["state"] == "blocked"
+            excluded_create = rpc(op="create", parent_id=backup["id"], name="new.part", kind="file",
+                                  client_item_id="genuine-excluded-create", content_path=str(filtered_source))
+            assert not excluded_create["ok"] and excluded_create["error"]["code"] == "excluded_by_filter", excluded_create
+            assert not ok(op="smart_repair_status", id=part["id"])["eligible"]
+            assert not ok(op="smart_repair_status", id="genuine-excluded-create")["eligible"]
+            assert (remote / "Backup/remote.part").read_bytes() == b"existing excluded temporary contents"
+            assert not (remote / "Backup/new.part").exists()
+            passed("an excluded cached descendant does not block a directory no-op; genuine excluded writes return a local rule error, retain their contents and cannot use no-op repair")
+
+            cli("smart", "pause")
+            legacy_request = dict(op="modify", id=backup["id"], name=backup["name"], parent_id="root",
+                                  base_content_version=backup_now["content_version"], base_metadata_version="legacy-filter-blocked-directory-snapshot")
+            assert not rpc(**legacy_request)["ok"]
+            stop()
+            stored = json.loads(queue_path.read_text())
+            selected = next(row for row in stored["mutations"].values()
+                            if row["request"].get("id") == backup["id"] and row["state"] == "pending")
+            # Preserve the actual enqueued immutable request and fingerprint;
+            # only reproduce the legacy local failure state while stopped.
+            selected["state"] = "interrupted"
+            selected["attempts"] = 150
+            selected["error"] = "server_unreachable: synchronization filters exclude Backup/remote.part; local mutation retained until the rules allow it"
+            queue_path.write_text(json.dumps(stored))
+            before = json.loads(queue_path.read_text())["mutations"]
+            snapshots = {row["id"]: (smart_root / "dirty" / row["snapshot"]["file"]).read_bytes()
+                         for row in before.values() if row.get("snapshot") and not row.get("payload_discarded")}
+            assert any(row["request"].get("smart_origin_id") == "genuine-excluded-create" and row["id"] in snapshots for row in before.values())
+            config_before = (home / "config.json").read_bytes()
+            Fixture.online = False
+            request_offset = len(Fixture.request_attempts)
+            start()
+            wait(lambda: ok(op="status", id=backup["id"])["state"] == "blocked", "legacy filter block overlay")
+            preview = ok(op="smart_repair_status", id=backup["id"])
+            assert preview["eligible"] and preview["mutation_id"] == selected["id"], preview
+            assert preview["filter_path"] == "Backup/remote.part" and "*.part" in preview["filter_reason"], preview
+            repaired = ok(op="repair_stale_directory", id=backup["id"], mutation_id=selected["id"])
+            assert repaired["repaired"] and repaired["refresh_queued"] and not repaired["remote_changed"], repaired
+            repeated = ok(**legacy_request)
+            assert repeated["cancelled_no_op"] and repeated["item"]["id"] == backup["id"] and not repeated["remote_changed"], repeated
+            after = json.loads(queue_path.read_text())["mutations"]
+            assert after[selected["id"]]["state"] == "cancelled"
+            assert {key: value for key, value in before.items() if key != selected["id"]} == {
+                key: value for key, value in after.items() if key != selected["id"]}
+            for mutation_id, contents in snapshots.items():
+                assert (smart_root / "dirty" / after[mutation_id]["snapshot"]["file"]).read_bytes() == contents
+            assert (home / "config.json").read_bytes() == config_before
+            assert (remote / "Backup/remote.part").read_bytes() == b"existing excluded temporary contents"
+            assert not (remote / "Backup/new.part").exists()
+            assert Fixture.request_attempts[request_offset:] == [], "local filter-blocked repair or its retry contacted the server"
+            assert not ok(op="smart_repair_status", id=backup["id"])["eligible"]
+            passed("legacy filter-blocked directory no-op repair and the exact OS retry stay offline and preserve excluded file edits, immutable queue records, snapshots, remote contents and rules")
         finally:
             stop()
             server.shutdown()
@@ -355,7 +575,8 @@ def run(binary):
     version = report["version"].split()[-1]
     suffix = ".debug" if "debug" in binary.parts else ""
     report["binary"] = str(binary.relative_to(ROOT)) if binary.is_relative_to(ROOT) else binary.name
-    report_path = ROOT / f"docs/SMART_VALIDATION_{version}{suffix}.json"
+    report_path = Path(os.environ["RDRIVE_SMART_REPORT"]).resolve() if os.environ.get("RDRIVE_SMART_REPORT") else ROOT / f"docs/SMART_VALIDATION_{version}{suffix}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2)+"\n")
     print(json.dumps(report,ensure_ascii=False))
 

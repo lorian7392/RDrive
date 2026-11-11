@@ -27,7 +27,7 @@ impl Backend for ScopedBackend {
 }
 fn setup()->(tempfile::TempDir,Store,Domain,Journal){
     let temp=tempfile::tempdir().unwrap();let mut store=Store::open(temp.path().join("state")).unwrap();
-    store.config.profiles.insert("p".into(),config::Profile{protocol:config::Protocol::Webdav,url:"https://example.invalid/".into(),username:None,password_env:None,allow_http:false,timeout_secs:5,smb_encryption:true,nextcloud_upload_url:None});store.save_config().unwrap();
+    store.config.profiles.insert("p".into(),config::Profile{protocol:config::Protocol::Webdav,url:"https://example.invalid/".into(),username:None,password_env:None,allow_http:false,timeout_secs:5,smb_encryption:true,keychain_internet:false,nextcloud_upload_url:None});store.save_config().unwrap();
     let domain=Domain{id:"lazy".into(),profile:"p".into(),remote:String::new(),display_name:"Lazy".into(),repository:false,smart:true,local_root:None};add_domain(&store,domain.clone()).unwrap();let journal=checked_journal(&store.home,&store.config,&domain).unwrap();(temp,store,domain,journal)
 }
 fn id(j:&Journal,path:&str)->String{j.items.values().find(|r|r.path==path).unwrap().item.id.clone()}
@@ -103,4 +103,156 @@ fn unknown_sidecar_allows_guarded_create_but_existing_metadata_keeps_fresh_versi
     let mut record=crate::metadata::MetadataRecord{version:1,content_sha256:"0".repeat(64),attributes:BTreeMap::from([("com.apple.metadata:_kMDItemUserTags".into(),"bb".into())]),selection:crate::metadata::MetadataPolicy::default().include,excluded:vec![]};
     assert!(check_fresh_metadata_base(&request,"doc",false,Some(&record)).is_err(),"an external present sidecar must never be adopted as the cached base");record.attributes.clear();assert!(check_fresh_metadata_base(&request,"doc",false,Some(&record)).is_err(),"an explicitly empty existing record remains a real metadata change");
     record.attributes.insert("com.apple.metadata:_kMDItemUserTags".into(),"aa".into());assert!(check_fresh_metadata_base(&request,"doc",false,Some(&record)).is_ok());
+}
+
+#[tokio::test]
+async fn directory_metadata_updates_do_not_inherit_excluded_descendants_but_namespace_changes_do() {
+    let (_temporary, mut store, domain, mut journal) = setup();
+    let backend = ScopedBackend::default();
+    backend.set("", vec![ScopedBackend::entry("Backup", true), ScopedBackend::entry("Other", true)]);
+    backend.set("Backup", vec![ScopedBackend::entry("Backup/book.part", false)]);
+    refresh_directory(&store, &backend, &domain, &mut journal, "root").await.unwrap();
+    let backup = id(&journal, "Backup");
+    refresh_directory(&store, &backend, &domain, &mut journal, &backup).await.unwrap();
+    assert!(journal.items.values().any(|record| record.path == "Backup/book.part"));
+    let mut request: Request = serde_json::from_value(json!({
+        "v":1,"op":"modify","domain":domain.id,"id":backup,"name":"Backup","parent_id":"root"
+    })).unwrap();
+    require_mutation_paths(&store, &domain, &journal, &request).unwrap();
+    request.tag_data_hex = Some(String::new());
+    require_mutation_paths(&store, &domain, &journal, &request).unwrap();
+    request.tag_data_hex = None;
+    request.name = Some("Renamed".into());
+    let error = require_mutation_paths(&store, &domain, &journal, &request).unwrap_err().to_string();
+    assert!(error.starts_with("excluded_by_filter:"));
+    assert!(error.contains("Backup/book.part"));
+    request.name = Some("Backup".into());
+    request.parent_id = Some(id(&journal, "Other"));
+    assert!(require_mutation_paths(&store, &domain, &journal, &request).is_err());
+    request.parent_id = Some("root".into());
+    request.op = "delete".into();
+    assert!(require_mutation_paths(&store, &domain, &journal, &request).is_err());
+    request.op = "create".into();
+    request.id = None;
+    request.parent_id = Some(backup.clone());
+    request.kind = Some("file".into());
+    request.name = Some("new.part".into());
+    assert!(require_mutation_paths(&store, &domain, &journal, &request).is_err());
+    request.name = Some("new.epub".into());
+    require_mutation_paths(&store, &domain, &journal, &request).unwrap();
+    request.op = "modify".into();
+    request.id = Some(backup.clone());
+    request.name = None;
+    request.parent_id = None;
+    request.kind = None;
+    store.config.filters.exclude.push("Backup/".into());
+    assert!(require_mutation_paths(&store, &domain, &journal, &request).is_err());
+}
+
+#[tokio::test]
+async fn retained_filter_blocks_have_a_distinct_overlay_for_new_and_existing_queue_errors() {
+    let (_temporary, store, domain, mut journal) = setup();
+    let backend = ScopedBackend::default();
+    backend.set("", vec![ScopedBackend::entry("Backup", true)]);
+    refresh_directory(&store, &backend, &domain, &mut journal, "root").await.unwrap();
+    let backup = id(&journal, "Backup");
+    let mut queue = crate::smart::Queue::open(&store, &domain.id, &journal_binding(&store.config, &domain).unwrap()).unwrap();
+    let mutation = queue.enqueue(json!({"v":1,"op":"modify","domain":domain.id,"id":backup,"tag_data_hex":"aa","request_id":"retained-filter-edit",
+        "base_content_version":journal.items[&backup].item.content_version,
+        "base_metadata_version":journal.items[&backup].item.metadata_version}), None).unwrap();
+    for prefix in ["server_unreachable", "excluded_by_filter"] {
+        queue.fail(&mutation.id, crate::smart::FailureKind::Offline,
+            &format!("{prefix}: synchronization filters exclude Backup/book.part; local mutation retained until the rules allow it")).unwrap();
+        update_overlay(&store, &domain).unwrap();
+        let current = checked_journal(&store.home, &store.config, &domain).unwrap();
+        assert_eq!(current.items[&backup].item.sync_state.as_deref(), Some("blocked"));
+        assert!(current.items[&backup].item.has_unsynced_changes);
+        assert_eq!(queue.get(&mutation.id).unwrap().request["tag_data_hex"], "aa");
+    }
+    for prefix in ["server_unreachable", "excluded_by_filter"] {
+        let message = format!("{prefix}: synchronization filters exclude Backup/password-conflict.part; local mutation retained until the rules allow it");
+        let response = error(anyhow::anyhow!(message.clone()));
+        assert_eq!(response["error"]["code"], "excluded_by_filter");
+        assert_eq!(response["error"]["message"], message);
+    }
+}
+
+#[tokio::test]
+async fn finder_refresh_validates_scope_before_queuing() {
+    let (_temporary, mut store, domain, mut journal) = setup();
+    let backend = ScopedBackend::default();
+    backend.set("", vec![ScopedBackend::entry("excluded", true)]);
+    refresh_directory(&store, &backend, &domain, &mut journal, "root")
+        .await
+        .unwrap();
+    let excluded = id(&journal, "excluded");
+    store.config.filters.exclude.push("excluded".into());
+    store.save_config().unwrap();
+
+    let managed = Domain {
+        id: "managed".into(),
+        repository: true,
+        ..domain.clone()
+    };
+    add_domain(&store, managed.clone()).unwrap();
+    let mut request: Request = serde_json::from_value(json!({
+        "v": 1, "op": "refresh_index", "domain": domain.id
+    }))
+    .unwrap();
+    assert!(finder_index_refresh(&store.home, &request)
+        .unwrap_err()
+        .to_string()
+        .contains("requires a directory ID"));
+    request.id = Some(excluded);
+    assert!(finder_index_refresh(&store.home, &request)
+        .unwrap_err()
+        .to_string()
+        .contains("filters exclude"));
+    request.domain = managed.id.clone();
+    assert!(finder_index_refresh(&store.home, &request)
+        .unwrap_err()
+        .to_string()
+        .contains("complete root snapshot"));
+    request.domain = "unconfigured".into();
+    request.id = Some("root".into());
+    assert!(finder_index_refresh(&store.home, &request)
+        .unwrap_err()
+        .to_string()
+        .contains("Smart domain missing"));
+    assert!(!demand_directory(&store.home, &domain.id).exists());
+    assert!(!demand_directory(&store.home, &managed.id).exists());
+
+    request.domain = managed.id;
+    let report = finder_index_refresh(&store.home, &request).unwrap();
+    assert_eq!(report["queued"], true);
+    assert_eq!(report["remote"], "");
+    assert_eq!(report["completed"], false);
+}
+
+#[tokio::test]
+async fn repair_bridge_requires_explicit_item_and_mutation_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let staging = private(&temporary.path().join("staging")).unwrap();
+    let handle = open_staging(&staging).unwrap();
+    let home = temporary.path().join("missing-state");
+    for (operation, id, expected) in [
+        ("smart_repair_status", None, "requires an item ID"),
+        ("repair_stale_directory", None, "requires an item ID"),
+        ("repair_stale_directory", Some("item"), "requires a mutation ID"),
+    ] {
+        let request: Request = serde_json::from_value(json!({
+            "v": 1, "op": operation, "domain": "domain", "id": id
+        }))
+        .unwrap();
+        let error = process(&home, &staging, &handle, request, crate::transfer::global())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    let request: Request = serde_json::from_value(json!({
+        "v": 1, "op": "modify", "domain": "domain", "id": "item"
+    }))
+    .unwrap();
+    assert!(serde_json::to_value(request).unwrap().get("mutation_id").is_none());
+    assert!(!home.exists());
 }

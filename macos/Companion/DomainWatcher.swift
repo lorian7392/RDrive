@@ -1,6 +1,132 @@
 import Foundation
 import FileProvider
 
+/// Publishes only worker-owned transfers. Foreground callbacks already return
+/// their own Progress to File Provider and must not create a second indicator.
+final class NativeBackgroundTransferWatcher {
+    private struct Published {
+        let item: String
+        let direction: String
+        let progress: Progress
+        let operation: SocketOperation
+    }
+    private let bridge: BackendBridge
+    private let system: NativeSystemManaging
+    private let timeout: TimeInterval
+    private let publish: (Progress) -> Void
+    private let unpublish: (Progress) -> Void
+    private let queue = DispatchQueue(label: "io.rdrive.native.transfer-progress", qos: .utility)
+    private let lock = NSLock()
+    private let operation = SocketOperation()
+    private var busy = false
+    private var stopped = false
+    private var published: [String: Published] = [:]
+
+    init(bridge: BackendBridge, system: NativeSystemManaging = NativeSystemManager(), timeout: TimeInterval = 5,
+         publish: @escaping (Progress) -> Void = { $0.publish() },
+         unpublish: @escaping (Progress) -> Void = { $0.unpublish() }) {
+        self.bridge = bridge; self.system = system; self.timeout = timeout
+        self.publish = publish; self.unpublish = unpublish
+    }
+    func stop(completion: (() -> Void)? = nil) {
+        lock.lock(); stopped = true; lock.unlock(); operation.cancel()
+        queue.async { self.clear(); completion?() }
+    }
+    func poll(completion: ((Error?) -> Void)? = nil) {
+        lock.lock()
+        guard !busy && !stopped else { lock.unlock(); completion?(nil); return }
+        busy = true; lock.unlock()
+        queue.async {
+            var failure: Error?
+            defer { self.lock.lock(); self.busy = false; self.lock.unlock(); completion?(failure) }
+            do { try self.tick() }
+            catch { self.clear(); failure = error; nativeDevelopmentLog("Transfer progress: \(error)") }
+        }
+    }
+    private func clear() {
+        for entry in published.values { unpublish(entry.progress) }
+        published.removeAll()
+    }
+    private func visibleURL(_ manager: NativeDomainManaging, id: String) throws -> URL {
+        let done = DispatchSemaphore(value: 0)
+        var resolved: URL?; var failure: Error?
+        manager.getUserVisibleURL(for: providerID(id)) { resolved = $0; failure = $1; done.signal() }
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            throw NativeFailure.bridge("Resolving the transfer's Finder item timed out.")
+        }
+        try operation.check()
+        if let failure = failure { throw failure }
+        guard let resolved = resolved, resolved.isFileURL else {
+            throw NativeFailure.invalid("The native manager omitted the transfer's file URL.")
+        }
+        return resolved
+    }
+    private func registeredDomains() throws -> Set<String> {
+        let done = DispatchSemaphore(value: 0)
+        var domains: [NSFileProviderDomain] = []; var failure: Error?
+        system.domains { domains = $0; failure = $1; done.signal() }
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            throw NativeFailure.bridge("The native transfer domain list timed out.")
+        }
+        try operation.check()
+        if let failure = failure { throw failure }
+        return Set(domains.map { $0.identifier.rawValue })
+    }
+    private func tick() throws {
+        let configured = try bridge.request(["op": "domains"], operation: operation)["domains"] as? [[String: Any]] ?? []
+        let registered = try registeredDomains()
+        var present = Set<String>()
+        for raw in configured where raw["smart"] as? Bool == true {
+            try operation.check()
+            guard let domainID = raw["id"] as? String else { throw NativeFailure.invalid("A transfer domain has no identifier.") }
+            guard registered.contains(domainID) else { continue }
+            let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(domainID), displayName: raw["display_name"] as? String ?? domainID)
+            guard let manager = system.manager(for: domain) else { continue }
+            let reply = try bridge.request(["op": "transfer_status", "domain": domainID], operation: operation)
+            guard let rows = reply["transfers"] as? [Any], rows.count <= 256 else { throw NativeFailure.invalid("The backend omitted its bounded transfer list.") }
+            for row in try rows.map(NativeTransferSnapshot.decode) where row.background {
+                let key = domainID + "\n" + row.transfer_id
+                if ["completed", "failed", "cancelled"].contains(row.state) {
+                    if let existing = published.removeValue(forKey: key) {
+                        if row.state == "completed" { existing.operation.finishProgress() }
+                        unpublish(existing.progress)
+                    }
+                    continue
+                }
+                present.insert(key)
+                guard present.count <= 256 else { throw NativeFailure.invalid("Too many active transfer progress entries.") }
+                if let existing = published[key], existing.item != row.id || existing.direction != row.operation {
+                    unpublish(existing.progress); published.removeValue(forKey: key)
+                }
+                if published[key] == nil {
+                    let url: URL
+                    do { url = try visibleURL(manager, id: row.id) }
+                    catch {
+                        try operation.check()
+                        present.remove(key)
+                        nativeDevelopmentLog("Transfer item unavailable: \(error)")
+                        continue
+                    }
+                    let progress = Progress(totalUnitCount: -1)
+                    configureFileProgress(progress, operation: row.operation == "upload" ? .uploading : .downloading)
+                    progress.fileURL = url
+                    // Cancelling an observer must not retract an already
+                    // retained edit or cancel another retry of the mutation.
+                    progress.isCancellable = false
+                    let entry = Published(item: row.id, direction: row.operation, progress: progress, operation: SocketOperation(progress: progress))
+                    published[key] = entry
+                    publish(progress)
+                }
+                published[key]!.operation.report(completed: Int64(row.completed), total: row.total.map(Int64.init),
+                    bytesPerSecond: row.bytes_per_second, etaSeconds: row.eta_seconds)
+            }
+        }
+        for key in published.keys.filter({ !present.contains($0) }) {
+            unpublish(published.removeValue(forKey: key)!.progress)
+        }
+    }
+}
+
 /// Keeps native domains current even when macOS unloads an idle extension.
 /// It reads the local Rust catalog; remote synchronization stays in the broker.
 final class NativeDomainWatcher {
@@ -16,6 +142,7 @@ final class NativeDomainWatcher {
     private var queuedParents: [String: Set<String>] = [:]
     private var lastRequests: [String: Date] = [:]
     private var lastSweep = Date.distantPast
+    private let transferProgress: NativeBackgroundTransferWatcher
 
     private let system: NativeSystemManaging
     private let timeout: TimeInterval
@@ -23,9 +150,11 @@ final class NativeDomainWatcher {
     init(bridge: BackendBridge, system: NativeSystemManaging = NativeSystemManager(),
          timeout: TimeInterval = 20, now: @escaping () -> Date = Date.init) {
         self.bridge = bridge; self.system = system; self.timeout = timeout; self.now = now
+        self.transferProgress = NativeBackgroundTransferWatcher(bridge: bridge, system: system, timeout: min(timeout, 5))
     }
-    func stop() { lock.lock(); stopped = true; lock.unlock(); operation.cancel() }
+    func stop() { lock.lock(); stopped = true; lock.unlock(); operation.cancel(); transferProgress.stop() }
     func poll(completion: ((Error?) -> Void)? = nil) {
+        transferProgress.poll()
         lock.lock()
         guard !busy && !stopped else { lock.unlock(); completion?(nil); return }
         busy = true; lock.unlock()

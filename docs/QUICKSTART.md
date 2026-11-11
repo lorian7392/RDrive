@@ -4,6 +4,11 @@ Start with the standalone CLI. Follow [installation](INSTALLATION.md) to build w
 
 Replace example endpoints and accounts with your own. Try modifying commands in a dedicated test directory first. The [CLI reference](reference/CLI.md) lists all arguments.
 
+`dav` and `nas` below are example profile names, not built-in protocol aliases.
+Run `rdrive profile list` to find the names in your selected configuration.
+When the terminal shares an existing Finder connection, use its existing name
+instead of adding the connection again.
+
 ## Authentication and connections
 
 ### Read a password in the current terminal
@@ -54,6 +59,33 @@ In Keychain Access, create a generic-password item with service `rdrive:PROFILE_
 A profile with `--password-env` explicitly requires that variable; a missing variable does not trigger a Keychain fallback. WebDAV without a username or password variable can connect anonymously. Reading Keychain may require system authorization.
 
 Native SMB mounts use macOS credentials or a terminal prompt independently of CLI transfer credentials. Background services do not save terminal passwords for you.
+
+An existing macOS Internet password can also be selected explicitly with
+`profile add --keychain-internet`, using the URL host and configured username.
+This reads the existing item and does not create a generic-password copy. It
+cannot be combined with `--password-env`. For a Finder connection shared with
+the terminal, both clients read the same profile and the same Keychain item.
+
+### Share an existing Finder configuration
+
+A private shared-home locator can point the CLI at Finder's existing RDrive
+state directory. It contains only a version and an absolute path; profiles,
+credentials, cache, and recovery records remain in the original directory.
+See [state selection](reference/CONFIGURATION.md#state-directory-and-configuration-persistence).
+Explicit `--home` and `RDRIVE_HOME` overrides still take precedence.
+
+Once attached, the existing connection can be used directly, for example:
+
+~~~sh
+rdrive profile list
+rdrive ls pan123
+~~~
+
+`profile list`, `info`, `ls`, and `stat` read validated configuration snapshots
+without taking the background service's writer lock. `ls` still reads the
+remote server and reports a connection error if it cannot reach that server.
+These commands do not substitute Finder's cached directory view for a remote
+result. Mutating commands retain their existing locking and recovery rules.
 
 ## Browse and transfer files
 

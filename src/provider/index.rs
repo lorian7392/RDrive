@@ -489,7 +489,29 @@ pub(super) fn load(
             initialize(home, domain, binding, &journal)?;
         }
     }
-    let mut connection = open(&db, false)?;
+    read_journal(open(&db, false)?, domain, binding)
+}
+
+/// UI inspection never initializes or migrates a provider index.
+pub(super) fn load_existing(home: &Path, domain: &str, binding: &str) -> Result<Option<Journal>> {
+    let db = path(home, domain);
+    if !present(&db)? { return Ok(None); }
+    let parent = super::private(db.parent().context("provider index has no directory")?)?;
+    let db = parent.join(db.file_name().context("provider index has no filename")?);
+    check_files(&db)?;
+    let connection = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    connection.busy_timeout(Duration::from_secs(3))?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    connection.pragma_update(None, "query_only", true)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let application: i64 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if version != SCHEMA_VERSION || application != APPLICATION_ID {
+        bail!("provider index needs initialization or migration; open the Smart domain before repairing it");
+    }
+    read_journal(connection, domain, binding)
+}
+
+fn read_journal(mut connection: Connection, domain: &str, binding: &str) -> Result<Option<Journal>> {
     let transaction = connection.transaction()?;
     let (anchor, pins) = validate_binding(&transaction, domain, binding)?;
     let control: String =

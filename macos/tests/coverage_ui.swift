@@ -19,6 +19,8 @@ private final class UICoverageManager: NativeDomainManaging {
     var evictions: [String] = []
     var signals: [String] = []
     var actionError: Error?
+    var resolvedErrors: [Int] = []
+    var omitResolvedCompletion = false
     init(url: URL) { self.url = url }
     func enumeratorForMaterializedItems() -> NSFileProviderEnumerator { UIEmptyEnumerator() }
     func getUserVisibleURL(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void) {
@@ -29,6 +31,10 @@ private final class UICoverageManager: NativeDomainManaging {
     }
     func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
         signals.append(identifier.rawValue); completionHandler(nil)
+    }
+    func signalErrorResolved(_ error: NSError, completionHandler: @escaping (Error?) -> Void) {
+        resolvedErrors.append(error.code)
+        if !omitResolvedCompletion { completionHandler(actionError) }
     }
     func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
         downloads.append(identifier.rawValue); completionHandler(actionError)
@@ -189,6 +195,7 @@ enum UICoverageTests {
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 1.1))
         }
         try status(paths, bridge, source)
+        try repairStatus(bridge)
         try expect(NSApp == nil || (!NSApp.isRunning && !NSApp.windows.contains(where: { $0.isVisible })), "Detached UI testing started an application loop or displayed a window")
         print("PASS mocked Finder menus/badges/actions/provenance and detached status UI; no Finder/OS manager/UI actions")
     }
@@ -213,6 +220,8 @@ enum UICoverageTests {
             if !omitIdentity { done(resolvedItem, resolvedDomain, identityError) }
         }, complete: { _ in completed += 1 })
         integration.timeout = 0.01
+        let framed = try integration.request(bridge, ["op": "test.fragmented"], SocketOperation())
+        try expect(framed["value"] as? String == "fragmented reply", "Status request boundary changed bridge framing")
         controller.integration = integration
         func details() -> String {
             let stack = controller.view.subviews.compactMap { $0 as? NSStackView }.first!
@@ -262,5 +271,170 @@ enum UICoverageTests {
         try pump("Status read error did not finish") { details().contains("Status unavailable: Synthetic read failed") }
         controller.finish()
         try expect(completed == 1, "Status completion was not delegated exactly once")
+    }
+
+    static func repairStatus(_ bridge: BackendBridge) throws {
+        let controller = RDriveStatusViewController(nibName: nil, bundle: nil)
+        let domain = NSFileProviderDomainIdentifier("repair-domain")
+        let exact = "version_conflict: item changed since the system snapshot"
+        var itemState = "conflict"
+        var itemMessage = exact
+        var eligibility: [String: Any] = ["eligible": true, "mutation_id": "immutable-request",
+                                        "message": "Clear this stale folder request and queue a folder refresh. Local contents and other pending edits are retained."]
+        var response: [String: Any] = ["repaired": true, "refresh_queued": true]
+        var repairError: Error?
+        var requests: [[String: Any]] = []
+        let notificationManager = UICoverageManager(url: URL(fileURLWithPath: "/private/tmp"))
+        var integration = NativeStatusIntegration(makeBridge: { bridge }, readItem: { _, _, _ in
+            try NativeTests.fixtureItem(["id": "folder", "kind": "directory", "smart": true,
+                "sync_state": itemState, "sync_message": itemMessage])
+        }, domain: { _ in domain }, manager: { _ in notificationManager }, identify: { _, _ in },
+            complete: { _ in })
+        integration.request = { _, request, _ in
+            requests.append(request)
+            try expect(request["domain"] as? String == domain.rawValue && request["id"] as? String == "folder",
+                       "Repair UI lost its selected item identity")
+            if request["op"] as? String == "smart_repair_status" { return eligibility }
+            try expect(request["op"] as? String == "repair_stale_directory"
+                && request["mutation_id"] as? String == "immutable-request" && request.count == 4,
+                       "Repair action changed the preflight mutation or added a remote path")
+            if let error = repairError { throw error }
+            return response
+        }
+        controller.integration = integration
+        func stack() -> NSStackView { controller.view.subviews.compactMap { $0 as? NSStackView }.first! }
+        func details() -> String { (stack().arrangedSubviews[1] as! NSTextField).stringValue }
+        func repairButton() -> NSButton { stack().arrangedSubviews[2] as! NSButton }
+        func prepare(_ action: String = "rdrive.repair") throws {
+            controller.prepare(forAction: action, itemIdentifiers: [providerID("folder")])
+            try pump("Repair eligibility did not finish") { !repairButton().isHidden }
+        }
+        controller.repairConflict()
+        try expect(requests.isEmpty, "An unselected repair sent a request")
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("one"), providerID("two")])
+        try expect(details().contains("Select one Smart folder"), "Repair accepted multiple selected folders")
+        try prepare()
+        try expect(details().contains("Local contents and other pending edits are retained.") && repairButton().isEnabled,
+                   "Eligible repair omitted its data-retention explanation")
+        controller.repairConflict()
+        try pump("Repair completion was not shown") { details().contains("Stale folder request cleared") }
+        try expect(repairButton().isHidden && details().contains("refresh is queued"), "Local repair claimed a completed remote refresh")
+        try expect(notificationManager.resolvedErrors == [NSFileProviderError.cannotSynchronize.rawValue, NSFileProviderError.serverUnreachable.rawValue],
+                   "The confirmed repair did not ask Finder to retry its cached error")
+        let completed = requests.count
+        controller.repairConflict()
+        try expect(requests.count == completed, "Completed repair was sent twice")
+
+        notificationManager.actionError = NSError(domain: "SyntheticNotification", code: 1, userInfo: [NSLocalizedDescriptionKey: "Retry notification unavailable"])
+        try prepare()
+        controller.repairConflict()
+        try pump("A failed Finder notification hid the saved repair") { details().contains("notification failed: Retry notification unavailable") }
+        try expect(details().contains("Stale folder request cleared"), "A notification failure was reported as a lost repair")
+        notificationManager.actionError = nil
+        notificationManager.omitResolvedCompletion = true
+        integration.timeout = 0.001
+        controller.integration = integration
+        try prepare()
+        controller.repairConflict()
+        try pump("An unanswered Finder notification hid the saved repair") { details().contains("notification timed out") }
+        notificationManager.omitResolvedCompletion = false
+        integration.timeout = 20
+        var unavailableManager = integration
+        unavailableManager.manager = { _ in nil }
+        controller.integration = unavailableManager
+        try prepare()
+        controller.repairConflict()
+        try pump("An unavailable native manager hid the saved repair") { details().contains("Reopen this connection") }
+        controller.integration = integration
+
+        itemMessage = "excluded_by_filter: synchronization filters exclude Backup/a.part; built-in temporary rule *.part"
+        eligibility["filter_reason"] = "Excluded by temporary-file rule *.part at Backup/a.part"
+        for state in ["blocked", "queued"] {
+            itemState = state
+            try prepare("rdrive.status")
+            try expect(details().contains("synchronization filters exclude Backup/a.part"),
+                       "Filter-blocked repair omitted its reason")
+            try expect(details().contains("Excluded by temporary-file rule *.part"), "The matched rule was omitted")
+            try expect(repairButton().title == "Repair Sync Issue", "The filter repair used a conflict-only label")
+        }
+        itemState = "queued"
+        itemMessage = "server_unreachable: waiting for a connection"
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("An ordinary queued folder exposed a stale repair") { details().contains("no eligible stale Smart folder request") }
+        try expect(repairButton().isHidden, "Ordinary queued work exposed a repair button")
+        itemState = "conflict"
+        itemMessage = exact
+        eligibility.removeValue(forKey: "filter_reason")
+
+        try prepare("rdrive.status")
+        response = ["repaired": false]
+        controller.repairConflict()
+        try pump("Missing repair acknowledgment was ignored") { details().contains("Repair stopped:") && details().contains("did not confirm") }
+        response = ["repaired": true, "refresh_queued": true]
+        try prepare()
+        repairError = NSError(domain: "SyntheticRepair", code: 1, userInfo: [NSLocalizedDescriptionKey: "A newer edit needs review"])
+        controller.repairConflict()
+        try pump("Repair failure was not shown") { details().contains("Repair stopped: A newer edit needs review") }
+        repairError = nil
+
+        eligibility = ["eligible": false, "message": "Local metadata changes require review in the RDrive command-line client."]
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("Protected local intent did not show a reason") { details().contains("Local metadata changes require review") }
+        try expect(repairButton().isHidden, "Protected local intent exposed a repair button")
+        eligibility = ["eligible": true]
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("Missing immutable repair identity was accepted") { details().contains("Status unavailable:") }
+        eligibility = ["eligible": false]
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("Missing eligibility reason did not show review guidance") { details().contains("requires review in the RDrive command-line client") }
+        itemState = "online"
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("An already-cleared conflict had no guidance") { details().contains("no eligible stale Smart folder request") }
+        try expect(repairButton().isHidden, "An already-cleared conflict exposed a repair button")
+        itemState = "conflict"
+        eligibility = ["eligible": true, "mutation_id": "immutable-request", "message": "Safe local repair"]
+        try prepare()
+        controller.prepare(forError: NSError(domain: "SyntheticRepair", code: 2))
+        try expect(repairButton().isHidden, "Error context retained an earlier repair action")
+        controller.finish()
+        for failed in [false, true] {
+            let started = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            var delayed = integration
+            delayed.readItem = { _, _, _ in
+                started.signal()
+                _ = release.wait(timeout: .now() + 3)
+                if failed { throw NativeFailure.bridge("Cancelled old status") }
+                return try NativeTests.fixtureItem(["kind": "file"])
+            }
+            controller.integration = delayed
+            controller.prepare(forAction: "rdrive.status", itemIdentifiers: [providerID("folder")])
+            try wait(started)
+            controller.prepare(forAction: "unknown", itemIdentifiers: [])
+            release.signal()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
+            try expect(details().hasPrefix("Select RDrive files"), "An old status callback replaced the current selection")
+        }
+        for failed in [false, true] {
+            let started = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            controller.integration = integration
+            try prepare()
+            var delayed = integration
+            delayed.request = { _, request, _ in
+                try expect(request["op"] as? String == "repair_stale_directory", "Unexpected delayed repair request")
+                started.signal()
+                _ = release.wait(timeout: .now() + 3)
+                if failed { throw NativeFailure.bridge("Cancelled old repair") }
+                return ["repaired": true, "refresh_queued": true]
+            }
+            controller.integration = delayed
+            controller.repairConflict()
+            try wait(started)
+            controller.prepare(forError: NSError(domain: "SyntheticRepair", code: 3, userInfo: [NSLocalizedDescriptionKey: "Current selection"]))
+            release.signal()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
+            try expect(details() == "Current selection", "An old repair callback replaced the current selection")
+        }
     }
 }

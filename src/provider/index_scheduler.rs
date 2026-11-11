@@ -63,7 +63,7 @@ fn valid_directory_demand(j: &Journal, demand: &CatalogDemand) -> bool {
 fn completed(j: &Journal, demand: &CatalogDemand) -> bool {
     (demand.force || demand.recursive)
         && j.completed_demands
-            .get(&demand.id)
+            .get(demand.completion_key().as_ref())
             .is_some_and(|requested| *requested >= demand.requested)
 }
 
@@ -111,7 +111,7 @@ pub(super) fn completed_manual_demands(
         };
         if done {
             finished
-                .entry(demand.id.clone())
+                .entry(demand.completion_key().into_owned())
                 .and_modify(|requested| *requested = (*requested).max(demand.requested))
                 .or_insert(demand.requested);
         }
@@ -388,6 +388,7 @@ mod tests {
             requested,
             recursive: false,
             force: false,
+            finder: false,
         }
     }
 
@@ -668,6 +669,40 @@ mod tests {
             Some("future")
         );
         assert!(completed_manual_demands(&j, &[request], false).is_empty());
+    }
+
+    #[test]
+    fn finder_refresh_completion_leaves_a_recursive_cli_refresh_pending() {
+        let mut journal = journal();
+        directory(&mut journal, "folder", "folder", "root");
+        directory(&mut journal, "child", "folder/child", "folder");
+        scanned(&mut journal, "root", NOW);
+        scanned(&mut journal, "child", NOW);
+        let mut cli = demand("folder", "folder", NOW + 1);
+        cli.force = true;
+        cli.recursive = true;
+        let mut finder = demand("folder", "folder", NOW + 2);
+        finder.force = true;
+        finder.finder = true;
+        let demands = [cli, finder];
+        let mut policy = policy();
+        policy.enabled = false;
+
+        scanned(&mut journal, "folder", NOW + 3);
+        assert_eq!(
+            completed_manual_demands(&journal, &demands, false),
+            vec![("finder:folder".into(), NOW + 2)]
+        );
+        journal.completed_demands.insert("finder:folder".into(), NOW + 2);
+        assert_eq!(
+            next_directory(&journal, &demands, &policy, NOW + 3_003).as_deref(),
+            Some("child")
+        );
+        scanned(&mut journal, "child", NOW + 3_004);
+        assert_eq!(
+            completed_manual_demands(&journal, &demands, false),
+            vec![("folder".into(), NOW + 1)]
+        );
     }
 
     #[test]

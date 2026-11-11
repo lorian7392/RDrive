@@ -89,9 +89,11 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
     }
 
     private func work<T>(_ body: @escaping (BackendBridge, SocketOperation) throws -> T,
+                         fileOperation: Progress.FileOperationKind? = nil,
                          discard: ((T) -> Void)? = nil,
                          completion: @escaping (Result<T, Error>) -> Void) -> Progress {
         let progress = Progress(totalUnitCount: 100)
+        if let kind = fileOperation { configureFileProgress(progress, operation: kind) }
         let operation = SocketOperation(progress: progress)
         let once = CompletionOnce(completion)
         let token = UUID()
@@ -108,7 +110,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                 try operation.check()
                 let result = try body(bridge, operation)
                 do { try operation.check() } catch { discard?(result); throw error }
-                progress.completedUnitCount = progress.totalUnitCount
+                operation.finishProgress()
                 if !once.finish(.success(result)) { discard?(result) }
             } catch {
                 nativeDevelopmentLog("Provider callback: \(error)")
@@ -180,7 +182,7 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                 "base_content_version": item.wire.content_version, "native_message": NSNull()])
             delivered = true
             return (destination, item, { budget.release(reservation) })
-        }, discard: { pair in try? FileManager.default.removeItem(at: pair.0); pair.2() }) { result in
+        }, fileOperation: .downloading, discard: { pair in try? FileManager.default.removeItem(at: pair.0); pair.2() }) { result in
             switch result { case .success(let pair): completionHandler(pair.0, pair.1, nil); case .failure(let error): completionHandler(nil, nil, error) }
         }
     }
@@ -203,11 +205,11 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
             var staged: URL?
             if let source = url { staged = try bridge.stagedCopy(source); message["content_path"] = staged!.path }
             defer { if let staged = staged { try? FileManager.default.removeItem(at: staged) } }
-            let item = ProviderItem(try bridge.item(message, operation: operation))
+            let item = ProviderItem(try bridge.item(message, operation: operation, reportsProgress: true))
             try? self.budgetFactory(bridge, self.domain.identifier.rawValue).acknowledgeLocalContent(item.wire)
             self.signal(item.parentItemIdentifier)
             return item
-        }) { result in
+        }, fileOperation: .uploading) { result in
             switch result { case .success(let item): completionHandler(item, [], false, nil); case .failure(let error): completionHandler(nil, fields, false, error) }
         }
     }
@@ -235,12 +237,12 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
                 staged = try bridge.stagedCopy(source); message["content_path"] = staged!.path
             }
             defer { if let staged = staged { try? FileManager.default.removeItem(at: staged) } }
-            let updated = ProviderItem(try bridge.item(message, operation: operation))
+            let updated = ProviderItem(try bridge.item(message, operation: operation, reportsProgress: true))
             if newContents != nil { try? self.budgetFactory(bridge, self.domain.identifier.rawValue).acknowledgeLocalContent(updated.wire) }
             self.signal(updated.parentItemIdentifier)
             if let previousParent = previousParent, previousParent != updated.parentItemIdentifier { self.signal(previousParent) }
             return updated
-        }) { result in
+        }, fileOperation: .uploading) { result in
             switch result { case .success(let item): completionHandler(item, [], false, nil); case .failure(let error): completionHandler(nil, changedFields, false, error) }
         }
     }
@@ -264,6 +266,17 @@ final class RDriveProvider: NSObject, NSFileProviderReplicatedExtension, NSFileP
         work({ bridge, operation in
             let pinned: Bool
             switch actionIdentifier.rawValue {
+            case "rdrive.refresh":
+                guard itemIdentifiers.count == 1, let identifier = itemIdentifiers.first else {
+                    throw remoteError(["code": "unsupported", "message": "Select one Smart folder to refresh."])
+                }
+                let id = identifier == .workingSet ? "root" : wireID(identifier)
+                let reply = try bridge.request(["op": "refresh_index", "domain": self.domain.identifier.rawValue,
+                    "id": id], operation: operation)
+                guard reply["queued"] as? Bool == true else {
+                    throw NativeFailure.bridge("RDrive did not acknowledge the refresh request.")
+                }
+                return
             case "rdrive.pin": pinned = true
             case "rdrive.unpin": pinned = false
             default:

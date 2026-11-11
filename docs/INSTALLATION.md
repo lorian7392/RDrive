@@ -16,7 +16,7 @@ export PATH="$HOME/.local/bin:$PATH"
 rdrive --version
 ~~~
 
-The script downloads the CLI and its SHA-256 checksum from the same stable release. It verifies the checksum before replacing the executable in a single step. The default destination is `~/.local/bin/rdrive`. Set `--prefix /absolute/path` for a different user-owned directory, or `--version v0.8.2` to install a particular published version. Add the selected `bin` directory to your shell's startup configuration to keep it on your path.
+The script downloads the CLI and its SHA-256 checksum from the same stable release. It verifies the checksum before replacing the executable in a single step. The default destination is `~/.local/bin/rdrive`. Set `--prefix /absolute/path` for a different user-owned directory, or `--version v0.8.3` to install a particular published version. Add the selected `bin` directory to your shell's startup configuration to keep it on your path.
 
 ```sh
 rdrive update          # Check for a newer stable release
@@ -83,6 +83,17 @@ rdrive --home "$HOME/Library/Application Support/rdrive-demo" profile list
 ~~~
 
 Keep state outside synchronization sources, shared directories, and public repositories. Separate state directories have independent profiles and jobs; changing `--home` does not migrate existing work. Locks coordinate operations sharing a state directory. Old and new background processes must not write the same state concurrently.
+
+To reuse a Finder configuration, the optional private `shared-home.json` locator
+in the default directory points at the existing state. It stores no connection
+or password values. `--home` and `RDRIVE_HOME` override this reference. See the
+[configuration reference](reference/CONFIGURATION.md#state-directory-and-configuration-persistence)
+for its format and validation.
+
+The terminal may use a symbolic link to the companion App's
+`Contents/Resources/rdrive` executable so an App upgrade updates both clients.
+When using that arrangement, update the App as a whole; the standalone
+`rdrive update --apply` workflow is intended for independent CLI installations.
 
 The CLI has no plaintext password argument. See [authentication](QUICKSTART.md#authentication-and-connections) for hidden input and Keychain setup, and the [configuration reference](reference/CONFIGURATION.md) for environment variables and directory layout.
 

@@ -146,7 +146,7 @@ async fn connection_refusal_and_request_timeout_are_reported_without_credentials
     let error=backend.stat("file").await.unwrap_err().to_string();assert!(error.contains("check connection"));assert!(!error.contains("test-secret"));
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
     let peer=tokio::spawn(async move{let (_socket,_)=listener.accept().await.unwrap();std::future::pending::<()>().await;});
-    let profile=Profile{protocol:Protocol::Webdav,url:format!("http://{address}/root/"),username:None,password_env:None,allow_http:true,timeout_secs:1,smb_encryption:true,nextcloud_upload_url:None};
+    let profile=Profile{protocol:Protocol::Webdav,url:format!("http://{address}/root/"),username:None,password_env:None,allow_http:true,timeout_secs:1,smb_encryption:true,keychain_internet:false,nextcloud_upload_url:None};
     let backend=WebDav::new(&profile,"").unwrap();assert!(backend.stat("file").await.unwrap_err().to_string().contains("timed out"));peer.abort();let _=peer.await;
 }
 
@@ -243,6 +243,7 @@ async fn loopback_bypasses_proxy_environment_and_remote_hosts_keep_it() {
             allow_http: true,
             timeout_secs: 2,
             smb_encryption: true,
+            keychain_internet: false,
             nextcloud_upload_url: None,
         };
         assert_eq!(

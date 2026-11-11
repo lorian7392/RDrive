@@ -125,6 +125,28 @@ func watchDomains(_ bridge: BackendBridge, system: NativeSystemManaging = Native
 }
 
 func controlCommand(arguments: [String] = CommandLine.arguments, integration: CompanionControlIntegration = .live) -> Int32? {
+    if arguments.contains("--retry-sync") {
+        guard let identifier = option("--retry-sync", arguments: arguments), !identifier.isEmpty, !identifier.hasPrefix("--") else {
+            printJSON(["ok": false, "error": "A native domain identifier is required."]); return 2
+        }
+        return runUntil { done in
+            integration.system.domains { domains, error in
+                if let error = error { done(error); return }
+                guard domains.contains(where: { $0.identifier.rawValue == identifier }) else {
+                    done(NativeFailure.invalid("The native domain is not registered.")); return
+                }
+                let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(identifier), displayName: identifier)
+                guard let manager = integration.system.manager(for: domain) else {
+                    done(NativeFailure.invalid("The domain manager is unavailable.")); return
+                }
+                signalNativeSyncErrorsResolved(manager, codes: [.serverUnreachable, .cannotSynchronize]) { error in
+                    if error == nil { printJSON(["ok": true, "action": "--retry-sync", "domain": identifier,
+                        "rescheduled_errors": ["server_unreachable", "cannot_synchronize"]]) }
+                    done(error)
+                }
+            }
+        }
+    }
     if arguments.contains("--watch-domains") {
         do {
             let bridge = BackendBridge(paths: try integration.paths(arguments))
@@ -401,18 +423,33 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         connections.addItem(withTitle: "Loading connections…", action: nil, keyEquivalent: "")
         let parent = NSMenuItem(title: "Add Connection to Finder", action: nil, keyEquivalent: "")
         parent.submenu = connections; menu.addItem(parent)
+        let refresh = NSMenu(title: "Refresh Connection")
+        refresh.addItem(withTitle: "Loading connections…", action: nil, keyEquivalent: "")
+        let refreshParent = NSMenuItem(title: "Refresh Connection", action: nil, keyEquivalent: "")
+        refreshParent.submenu = refresh
+        menu.addItem(refreshParent)
         DispatchQueue.global(qos: .utility).async {
             let reply = self.bridge.flatMap { try? self.integration.request($0, ["op": "domains"]) }
             DispatchQueue.main.async {
                 connections.removeAllItems()
+                refresh.removeAllItems()
                 if let domains = reply?["domains"] as? [[String: Any]] {
                     for domain in domains {
                         guard let id = domain["id"] as? String else { continue }
                         let item = NSMenuItem(title: domain["display_name"] as? String ?? id, action: #selector(self.addDomain(_:)), keyEquivalent: "")
                         item.target = self; item.representedObject = domain; connections.addItem(item)
+                        if domain["smart"] as? Bool == true {
+                            let entry = refresh.addItem(withTitle: item.title, action: #selector(self.refreshConnection(_:)), keyEquivalent: "")
+                            entry.target = self
+                            entry.representedObject = id
+                        }
                     }
                     if domains.isEmpty { connections.addItem(withTitle: "No connections configured", action: nil, keyEquivalent: "") }
-                } else { connections.addItem(withTitle: "Connection service unavailable", action: nil, keyEquivalent: "") }
+                    if refresh.items.isEmpty { refresh.addItem(withTitle: "No Smart connections configured", action: nil, keyEquivalent: "") }
+                } else {
+                    connections.addItem(withTitle: "Connection service unavailable", action: nil, keyEquivalent: "")
+                    refresh.addItem(withTitle: "Connection service unavailable", action: nil, keyEquivalent: "")
+                }
             }
         }
         menu.addItem(.separator())
@@ -431,6 +468,20 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if let error = error { self.showMessage(error.localizedDescription) }
                 else { self.updateRoots() }
+            }
+        }
+    }
+    @objc func refreshConnection(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let bridge = bridge else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let reply = try self.integration.request(bridge, ["op": "refresh_index", "domain": id, "id": "root"])
+                guard reply["queued"] as? Bool == true else {
+                    throw NativeFailure.bridge("RDrive did not acknowledge the refresh request.")
+                }
+                DispatchQueue.main.async { self.showMessage("Folder list refresh queued.") }
+            } catch {
+                DispatchQueue.main.async { self.showMessage(providerError(error).localizedDescription) }
             }
         }
     }

@@ -2,6 +2,15 @@
 
 Changes are organized from source history and versioned validation records. Dates identify the recorded changes or checks; they do not imply that a signed distribution was published. Historical test counts and deployment observations remain in their original reports and do not establish current coverage or installation status.
 
+## 0.8.3 — 2026-11-11
+
+- Let the CLI reference an existing private Finder state through a shared-home locator, with explicit path overrides retaining precedence.
+- Add explicit reuse of existing macOS Internet Keychain items, and keep read-only connection commands independent of the background writer lock.
+- Add Finder's Refresh action and the companion's Refresh Connection menu, preserving independent recursive CLI refresh requests.
+- Add Repair Sync Issue to the Finder menu and status window for obsolete directory updates, including callbacks blocked by excluded temporary descendants. Preserve retained contents and other pending edits, and require review when another active request targets the same directory.
+- Label filtering blocks separately from connection failures, explain matched rules, and check excluded descendants only for directory namespace operations.
+- Report payload progress through Finder callbacks and publish scoped background upload progress through macOS file progress APIs, preserving transfer verification and commit boundaries.
+
 ## 0.8.2 — 2026-11-11
 
 - Publish an Apple Silicon CLI, checksum manifest, and installation script after tagged builds pass the release checks.

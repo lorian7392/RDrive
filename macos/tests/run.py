@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile and exercise native SDK objects against an isolated Unix-socket peer."""
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -190,6 +191,8 @@ def main():
                             continue
                         if request["op"] == "test.fragmented":
                             frames = [{"progress": {"completed": 19, "total": 19}}, {"ok": True, "value": "fragmented reply"}]
+                        elif request["op"] == "test.indeterminate-progress":
+                            frames = [{"progress": {"completed": 3, "total": None, "bytes_per_second": 7, "eta_seconds": None}}, {"progress": {}}, {"ok": True}]
                         elif request["op"] == "test.authentication":
                             frames = [{"ok": False, "error": {"code": "not_authenticated", "message": "Synthetic test failure"}}]
                         elif request["op"] == "test.oversized":
@@ -211,14 +214,15 @@ def main():
                                 pass
                             continue
                         elif request["op"] == "item":
-                            frames = [{"ok": True, "item": item(0)}]
+                            frames = [{"progress": {"completed": 999, "total": 1000}}, {"ok": True, "item": item(0)}]
                         elif request["op"] in ["create", "modify"]:
                             if "content_path" in request:
                                 assert Path(request["content_path"]).read_bytes() == b"provider-create"
                             row = item(0)
                             row["parent_id"] = request.get("parent_id", "root")
                             row["name"] = request.get("name", "new.txt")
-                            frames = [{"ok": True, "item": row}]
+                            frames = ([{"progress": {"completed": 7, "total": len(b"provider-create")}}] if "content_path" in request else [])
+                            frames += [{"ok": True, "item": row}]
                         elif request["op"] == "fetch":
                             transfers = group / "Transfers"
                             transfers.mkdir(exist_ok=True)
@@ -234,13 +238,28 @@ def main():
                                 staged.mkdir()
                             else:
                                 staged.write_bytes(b"provider-content")
-                            frames = [{"ok": True}] if domain == "provider-fetch-missing" else [{"ok": True, "item": item(0), "content_path": str(staged)}]
+                            frames = [{"progress": {"completed": len(b"provider-content"), "total": len(b"provider-content")}}, {"ok": True}] if domain == "provider-fetch-missing" else [
+                                {"progress": {"completed": len(b"provider-content"), "total": len(b"provider-content")}}, {"ok": True, "item": item(0), "content_path": str(staged)}]
                         elif request["op"] in ["delete", "pin", "native_error"]:
                             frames = [{"ok": False, "error": {"code": "version_conflict"}}] if request.get("domain") == "provider-pin-error" else [{"ok": True}]
+                        elif request["op"] == "refresh_index":
+                            assert set(request) - {"auth_token", "request_id", "v"} == {"op", "domain", "id"}
+                            assert request["domain"] in ("provider-tests", "provider-refresh-no-ack")
+                            if request["id"] == "stable-0":
+                                frames = [{"ok": False, "error": {"code": "unsupported", "message": "Select a directory"}}]
+                            else:
+                                assert request["id"] in ("folder-one", "root")
+                                frames = [{"ok": True, "queued": request["domain"] == "provider-tests", "completed": False}]
                         elif request["op"] == "cache_budget":
                             frames = [{"ok": True, "max_bytes": 1024, "used_bytes": 0, "reserved_bytes": 0}]
                         elif request["op"] == "domains":
-                            frames = [{"ok": True, "domains": []}]
+                            fixture = group / "transfer-progress-fixture.json"
+                            value = json.loads(fixture.read_bytes()) if fixture.exists() else {}
+                            frames = [{"ok": True, "domains": value.get("domains", [])}]
+                        elif request["op"] == "transfer_status":
+                            fixture = group / "transfer-progress-fixture.json"
+                            value = json.loads(fixture.read_bytes()) if fixture.exists() else {}
+                            frames = [value.get("reply", {"ok": True, "transfers": value.get("transfers", [])})]
                         elif request["op"] == "list":
                             domain = request.get("domain")
                             if domain == "missing-list":
@@ -270,6 +289,9 @@ def main():
                     # A cancelled request may close while a fragmented reply is
                     # being delivered; production callback assertions still run.
                     pass
+                except OSError as error:
+                    if error.errno != errno.ENOTCONN:
+                        errors.append(error)
                 except Exception as error:
                     errors.append(error)
         for transport in ["unix", "development-tcp"]:
@@ -331,6 +353,8 @@ def main():
                         assert message["ok"] == (expected_status == 0), (arguments, message)
                 assert not errors, errors
                 assert len([c for c in calls if c["op"] == "list" and c.get("domain") == "fixture"]) == 1, "Paging must reuse one stable snapshot"
+                assert [c["id"] for c in calls if c["op"] == "refresh_index"] == [
+                    "folder-one", "root", "root", "stable-0", "root"]
             finally:
                 stopped.set(); listener.close(); worker.join(timeout=2)
 

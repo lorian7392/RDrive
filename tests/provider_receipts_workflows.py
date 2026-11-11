@@ -382,6 +382,23 @@ def run(binary):
             assert ReceiptDav.requests_seen.count(("PUT", gate["sidecar_url"])) == before, "recovery needlessly republished committed tags"
             assert (remote / "tag-crash/doc.txt").read_bytes() == b"original"
             passed("SIGKILL after metadata-only publication reconciles exact own tags without conflict or a second PUT")
+
+            # This final broker exits normally, preserving measured managed
+            # payload observations after the deliberately killed crash peers.
+            managed_payload = b"managed payload after crash recovery"
+            managed_source = stage / "managed-progress"
+            managed_source.write_bytes(managed_payload)
+            created = ok(op="create", domain="managed", parent_id="root", name="progress-after-crash.txt",
+                         kind="file", client_item_id="managed-progress-item", content_path=str(managed_source))["item"]
+            progress = next(row for row in ok(op="transfer_status", domain="managed")["transfers"] if row["id"] == "managed-progress-item")
+            assert progress["state"] == "completed" and progress["total"] == progress["completed"] == len(managed_payload), progress
+            downloaded = ok(op="fetch", domain="managed", id=created["id"], base_content_version=created["content_version"])
+            assert Path(downloaded["content_path"]).read_bytes() == managed_payload
+            Path(downloaded["content_path"]).unlink()
+            progress = next(row for row in ok(op="transfer_status", domain="managed")["transfers"] if row["id"] == created["id"])
+            assert progress["state"] == "completed" and progress["operation"] == "download", progress
+            assert progress["total"] == progress["completed"] == len(managed_payload), progress
+            passed("managed upload and download report only their bound object payload and complete after durable snapshot publication")
         finally:
             for name in ("publication_gate", "deletion_gate", "metadata_gate"):
                 gate = getattr(ReceiptDav, name)
@@ -399,7 +416,8 @@ def run(binary):
                   scope="synthetic authenticated loopback DAV, independent writer home, actual broker SIGKILL; no real storage")
     release_version = version.removeprefix("rdrive ").replace("/", "_")
     build_kind = ".debug" if binary.parent.name == "debug" else ""
-    destination = ROOT / "docs" / f"PROVIDER_RECEIPTS_VALIDATION.{release_version}{build_kind}.json"
+    destination = Path(os.environ["RDRIVE_PROVIDER_RECEIPTS_REPORT"]).resolve() if os.environ.get("RDRIVE_PROVIDER_RECEIPTS_REPORT") else ROOT / "docs" / f"PROVIDER_RECEIPTS_VALIDATION.{release_version}{build_kind}.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(report, ensure_ascii=False))
 

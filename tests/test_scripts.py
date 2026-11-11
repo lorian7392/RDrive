@@ -243,7 +243,7 @@ class BuildPeer:
         if arguments == ["uname", "-m"]:
             return "arm64\n"
         if arguments == [str(self.cli), "--version"]:
-            return "rdrive 0.8.2\n"
+            return "rdrive 0.8.3\n"
         raise AssertionError("unexpected external query: " + repr(arguments))
 
     def run(self, arguments, *, check, **options):
@@ -303,9 +303,9 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual((self.output / "RDrive.app/Contents/Resources/rdrive").read_bytes(), self.cli.read_bytes())
         self.assertEqual(report["source_cli_sha256"], hashlib.sha256(self.cli.read_bytes()).hexdigest())
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
-        self.assertEqual(report["cli_version"], "rdrive 0.8.2")
-        self.assertEqual(report["version"], "0.8.2")
-        self.assertEqual(report["bundle_build"], "12")
+        self.assertEqual(report["cli_version"], "rdrive 0.8.3")
+        self.assertEqual(report["version"], "0.8.3")
+        self.assertEqual(report["bundle_build"], "19")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])
@@ -317,14 +317,29 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual(peer.calls[-1][:5], ["codesign", "--verify", "--deep", "--strict", "--verbose=2"])
         provider = self.read_plist("RDrive.app/Contents/PlugIns/RDriveProvider.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(provider["NSExtensionFileProviderDocumentGroup"], "group.io.rdrive.shared")
-        self.assertEqual(len(provider["NSFileProviderDecorations"]), 13)
+        self.assertEqual(len(provider["NSFileProviderDecorations"]), 15)
+        blocked = next(item for item in provider["NSFileProviderDecorations"]
+                       if item["Identifier"] == "io.rdrive.native.provider.status.blocked")
+        self.assertEqual(blocked["Label"], "Excluded by sync rules")
         self.assertEqual([action["NSExtensionFileProviderActionIdentifier"]
                           for action in provider["NSExtensionFileProviderActions"]],
-                         ["rdrive.pin", "rdrive.unpin"])
+                         ["rdrive.refresh", "rdrive.pin", "rdrive.unpin"])
+        refresh = provider["NSExtensionFileProviderActions"][0]
+        self.assertEqual(refresh["NSExtensionFileProviderActionName"], "Refresh")
+        self.assertEqual(refresh["NSExtensionFileProviderActionActivationRule"],
+                         "fileproviderItems.@count == 1 AND SUBQUERY(fileproviderItems, $item, "
+                         "$item.userInfo.rdriveSmart == YES AND $item.contentType.identifier == 'public.folder').@count == 1")
         finder = self.read_plist("RDrive.app/Contents/PlugIns/RDriveFinder.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(finder["NSExtensionAttributes"], {})
         status_ui = self.read_plist("RDrive.app/Contents/PlugIns/RDriveStatus.appex/Contents/Info.plist")["NSExtension"]
         self.assertEqual(status_ui["NSExtensionFileProviderActions"][0]["NSExtensionFileProviderActionIdentifier"], "rdrive.status")
+        repair = status_ui["NSExtensionFileProviderActions"][1]
+        self.assertEqual(repair["NSExtensionFileProviderActionIdentifier"], "rdrive.repair")
+        self.assertEqual(repair["NSExtensionFileProviderActionName"], "Repair Sync Issue…")
+        self.assertEqual(repair["NSExtensionFileProviderActionActivationRule"],
+                         "fileproviderItems.@count == 1 AND SUBQUERY(fileproviderItems, $item, "
+                         "$item.userInfo.rdriveSmart == YES AND $item.userInfo.rdriveState IN {'conflict', 'blocked', 'queued'} "
+                         "AND $item.contentType.identifier == 'public.folder').@count == 1")
         self.assertTrue(self.read_plist("RDriveProvider.entitlements")["com.apple.security.app-sandbox"])
 
     def test_signing_team_and_explicit_app_group_are_reported(self):

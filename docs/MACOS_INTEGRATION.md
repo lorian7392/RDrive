@@ -125,6 +125,7 @@ CONTROL="$APP/Contents/MacOS/RDriveCompanion"
 "$CONTROL" --register-domain PROFILE --display-name 'My Storage'
 "$CONTROL" --domain-root PROFILE
 "$CONTROL" --signal PROFILE
+"$CONTROL" --retry-sync PROFILE
 "$CONTROL" --download PROFILE ITEM_ID
 "$CONTROL" --evict PROFILE ITEM_ID
 "$CONTROL" --pin PROFILE ITEM_ID
@@ -157,8 +158,29 @@ extension access to that directory.
 ## Finder actions and availability
 
 RDrive adds Show Sync Status, Keep Offline and Allow Automatic Removal to the
-File Provider menu. Use Finder's cloud download button or open an online-only
+File Provider menu. Right-click one Smart folder and choose **Refresh** to queue
+a refresh of its immediate contents. The menu-bar companion offers **Refresh
+Connection** for each Smart connection, which refreshes its root. Choose that
+command for a managed repository, which refreshes its entire snapshot. The
+background service applies the refresh and notifies Finder when the catalog
+changes. Use Finder's cloud download button or open an online-only
 item to download it. Finder offers Remove Download for eligible local copies.
+For a conflicted or blocked Smart folder, choose **Repair Sync Issue…**, or open
+**Show Sync Status**. The status window offers **Repair Sync Issue** when
+RDrive can safely cancel the exact stale request while retaining local contents
+and other pending edits. Repair queues a folder refresh. Requests containing
+local file content, Finder tags, extended attributes, or a recorded remote
+transaction show a review reason and keep their recovery data.
+After a confirmed repair, RDrive asks macOS to retry requests held by cached
+synchronization or connection errors in this domain. The native
+`--retry-sync DOMAIN` command provides the same retry notification after a
+connection is restarted. This resets system backoff; every retried operation
+keeps its existing revision checks and retained content. A retry notification
+does not confirm that the remote connection has recovered.
+An item blocked by filtering is labeled **Excluded by sync rules**. A stale-folder
+repair explains the selected rule. An existing temporary file under a folder does not
+block an unrelated metadata update to that folder; moving or deleting the folder
+still checks the affected descendants.
 The separate Finder Sync menu also includes Download Now and Remove Download.
 The historical system runs in the repository archive observed that menu in an
 ordinary mapped synthetic folder and observed the File Provider pinned badge
@@ -285,7 +307,21 @@ claim that every filesystem attribute is supported by File Provider.
 
 A pin is a native
 content policy, separate from file bytes. Socket cancellation interrupts pending
-requests, and progress frames update `NSProgress`. The Rust side preserves the
+requests, and progress frames update `NSProgress`. File transfers report their
+direction, payload bytes, and available speed and time estimates. Preflight and
+verification traffic do not advance the file's payload counter. Reaching the
+payload size does not mark the operation complete until its final result is
+confirmed and a download has been handed to the system.
+
+The companion also publishes file progress for background Smart upload attempts
+after resolving the item's real user-visible URL through File Provider. Progress
+is removed on failure, cancellation, or a missing attempt; a new attempt gets a
+new progress object. Unknown lengths remain indeterminate. Finder controls the
+appearance of its progress indicators and the fields it displays; publication
+does not add a custom Finder column or guarantee a numeric percentage in every
+view.
+
+The Rust side preserves the
 record of already confirmed operations when a caller disconnects. The OS retains
 pending local changes when the provider reports errors and retries according to
 File Provider's synchronization rules.
@@ -295,7 +331,11 @@ File Provider's synchronization rules.
 Each Unix-socket connection sends one newline-delimited JSON request containing
 `v: 1`, `request_id`, `op`, and operation fields. Replies are `{ok:true,...}` or
 `{ok:false,error:{code,message}}`. Optional progress frames precede the final
-reply: `{progress:{completed,total}}`. The Rust service validates peer UID,
+reply: `{progress:{completed,total}}`, with optional transfer direction, speed,
+and estimated time. A null total means that the payload length is unknown. The
+local `transfer_status` request exposes scoped active and recent transfer
+attempts to the companion without waiting for a remote operation or index scan.
+The Rust service validates peer UID,
 socket/staging permissions, domain scope, revision guards, and local paths.
 The explicit development TCP variant uses the same framing, adds `auth_token`,
 and validates the fresh local IPC nonce before handling a request.

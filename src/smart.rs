@@ -653,6 +653,10 @@ impl Queue {
         })
     }
     pub(crate) fn cancel_stale_directory(&mut self, mutation: &Mutation) -> Result<Mutation> {
+        let current = self.get(&mutation.id)?;
+        if current.stale_directory_cancelled() {
+            return Ok(current);
+        }
         self.update(&mutation.id, |mutation| {
             mutation.state = MutationState::Cancelled;
             mutation.error = Some(STALE_DIRECTORY_CANCELLED.into());

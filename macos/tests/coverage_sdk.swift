@@ -31,6 +31,8 @@ private final class SDKManagerProxy: NSObject {
     let url:URL
     let enumerator=SDKEnumeratorProxy()
     var downloads=0;var evictions=0;var signals=0
+    var resolvedErrors:[NSError]=[]
+    var resolutionFailure:NSError?
     init(_ url:URL){self.url=url}
     @objc(enumeratorForMaterializedItems) func materialized()->AnyObject {enumerator}
     @objc(getUserVisibleURLForItemIdentifier:completionHandler:)
@@ -39,6 +41,8 @@ private final class SDKManagerProxy: NSObject {
     func evict(_ identifier:NSString,completion:@escaping(NSError?)->Void){evictions += 1;completion(nil)}
     @objc(signalEnumeratorForContainerItemIdentifier:completionHandler:)
     func signal(_ identifier:NSString,completion:@escaping(NSError?)->Void){signals += 1;completion(nil)}
+    @objc(signalErrorResolved:completionHandler:)
+    func resolved(_ error:NSError,completion:@escaping(NSError?)->Void){resolvedErrors.append(error);completion(resolutionFailure)}
     @objc(requestDownloadForItemWithIdentifier:requestedRange:completionHandler:)
     func download(_ identifier:NSString,range:NSRange,completion:@escaping(NSError?)->Void){downloads += 1;completion(nil)}
     @objc(temporaryDirectoryURLWithError:)
@@ -132,6 +136,14 @@ enum NativeSDKCoverageTests {
         native.getUserVisibleURL(for:providerID("sdk-item")){value,_ in url=value}
         native.signalEnumerator(for:.workingSet){_ in};native.requestDownloadForItem(withIdentifier:providerID("sdk-item")){_ in};native.evictItem(identifier:providerID("sdk-item")){_ in}
         try expect(url==paths.group && manager.signals==1 && manager.downloads==1 && manager.evictions==1,"Default manager adapter did not preserve SDK forwarding")
+        let resolvedError=NSError(domain:NSFileProviderErrorDomain,code:NSFileProviderError.cannotSynchronize.rawValue)
+        var resolutionReply:Error?
+        native.signalErrorResolved(resolvedError){resolutionReply=$0}
+        try expect(resolutionReply==nil && manager.resolvedErrors.last?.code==resolvedError.code,"Default manager did not forward the resolved error code")
+        manager.resolutionFailure=NSError(domain:"SyntheticResolution",code:17)
+        native.signalErrorResolved(resolvedError){resolutionReply=$0}
+        try expect((resolutionReply as NSError?)===manager.resolutionFailure,"Default manager hid the native resolution callback failure")
+        manager.resolutionFailure=nil
         let integration=NativeFinderIntegration.live
         integration.registerBadge("synthetic","icloud","Synthetic")
         integration.setRoots([paths.group]);integration.setBadge("cached",paths.group)

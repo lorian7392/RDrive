@@ -89,7 +89,7 @@ struct WireItem: Codable {
 }
 
 enum NativeSyncState: String, CaseIterable {
-    case online, cached, pinned, syncing, queued, conflict, error
+    case online, cached, pinned, syncing, queued, conflict, error, blocked
     var title: String {
         switch self {
         case .online: return "Online only"
@@ -99,6 +99,7 @@ enum NativeSyncState: String, CaseIterable {
         case .queued: return "Waiting to sync"
         case .conflict: return "Sync conflict"
         case .error: return "Needs attention"
+        case .blocked: return "Excluded by sync rules"
         }
     }
     var badgeType: String? {
@@ -107,7 +108,7 @@ enum NativeSyncState: String, CaseIterable {
         case .cached: return "com.apple.icon-decoration.badge.checkmark"
         case .pinned: return "com.apple.icon-decoration.badge.pinned"
         case .syncing: return "com.apple.icon-decoration.badge.syncing"
-        case .queued: return "com.apple.icon-decoration.badge.in-review"
+        case .queued, .blocked: return "com.apple.icon-decoration.badge.in-review"
         case .conflict, .error: return "com.apple.icon-decoration.badge.warning"
         }
     }
@@ -186,7 +187,7 @@ func remoteError(_ object: [String: Any]) -> NSError {
     case "not_authenticated": value = .notAuthenticated
     case "filename_collision": value = .filenameCollision
     case "sync_anchor_expired": value = .syncAnchorExpired
-    case "version_conflict": value = .cannotSynchronize
+    case "version_conflict", "excluded_by_filter": value = .cannotSynchronize
     case "insufficient_quota": value = .insufficientQuota
     case "directory_not_empty": value = .directoryNotEmpty
     case "deletion_rejected": value = .deletionRejected
@@ -196,17 +197,72 @@ func remoteError(_ object: [String: Any]) -> NSError {
         userInfo: [NSLocalizedDescriptionKey: message])
 }
 
+func configureFileProgress(_ progress: Progress, operation: Progress.FileOperationKind) {
+    progress.kind = .file
+    progress.fileOperationKind = operation
+    progress.totalUnitCount = -1
+    progress.completedUnitCount = 0
+    progress.isPausable = false
+    progress.setUserInfoObject(NSNumber(value: 1), forKey: .fileTotalCountKey)
+    progress.setUserInfoObject(NSNumber(value: 0), forKey: .fileCompletedCountKey)
+}
+
+/// A byte snapshot from the broker, never inferred from elapsed time or a
+/// materialized file's size. Unknown lengths remain indeterminate.
+struct NativeTransferSnapshot: Decodable {
+    let transfer_id: String
+    let id: String
+    let operation: String
+    let completed: UInt64
+    let total: UInt64?
+    let bytes_per_second: Double
+    let eta_seconds: Double?
+    let state: String
+    let background: Bool
+
+    static func decode(_ object: Any) throws -> NativeTransferSnapshot {
+        let value = try JSONDecoder().decode(Self.self, from: JSONSerialization.data(withJSONObject: object))
+        guard !value.transfer_id.isEmpty, !value.id.isEmpty,
+              ["upload", "download"].contains(value.operation),
+              ["transferring", "committing", "completed", "failed", "cancelled"].contains(value.state),
+              value.completed <= UInt64(Int64.max), value.total.map({ $0 <= UInt64(Int64.max) && value.completed <= $0 }) ?? true,
+              value.bytes_per_second.isFinite, value.bytes_per_second >= 0,
+              value.eta_seconds.map({ $0.isFinite && $0 >= 0 }) ?? true else {
+            throw NativeFailure.invalid("The backend returned invalid transfer progress.")
+        }
+        return value
+    }
+}
+
 final class SocketOperation: @unchecked Sendable {
-    private let lock = NSLock()
+    // Progress KVO observers may synchronously cancel this same operation.
+    private let lock = NSRecursiveLock()
     private var descriptor: Int32 = -1
     private var cancelled = false
+    private var finished = false
     private weak var progress: Progress?
 
     init(progress: Progress? = nil) { self.progress = progress }
-    func report(completed: Int64, total: Int64) {
-        guard total > 0, completed >= 0, completed <= total else { return }
-        progress?.totalUnitCount = total
-        progress?.completedUnitCount = completed
+    func report(completed: Int64, total: Int64?, bytesPerSecond: Double? = nil, etaSeconds: Double? = nil) {
+        guard completed >= 0, total == nil || (total! > 0 && completed <= total!) else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled, !finished, let progress = progress else { return }
+        progress.totalUnitCount = total ?? -1
+        // Transport consumption precedes remote confirmation and native file
+        // delivery. Only finishProgress marks the operation fully complete.
+        progress.completedUnitCount = total.map { min(completed, $0 - 1) } ?? completed
+        progress.setUserInfoObject(bytesPerSecond.flatMap { $0.isFinite && $0 >= 0 ? NSNumber(value: $0) : nil }, forKey: .throughputKey)
+        progress.setUserInfoObject(etaSeconds.flatMap { $0.isFinite && $0 >= 0 ? NSNumber(value: $0) : nil }, forKey: .estimatedTimeRemainingKey)
+    }
+    func finishProgress() {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled, !finished else { return }
+        finished = true
+        if let progress = progress {
+            if progress.totalUnitCount <= 0 { progress.totalUnitCount = 1 }
+            progress.completedUnitCount = progress.totalUnitCount
+            progress.setUserInfoObject(NSNumber(value: 1), forKey: .fileCompletedCountKey)
+        }
     }
 
     func attach(_ fd: Int32) throws {
@@ -253,7 +309,7 @@ final class BackendBridge: @unchecked Sendable {
         return (UInt16(number.intValue), token)
     }
 
-    func request(_ input: [String: Any], operation: SocketOperation? = nil) throws -> [String: Any] {
+    func request(_ input: [String: Any], operation: SocketOperation? = nil, reportsProgress: Bool = true) throws -> [String: Any] {
         try operation?.check()
         var request = input
         request["v"] = 1
@@ -317,9 +373,12 @@ final class BackendBridge: @unchecked Sendable {
                 guard let result = try JSONSerialization.jsonObject(with: frame) as? [String: Any] else { throw NativeFailure.invalid("Invalid backend response.") }
                 reply.removeSubrange(...newline)
                 scannedThrough = reply.startIndex
-                if let event = result["progress"] as? [String: Any],
-                   let completed = event["completed"] as? NSNumber, let total = event["total"] as? NSNumber {
-                    operation?.report(completed: completed.int64Value, total: total.int64Value)
+                if let event = result["progress"] as? [String: Any] {
+                    if reportsProgress, let completed = event["completed"] as? NSNumber {
+                        operation?.report(completed: completed.int64Value, total: (event["total"] as? NSNumber)?.int64Value,
+                            bytesPerSecond: (event["bytes_per_second"] as? NSNumber)?.doubleValue,
+                            etaSeconds: (event["eta_seconds"] as? NSNumber)?.doubleValue)
+                    }
                     continue
                 }
                 guard result["ok"] as? Bool == true else { throw remoteError(result["error"] as? [String: Any] ?? [:]) }
@@ -339,8 +398,8 @@ final class BackendBridge: @unchecked Sendable {
         return response
     }
 
-    func item(_ request: [String: Any], operation: SocketOperation? = nil) throws -> WireItem {
-        let result = try self.request(request, operation: operation)
+    func item(_ request: [String: Any], operation: SocketOperation? = nil, reportsProgress: Bool = false) throws -> WireItem {
+        let result = try self.request(request, operation: operation, reportsProgress: reportsProgress)
         guard let item = result["item"] else { throw NativeFailure.invalid("Backend omitted the item.") }
         return try WireItem.decode(item)
     }

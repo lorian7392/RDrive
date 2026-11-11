@@ -33,6 +33,10 @@ rdrive index refresh cloud-smart documents
 rdrive index refresh cloud-smart documents --recursive
 ```
 
+In Finder, select one Smart folder and choose **Refresh** from its context menu. Use the RDrive menu bar app's **Refresh Connection** menu to refresh a Smart domain's root. For a managed repository, use the root action to refresh its current snapshot.
+
+Finder and the CLI submit a request for the provider service to process in the background. A manual request bypasses the normal freshness interval. The service still respects synchronization filters, pause, and retry backoff. An ordinary folder refresh reads the metadata for its immediate children. Use the CLI's `--recursive` option when you need to scan a subtree.
+
 A recursive refresh can exceed the general prebuilding depth limit. Once the currently known subtree has been scanned, its one-time request is persistently marked complete. Running the command again creates a new request; ordinary browsing does not overwrite an unfinished manual refresh. Paths are relative to the domain root, and the target directory itself must already be indexed. If it is not, refresh the nearest known parent first. Omit the path, or use an empty path, for the root.
 
 `index status` works offline and reports policy plus item, directory, scanned-directory, and pending-directory counts for each domain. `pending` counts discovered directories not yet successfully scanned, including those blocked by depth policy, disabled prebuilding, or errors. It is not a count of active tasks. `queued` means only that a request was saved. Keep `provider serve` running to continue scanning; running `info` or mounting an ordinary native volume does not start this service.

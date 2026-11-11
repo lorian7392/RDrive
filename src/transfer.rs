@@ -285,6 +285,15 @@ impl TransferContext {
         self.shared.snapshot()
     }
 
+    pub(crate) fn scope_label(&self) -> Option<&str> { self.scope.as_deref() }
+
+    /// Select before cloning paths and computing rates. Finder polls only its
+    /// own payload operation rather than copying the process-wide history.
+    pub(crate) fn scoped_jobs(&self) -> Vec<JobProgress> {
+        self.shared.jobs.lock().map(|jobs| jobs.values()
+            .filter(|job| job.label == self.scope).map(|job| job.snapshot()).collect()).unwrap_or_default()
+    }
+
     /// Keep protocol blocks within the limiter's burst allowance. This avoids
     /// a low configured rate accumulating a large credit before one large I/O.
     pub fn chunk_size(&self, maximum: usize) -> usize {

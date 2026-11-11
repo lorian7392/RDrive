@@ -367,6 +367,55 @@ def run(binary, output=None):
             assert old["folder/remove.txt"]["id"] in main.ok(op="changes", anchor=anchor)["deleted"]
             passed("manual targeted refresh applies create/delete/modify atomically and preserves stable sibling identities")
 
+            main.cli("index", "config", "--disable", "--refresh-seconds", "3600", "--active-refresh-seconds", "3600")
+            direct = remote / "folder/finder-refresh.txt"
+            descendant = remote / "folder/nested/finder-unrequested.txt"
+            direct.write_bytes(b"metadata only")
+            descendant.write_bytes(b"outside the requested scope")
+            before = IndexedDav.directory_requests.copy()
+            request_offset = len(IndexedDav.requests_seen)
+            completed = read_provider_journal(main.home, main.domain).get("completed_demands", {})
+            finder_folder_key = f"finder:{folder['id']}"
+            file_error = main.rpc(op="refresh_index", id=changed_rows["folder/stable.txt"]["id"])
+            assert not file_error["ok"] and "index refresh requires a directory" in file_error["error"]["message"], file_error
+            missing = main.rpc(op="refresh_index", id="not-a-catalog-item")
+            assert not missing["ok"] and missing["error"]["code"] == "no_such_item", missing
+            assert "directory is not indexed" in missing["error"]["message"], missing
+
+            finder_gate = dict(entered=threading.Event(), release=threading.Event())
+            with IndexedDav.guard:
+                IndexedDav.gates["/dav/folder"] = finder_gate
+            try:
+                queued = main.ok(op="refresh_index", id=folder["id"])
+                assert queued["queued"] and not queued["completed"] and not queued["recursive"], queued
+                assert queued["domain"] == main.domain and queued["remote"] == "folder", queued
+                assert finder_gate["entered"].wait(25), "manual refresh did not bypass the fresh directory TTL"
+                assert "folder/finder-refresh.txt" not in sqlite_items(main.home, main.domain)
+            finally:
+                finder_gate["release"].set()
+
+            def finder_refresh_completed():
+                journal = read_provider_journal(main.home, main.domain)
+                return journal.get("completed_demands", {}).get(finder_folder_key, 0) > completed.get(finder_folder_key, 0)
+            wait(finder_refresh_completed, "durable Finder directory refresh completion", 30)
+            refreshed = sqlite_items(main.home, main.domain)
+            assert "folder/finder-refresh.txt" in refreshed
+            assert "folder/nested/finder-unrequested.txt" not in refreshed
+            assert "sibling/unrequested.txt" not in refreshed
+            assert IndexedDav.directory_requests - before == Counter({"/dav/folder": 1})
+
+            root_file = remote / "finder-root.txt"
+            root_file.write_bytes(b"root metadata only")
+            queued = main.ok(op="refresh_index", id="root")
+            assert queued["queued"] and queued["remote"] == "" and not queued["recursive"], queued
+            wait(lambda: read_provider_journal(main.home, main.domain).get("completed_demands", {}).get("finder:root", 0) > completed.get("finder:root", 0), "Finder root refresh", 30)
+            assert "finder-root.txt" in sqlite_items(main.home, main.domain)
+            assert IndexedDav.directory_requests - before == Counter({"/dav/folder": 1, "/dav": 1})
+            assert not [path for method, path in IndexedDav.requests_seen[request_offset:] if method == "GET"]
+            descendant.unlink()
+            main.cli("index", "config", "--enable", "--refresh-seconds", "120", "--active-refresh-seconds", "60")
+            passed("Finder refresh queues only the selected directory or root despite a fresh TTL and disabled background indexing")
+
             kept_id = changed_rows["folder/nested/kept.txt"]["id"]
             IndexedDav.failed.add("/dav/folder/nested")
             failures_before = IndexedDav.directory_requests["/dav/folder/nested"]
@@ -381,16 +430,30 @@ def run(binary, output=None):
             passed("errored listings preserve known descendants; only a later successful empty scope removes them")
 
             main.cli("index", "config", "--depth", "0")
-            (remote / "manual-recursive/one").mkdir(parents=True)
+            (remote / "manual-recursive/one/deep").mkdir(parents=True)
             (remote / "manual-recursive/one/leaf.txt").write_bytes(b"manual subtree")
+            (remote / "manual-recursive/one/deep/extra.txt").write_bytes(b"queued recursion continues")
             main.cli("index", "refresh", main.domain)
             wait(lambda: "manual-recursive" in sqlite_items(main.home, main.domain), "depth-zero root update", 25)
             time.sleep(3.5)
             assert "/dav/manual-recursive" not in IndexedDav.directory_requests, "depth-zero preindex entered a child"
-            main.cli("index", "refresh", main.domain, "manual-recursive", "--recursive")
-            wait(lambda: "manual-recursive/one/leaf.txt" in sqlite_items(main.home, main.domain), "manual recursive subtree refresh", 45)
             manual_id = sqlite_items(main.home, main.domain)["manual-recursive"]["id"]
-            wait(lambda: manual_id in read_provider_journal(main.home, main.domain).get("completed_demands", {}), "durable completion of one-shot recursive demand", 15)
+            recursive_gate = dict(entered=threading.Event(), release=threading.Event())
+            with IndexedDav.guard:
+                IndexedDav.gates["/dav/manual-recursive/one"] = recursive_gate
+            try:
+                main.cli("index", "refresh", main.domain, "manual-recursive", "--recursive")
+                assert recursive_gate["entered"].wait(30), "recursive refresh did not reach its child"
+                queued = main.ok(op="refresh_index", id=manual_id)
+                assert queued["queued"] and not queued["recursive"], queued
+            finally:
+                recursive_gate["release"].set()
+            wait(lambda: "manual-recursive/one/deep/extra.txt" in sqlite_items(main.home, main.domain), "recursive demand continues after Finder refresh", 45)
+            def both_demands_completed():
+                completed = read_provider_journal(main.home, main.domain).get("completed_demands", {})
+                return {manual_id, f"finder:{manual_id}"} <= set(completed)
+            wait(both_demands_completed, "distinct durable completion of CLI and Finder demands", 15)
+            passed("Finder refresh of a directory leaves the CLI's queued recursive refresh active")
             main.cli("index", "config", "--active-refresh-seconds", "1")
             (remote / "manual-recursive/late/deep").mkdir(parents=True)
             (remote / "manual-recursive/late/deep/future.txt").write_bytes(b"future subtree")

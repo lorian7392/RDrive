@@ -274,7 +274,7 @@ mod coverage_tests {
     #[tokio::test]
     async fn history_failure_after_confirmed_upload_keeps_the_completed_receipt() {
         let temp = tempfile::tempdir().unwrap(); let mut store = Store::open(temp.path().join("state")).unwrap();
-        store.config.profiles.insert("test".into(), Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: None, password_env: None, allow_http: false, timeout_secs: 10, smb_encryption: true, nextcloud_upload_url: None });
+        store.config.profiles.insert("test".into(), Profile { protocol: Protocol::Webdav, url: "https://example.invalid/".into(), username: None, password_env: None, allow_http: false, timeout_secs: 10, smb_encryption: true, keychain_internet:false,nextcloud_upload_url: None });
         let source = temp.path().join("source"); fs::write(&source, b"payload").unwrap();
         let job = enqueue(&mut store, "test", &source, "remote", false, None, false).unwrap(); let backend = ConfirmedUpload(0.into());
         let failure = run_job_with_event(&mut store, &backend, &job.id, |_, operation, profile, path, _| {

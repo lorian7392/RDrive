@@ -1,6 +1,6 @@
 # Version tags and releases
 
-RDrive uses `v<version>` Git tags, such as `v0.8.2`, for source versions. The tag must exactly match `package.version` in `Cargo.toml`, the compiled CLI's `--version`, and the optional native host and extension bundle versions.
+RDrive uses `v<version>` Git tags, such as `v0.8.3`, for source versions. The tag must exactly match `package.version` in `Cargo.toml`, the compiled CLI's `--version`, and the optional native host and extension bundle versions.
 
 Starting with `v0.8.2`, the Release workflow publishes the standalone Apple Silicon CLI to GitHub Releases after Build and Checks pass on the tagged source. CI builds the native companion with ad-hoc signing for verification. Native companion distribution is a separate process.
 
@@ -22,16 +22,16 @@ The Release workflow publishes `rdrive-macos-arm64`, `SHA256SUMS`, and `install.
 3. Push the version commit to `main` and wait for both **Build** and **Checks** to pass for that exact commit.
 4. Create and push an annotated version tag. Never move a published version tag to a different commit; publish a new version for a correction.
 
-For version `0.8.2`:
+For version `0.8.3`:
 
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.8.2 -m "RDrive 0.8.2"
-git push origin refs/tags/v0.8.2
+git tag -a v0.8.3 -m "RDrive 0.8.3"
+git push origin refs/tags/v0.8.3
 ```
 
-Use `git tag -s` instead of `git tag -a` when a signing key is configured. Replace the example version for later releases. A tag push runs the release checks again on the tagged source. A tag such as `v0.8.3` on source that still declares `0.8.2` fails version validation.
+Use `git tag -s` instead of `git tag -a` when a signing key is configured. Replace the example version for later releases. A tag push runs the release checks again on the tagged source. A tag such as `v0.8.4` on source that still declares `0.8.3` fails version validation.
 
 ## Check a build locally
 
@@ -41,7 +41,7 @@ python3 macos/build.py --cli target/release/rdrive --output target/native-versio
 python3 tests/check_version.py \
   --binary target/release/rdrive \
   --app target/native-version-check/RDrive.app \
-  --tag v0.8.2 \
+  --tag v0.8.3 \
   --output target/version-report.json
 python3 -m unittest discover -s tests -p 'test_version.py' -v
 ```

@@ -272,9 +272,12 @@ impl SmbFile {
         Ok(slot.as_ref().unwrap().clone())
     }
     async fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<usize> {
+        self.read_at_metered(buffer,offset,None).await
+    }
+    async fn read_at_metered(&self, buffer: &mut [u8], offset: u64, payload: Option<&Transfer>) -> Result<usize> {
         let limit = self.context.chunk_size(buffer.len());
         let buffer = &mut buffer[..limit];
-        let transfer = self.meter(false)?;
+        let transfer = match payload {Some(transfer)=>transfer.clone(),None=>self.meter(false)?};
         transfer.acquire(buffer.len()).await?;
         match self.driver.read(&self.raw, buffer, offset).await {
             Ok(count) => {
@@ -282,7 +285,9 @@ impl SmbFile {
                 Ok(count)
             }
             Err(error) => {
-                transfer.fail(&error.to_string());
+                // A primary download keeps its meter across a protected reopen.
+                // The outer copy marks failure only after retries are exhausted.
+                if payload.is_none() { transfer.fail(&error.to_string()); }
                 Err(error.into())
             }
         }
@@ -784,8 +789,14 @@ impl Smb {
         offset: u64,
         recoveries: &mut u8,
     ) -> Result<usize> {
+        self.read_download_chunk_metered(path,source,expected,buffer,offset,recoveries,None).await
+    }
+    async fn read_download_chunk_metered(
+        &self, path: &str, source: &mut SmbFile, expected: &Entry,
+        buffer: &mut [u8], offset: u64, recoveries: &mut u8, payload: Option<&Transfer>,
+    ) -> Result<usize> {
         loop {
-            match source.read_at(buffer, offset).await {
+            match source.read_at_metered(buffer, offset, payload).await {
                 Ok(count) => return Ok(count),
                 Err(error) if *recoveries < 3 && reconnectable(&error) => {
                     *recoveries += 1;
@@ -1865,6 +1876,8 @@ impl Backend for Smb {
                     prefix += count as u64;
                 }
                 output.seek(SeekFrom::Start(offset)).await?;
+                let payload=self.transfer.start("download",&remote,Some(expected.size),offset)?;
+                let copied=async {
                 let mut position = offset;
                 #[cfg(test)]
                 let mut first_network_block = true;
@@ -1873,13 +1886,14 @@ impl Backend for Smb {
                     .await;
                 while position < expected.size {
                     let count = self
-                        .read_download_chunk(
+                        .read_download_chunk_metered(
                             &remote,
                             &mut source,
                             expected,
                             &mut buffer[..CHUNK.min((expected.size - position) as usize)],
                             position,
                             &mut recoveries,
+                            Some(&payload),
                         )
                         .await?;
                     if count == 0 {
@@ -1895,7 +1909,11 @@ impl Backend for Smb {
                             .await;
                     }
                 }
-                Ok(())
+                output.sync_all().await?;
+                Ok::<_,anyhow::Error>(())
+                }.await;
+                match &copied {Ok(())=>payload.finish(),Err(error)=>payload.fail(&error.to_string())}
+                copied
             }
             .await;
             finish(
@@ -2757,6 +2775,21 @@ async fn write_all_at(file: &dyn PayloadIo, bytes: &[u8], offset: u64) -> Result
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn imported_internet_keychain_profile_cannot_connect_anonymously_on_other_platforms() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "protocol": "smb", "url": "smb://127.0.0.1:1/share", "username": null,
+            "password_env": null, "keychain_internet": true, "timeout_secs": 1
+        })).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1),
+            crate::factory::connect(&profile, "imported-finder", TransferContext::default()))
+            .await.expect("unsupported credential sources must fail before an SMB connection")
+            .err().expect("an imported Keychain profile must not become an anonymous connection");
+        assert_eq!(error.to_string(), "Internet Keychain credentials are available only on macOS");
+    }
+
     fn strong_entry(path: &str) -> Entry {
         Entry { path: path.into(), is_dir: false, size: 3, modified: Some(1), etag: Some(revision_token(&"a".repeat(64), &FileIdInformation { volume_serial_number: 42, file_id: 7 })) }
     }
@@ -3241,6 +3274,7 @@ mod tests {
             allow_http: false,
             timeout_secs: 15,
             smb_encryption: true,
+            keychain_internet: false,
             nextcloud_upload_url: None,
         }
     }

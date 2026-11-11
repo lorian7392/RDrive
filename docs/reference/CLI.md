@@ -41,8 +41,10 @@ automatically, so it is not expanded again below. Trailing arguments to
 
 ## Global options and execution constraints
 
-- `--home PATH` overrides `RDRIVE_HOME`; otherwise the default is
-  `~/Library/Application Support/rdrive`. Each state directory is independent.
+- State selection follows `--home PATH`, then `RDRIVE_HOME`, then the optional
+  private `~/Library/Application Support/rdrive/shared-home.json` reference,
+  then `~/Library/Application Support/rdrive`. The reference points to an
+  existing Finder state directory; it contains no profiles or credentials.
 - `--json` changes structured results and the usual runtime-error format; it
   does not change file-content encoding.
 - `--limit BYTES_PER_SECOND` is a positive integer payload-rate limit shared by
@@ -72,7 +74,9 @@ list every positional argument and option.
   greater than `0`. WebDAV requires HTTPS unless `--allow-http` is given. SMB
   requires encryption unless `--allow-unencrypted-smb` explicitly disables it.
   URLs cannot contain credentials, queries, or fragments. `--nextcloud-upload-url`
-  applies only to same-origin WebDAV. See [Configuration](CONFIGURATION.md) for
+  applies only to same-origin WebDAV. `--keychain-internet` reads an existing
+  macOS Internet Keychain item for the URL host and username; it cannot be
+  combined with `--password-env`. See [Configuration](CONFIGURATION.md) for
   credential handling.
 - `get`, `cache get`, `repo get`, and `smart export` preserve existing local
   files by default; `put`, `cp`, and `mv` preserve existing remote destinations.
@@ -171,6 +175,7 @@ to avoid relying on implementation-branch precedence between multiple actions.
 - `--domain-root DOMAIN` queries the domain's user-visible root path.
 - `--resolve-file PATH` resolves a system-visible file path to a domain and item ID.
 - `--signal DOMAIN` requests a working-set enumerator refresh.
+- `--retry-sync DOMAIN` asks macOS to retry requests held by connection or synchronization errors in the registered domain, preserving RDrive's original queue and revision checks.
 - `--download DOMAIN ITEM_ID` requests system content download; it does not
   change the offline-pinning policy.
 - `--evict DOMAIN ITEM_ID` requests system eviction, subject to system protection
@@ -201,7 +206,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.2`: **116 command entries** (including groups, excluding the root and automatic `help`), **101 executable leaf commands**, and **822 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.3`: **116 command entries** (including groups, excluding the root and automatic `help`), **101 executable leaf commands**, and **823 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -449,10 +454,12 @@ Options:
 
       --progress <PROGRESS>
           Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
-      --allow-http
-
       --jobs <JOBS>
           Concurrent queue targets. Jobs for the same target retain order [default: 4]
+      --keychain-internet
+          Reuse the matching Internet Password in macOS Keychain
+      --allow-http
+
       --allow-unencrypted-smb
           Permit SMB without encryption (for trusted compatibility testing)
       --timeout <TIMEOUT>

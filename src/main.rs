@@ -443,6 +443,9 @@ enum ProfileCommand {
         username: Option<String>,
         #[arg(long)]
         password_env: Option<String>,
+        /// Reuse the matching Internet Password in macOS Keychain.
+        #[arg(long, conflicts_with = "password_env")]
+        keychain_internet: bool,
         #[arg(long)]
         allow_http: bool,
         /// Permit SMB without encryption (for trusted compatibility testing).
@@ -569,12 +572,15 @@ fn require_guarded_edit(conditional_write: bool) -> Result<()> {
     Ok(())
 }
 fn profile(store: &Store, name: &str) -> Result<Profile> {
-    store
-        .config
+    configured_profile(&store.config, &store.home, name)
+}
+fn configured_profile(config: &config::Config, home: &Path, name: &str) -> Result<Profile> {
+    config
         .profiles
         .get(name)
         .cloned()
-        .with_context(|| format!("unknown profile {name}"))
+        .with_context(|| format!("unknown profile {name} in {}; available profiles: [{}]; run rdrive profile list",
+            home.display(), config.profiles.keys().map(String::as_str).collect::<Vec<_>>().join(", ")))
 }
 fn smart_queue(store:&Store,id:&str)->Result<rdrive::smart::Queue>{
     let domain=rdrive::provider::domains(&store.home)?.into_iter().find(|domain|domain.id==id&&domain.smart).context("Smart domain not found")?;
@@ -582,6 +588,41 @@ fn smart_queue(store:&Store,id:&str)->Result<rdrive::smart::Queue>{
 }
 async fn connect(store: &Store, name: &str) -> Result<Arc<dyn Backend>> {
     rdrive::factory::connect(&profile(store,name)?,name,rdrive::transfer::global()).await
+}
+
+async fn read_connection(home: &Path, name: &str) -> Result<Arc<dyn Backend>> {
+    let config = rdrive::client_read::config(home)?;
+    rdrive::factory::connect(&configured_profile(&config, home, name)?, name, rdrive::transfer::global()).await
+}
+
+/// Read-only remote operations use one configuration snapshot. They never open
+/// Store's writer lock or recover its unrelated upload/cache journals.
+async fn read_command(cli: &Cli, home: &Path) -> Result<Option<serde_json::Value>> {
+    let value = match &cli.command {
+        Command::Profile { command: ProfileCommand::List } => {
+            serde_json::to_value(rdrive::client_read::config(home)?.profiles)?
+        }
+        Command::Info { profile } => {
+            let backend = read_connection(home, profile).await?;
+            let root = backend.stat("").await?;
+            serde_json::json!({"capabilities":backend.capabilities(),"root":root,"diagnostics":backend.diagnostics()})
+        }
+        Command::Ls { profile, remote, recursive, contains } => {
+            let remote = path(remote)?;
+            let backend = read_connection(home, profile).await?;
+            let mut entries = if *recursive { backend::walk(backend.as_ref(), &remote).await? }
+                else { backend.list(&remote).await? };
+            if let Some(filter) = contains { entries.retain(|entry| entry.path.contains(filter)); }
+            serde_json::to_value(entries)?
+        }
+        Command::Stat { profile, remote } => {
+            let remote = path(remote)?;
+            let backend = read_connection(home, profile).await?;
+            serde_json::to_value(backend.stat(&remote).await?)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
 }
 fn sync_options(direction: SyncDirection, apply: bool, delete: bool) -> sync::SyncOptions {
     sync::SyncOptions {
@@ -843,6 +884,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                     url,
                     username,
                     password_env,
+                    keychain_internet,
                     allow_http,
                     allow_unencrypted_smb,
                     timeout,
@@ -872,6 +914,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                         url: url.clone(),
                         username: username.clone(),
                         password_env: password_env.clone(),
+                        keychain_internet: *keychain_internet,
                         allow_http: *allow_http,
                         timeout_secs: *timeout,
                         smb_encryption: !*allow_unencrypted_smb,
@@ -900,38 +943,8 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 }
             }
         }
-        Command::Info { profile: name } => {
-            let b = connect(store, name).await?;
-            let root = b.stat("").await?;
-            emit(
-                json,
-                &serde_json::json!({"capabilities":b.capabilities(),"root":root,"diagnostics":b.diagnostics()}),
-            )?;
-        }
-        Command::Ls {
-            profile: name,
-            remote,
-            recursive,
-            contains,
-        } => {
-            let b = connect(store, name).await?;
-            let remote = path(remote)?;
-            let mut entries = if *recursive {
-                backend::walk(b.as_ref(), &remote).await?
-            } else {
-                b.list(&remote).await?
-            };
-            if let Some(filter) = contains {
-                entries.retain(|e| e.path.contains(filter));
-            }
-            emit(json, &entries)?;
-        }
-        Command::Stat {
-            profile: name,
-            remote,
-        } => {
-            let b = connect(store, name).await?;
-            emit(json, &b.stat(&path(remote)?).await?)?;
+        Command::Info { .. } | Command::Ls { .. } | Command::Stat { .. } => {
+            emit(json, &read_command(cli, &store.home).await?)?;
         }
         Command::Get {
             profile: name,
@@ -1389,7 +1402,8 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
     if let Command::Update { apply } = &cli.command {
         return emit(cli.json, &rdrive::update::run(*apply).await?);
     }
-    let home = cli.home.clone().unwrap_or_else(config::default_home);
+    let home = rdrive::shared_home::resolve(cli.home.as_deref())?;
+    if let Some(value) = read_command(cli, &home).await? { return emit(cli.json, &value); }
     match &cli.command {
         Command::Service {command} => {
             use rdrive::service::{self,ServiceAction};
@@ -1476,11 +1490,11 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
                 return emit(cli.json, &(native.plan)(&p, local, &options)?);
             }
             let credential = if matches!(p.protocol, Protocol::Webdav)
-                && (p.username.is_some() || p.password_env.is_some())
+                && (p.username.is_some() || p.password_env.is_some() || p.keychain_internet)
             {
                 match (native.password)(&p, name) {
                     Ok(value) => Some(value),
-                    Err(e) if p.password_env.is_some() => return Err(e),
+                    Err(e) if p.password_env.is_some() || p.keychain_internet => return Err(e),
                     Err(_) => None,
                 }
             } else {
@@ -1869,8 +1883,14 @@ mod cli_contract {
             ("smb",Protocol::Smb,Some("smb"),None),
         ] {
             let url=if matches!(protocol,Protocol::Smb){"smb://fixture/share"}else{"https://fixture.invalid/root/"};
-            store.config.profiles.insert(name.into(),Profile{protocol,url:url.into(),username:username.map(str::to_owned),password_env:environment.map(str::to_owned),allow_http:false,timeout_secs:5,smb_encryption:true,nextcloud_upload_url:None});
+            store.config.profiles.insert(name.into(),Profile{protocol,url:url.into(),username:username.map(str::to_owned),password_env:environment.map(str::to_owned),keychain_internet:false,allow_http:false,timeout_secs:5,smb_encryption:true,nextcloud_upload_url:None});
         }
+        let mut internet = store.config.profiles["credential"].clone();
+        internet.password_env = None;
+        internet.keychain_internet = true;
+        store.config.profiles.insert("internet".into(), internet.clone());
+        internet.username = None;
+        store.config.profiles.insert("internet-failure".into(), internet);
         store.save_config().unwrap(); drop(store);
         let native=NativeCalls {
             password: |_,name| if name.ends_with("failure"){bail!("synthetic credential lookup failed")}else{Ok("mock credential".into())},
@@ -1884,16 +1904,183 @@ mod cli_contract {
             list: || Ok(vec![mounted(std::path::Path::new("/synthetic/fixture"))]),
             unmount: |path,force| { assert!(force); Ok(mounted(path)) },
         };
-        for name in ["credential","keychain-failure","anonymous","smb"] {
+        for name in ["credential","internet","keychain-failure","anonymous","smb"] {
             let args: Vec<String>=vec!["rdrive".into(),"--home".into(),home.to_string_lossy().into(),"--json".into(),"mount".into(),name.into(),point.to_string_lossy().into(),"--read-only".into(),"--browse".into(),"--no-prompt".into()];
             run_with_native(&Cli::try_parse_from(args).unwrap(),&native).await.unwrap();
-            assert_eq!(std::fs::read_to_string(point.join("observed")).unwrap(),if name=="keychain-failure"{"keychain-failure"}else{name});
+            assert_eq!(std::fs::read_to_string(point.join("observed")).unwrap(),if name=="internet"{"credential"}else{name});
         }
         let input=Cli::try_parse_from(["rdrive","--home",home.to_str().unwrap(),"mount","env-failure",point.to_str().unwrap(),"--no-prompt"]).unwrap();
+        assert!(run_with_native(&input,&native).await.unwrap_err().to_string().contains("synthetic credential"));
+        let input=Cli::try_parse_from(["rdrive","--home",home.to_str().unwrap(),"mount","internet-failure",point.to_str().unwrap(),"--no-prompt"]).unwrap();
         assert!(run_with_native(&input,&native).await.unwrap_err().to_string().contains("synthetic credential"));
         for args in [vec!["mounts"],vec!["unmount",point.to_str().unwrap(),"--force"],vec!["mount","credential",point.to_str().unwrap(),"--dry-run"]] {
             let mut arguments=vec!["rdrive","--home",home.to_str().unwrap(),"--json"]; arguments.extend(args);
             run_with_native(&Cli::try_parse_from(arguments).unwrap(),&native).await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod readonly_connection_tests {
+    use super::*;
+    use std::{io::{Read, Write}, net::{TcpListener, TcpStream}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, thread};
+
+    struct Dav {
+        address: std::net::SocketAddr,
+        fresh: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<String>>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Dav {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let fresh = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (available, stopping, requests) = (fresh.clone(), stop.clone(), seen.clone());
+            let thread = thread::spawn(move || {
+                for connection in listener.incoming() {
+                    let mut connection = connection.unwrap();
+                    if stopping.load(Ordering::SeqCst) { break; }
+                    connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let headers_end = loop {
+                        let mut buffer = [0; 4096];
+                        let count = connection.read(&mut buffer).unwrap();
+                        assert_ne!(count, 0, "request ended before headers");
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break position + 4; }
+                    };
+                    let headers = String::from_utf8(bytes[..headers_end].to_vec()).unwrap();
+                    let length = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                    while bytes.len() < headers_end + length {
+                        let mut buffer = [0; 4096];
+                        let count = connection.read(&mut buffer).unwrap();
+                        assert_ne!(count, 0);
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    let request = headers.lines().next().unwrap().to_owned();
+                    requests.lock().unwrap().push(request.clone());
+                    assert!(request.starts_with("PROPFIND "), "unexpected mutation request: {request}");
+                    assert!(headers.lines().any(|line| line.eq_ignore_ascii_case("authorization: Basic dXNlcjpmaXh0dXJlLXBhc3N3b3Jk")));
+                    let target = request.split_whitespace().nth(1).unwrap();
+                    let depth_one = headers.lines().any(|line| line.eq_ignore_ascii_case("depth: 1"));
+                    let mut rows = match target {
+                        "/dav/" => vec![("", true, 0)],
+                        "/dav/folder/" | "/dav/folder" => vec![("folder/", true, 0)],
+                        "/dav/fresh.txt" if available.load(Ordering::SeqCst) => vec![("fresh.txt", false, 9)],
+                        _ => Vec::new(),
+                    };
+                    if depth_one && target == "/dav/" {
+                        rows.extend([("folder/", true, 0), ("old.txt", false, 3)]);
+                        if available.load(Ordering::SeqCst) { rows.push(("fresh.txt", false, 9)); }
+                    } else if depth_one && target.trim_end_matches('/') == "/dav/folder" {
+                        rows.push(("folder/fresh-child.txt", false, 12));
+                    }
+                    let status = if rows.is_empty() { "404 Not Found" } else { "207 Multi-Status" };
+                    let body = format!("<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\">{}</d:multistatus>", rows.into_iter().map(|(name, directory, size)| format!("<d:response><d:href>/dav/{name}</d:href><d:propstat><d:prop><d:resourcetype>{}</d:resourcetype><d:getcontentlength>{size}</d:getcontentlength><d:getetag>\"live\"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>", if directory { "<d:collection/>" } else { "" })).collect::<String>());
+                    write!(connection, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            Self { address, fresh, stop, seen, thread: Some(thread) }
+        }
+    }
+    impl Drop for Dav {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            TcpStream::connect(self.address).unwrap();
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    struct Environment(Option<std::ffi::OsString>);
+    impl Environment {
+        fn fixture() -> Self {
+            let old = std::env::var_os("RDRIVE_READONLY_FIXTURE_PASSWORD");
+            std::env::set_var("RDRIVE_READONLY_FIXTURE_PASSWORD", "fixture-password");
+            Self(old)
+        }
+    }
+    impl Drop for Environment {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("RDRIVE_READONLY_FIXTURE_PASSWORD", value),
+                None => std::env::remove_var("RDRIVE_READONLY_FIXTURE_PASSWORD"),
+            }
+        }
+    }
+    fn cli(home: &Path, arguments: &[&str]) -> Cli {
+        let mut values = vec!["rdrive", "--json", "--home", home.to_str().unwrap()];
+        values.extend_from_slice(arguments);
+        Cli::try_parse_from(values).unwrap()
+    }
+    fn names(home: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+        std::fs::read_dir(home).unwrap().map(|row| row.unwrap().file_name()).collect()
+    }
+
+    #[tokio::test]
+    async fn remote_reads_use_live_shared_profiles_without_taking_or_recovering_store() {
+        let _environment = Environment::fixture();
+        let dav = Dav::start();
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("state");
+        let mut store = Store::open(home.clone()).unwrap();
+        store.config.profiles.insert("pan123".into(), Profile {
+            protocol: Protocol::Webdav, url: format!("http://{}/dav/", dav.address), username: Some("user".into()),
+            password_env: Some("RDRIVE_READONLY_FIXTURE_PASSWORD".into()), keychain_internet: false,
+            allow_http: true, timeout_secs: 5, smb_encryption: true, nextcloud_upload_url: None,
+        });
+        store.config.filters.exclude.push("fresh*".into());
+        store.save_config().unwrap();
+        std::fs::write(home.join("state.json"), b"unrelated interrupted writer ledger").unwrap();
+        let before = (std::fs::read(home.join("config.json")).unwrap(), std::fs::read(home.join("state.json")).unwrap(), names(&home));
+        let first = read_command(&cli(&home, &["ls", "pan123"]), &home).await.unwrap().unwrap();
+        assert_eq!(first.as_array().unwrap().len(), 2);
+        dav.fresh.store(true, Ordering::SeqCst);
+        let fresh = read_command(&cli(&home, &["ls", "pan123", "--contains", "fresh"]), &home).await.unwrap().unwrap();
+        assert_eq!(fresh.as_array().unwrap().len(), 1);
+        assert_eq!(fresh[0]["path"], "fresh.txt");
+        let recursive = read_command(&cli(&home, &["ls", "pan123", "--recursive", "--contains", "fresh"]), &home).await.unwrap().unwrap();
+        assert_eq!(recursive.as_array().unwrap().len(), 2);
+        assert!(recursive.as_array().unwrap().iter().any(|item| item["path"] == "folder/fresh-child.txt"));
+        let stat = read_command(&cli(&home, &["stat", "pan123", "fresh.txt"]), &home).await.unwrap().unwrap();
+        assert_eq!(stat["size"], 9);
+        let info = read_command(&cli(&home, &["info", "pan123"]), &home).await.unwrap().unwrap();
+        assert_eq!(info["root"]["is_dir"], true);
+        assert!(info["capabilities"].is_object());
+        assert!(info["diagnostics"].is_object());
+        let profiles = read_command(&cli(&home, &["profile", "list"]), &home).await.unwrap().unwrap();
+        assert_eq!(profiles["pan123"]["url"], store.config.profiles["pan123"].url);
+        for arguments in [vec!["ls", "pan123"], vec!["stat", "pan123", "fresh.txt"], vec!["info", "pan123"], vec!["profile", "list"]] {
+            let command = cli(&home, &arguments);
+            run_with_native(&command, &NativeCalls::default()).await.unwrap();
+            execute(&command, &mut store).await.unwrap();
+        }
+        let unknown = read_command(&cli(&home, &["ls", "dav"]), &home).await.unwrap_err().to_string();
+        assert!(unknown.contains("unknown profile dav") && unknown.contains("pan123") && unknown.contains(home.to_str().unwrap()));
+        let missing = read_command(&cli(&home, &["stat", "pan123", "missing.txt"]), &home).await.unwrap().unwrap();
+        assert_eq!(missing, serde_json::Value::Null);
+        for arguments in [vec!["ls", "pan123", "../invalid"], vec!["stat", "pan123", "../invalid"], vec!["ls", "pan123", "missing"]] {
+            assert!(read_command(&cli(&home, &arguments), &home).await.is_err(), "{arguments:?}");
+        }
+        assert!(read_command(&cli(&home, &["cache", "list", "pan123"]), &home).await.unwrap().is_none());
+        assert_eq!((std::fs::read(home.join("config.json")).unwrap(), std::fs::read(home.join("state.json")).unwrap(), names(&home)), before);
+        assert!(Store::open(home.clone()).err().unwrap().to_string().contains("another rdrive process"));
+        assert!(dav.seen.lock().unwrap().iter().any(|request| request.contains("/dav/folder/")));
+        let absent = temporary.path().join("absent");
+        assert_eq!(read_command(&cli(&absent, &["profile", "list"]), &absent).await.unwrap().unwrap(), serde_json::json!({}));
+        assert!(!absent.exists());
+    }
+
+    #[tokio::test]
+    async fn profile_add_explicit_internet_keychain_source_is_persisted_and_exclusive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("state");
+        let mut store = Store::open(home.clone()).unwrap();
+        execute(&cli(&home, &["profile", "add", "existing", "--protocol", "webdav", "--url", "https://example.invalid/dav/", "--username", "user", "--keychain-internet"]), &mut store).await.unwrap();
+        assert!(store.config.profiles["existing"].keychain_internet);
+        assert!(rdrive::client_read::config(&home).unwrap().profiles["existing"].keychain_internet);
+        assert!(Cli::try_parse_from(["rdrive", "profile", "add", "invalid", "--protocol", "webdav", "--url", "https://example.invalid/dav/", "--keychain-internet", "--password-env", "PASSWORD"]).is_err());
     }
 }

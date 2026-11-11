@@ -1886,6 +1886,7 @@ mod tests {
             allow_http: true,
             timeout_secs: 5,
             smb_encryption: true,
+            keychain_internet: false,
             nextcloud_upload_url: None,
         }
     }

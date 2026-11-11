@@ -226,6 +226,25 @@ async fn weak_revision_fetch_does_not_adopt_a_metadata_write_guard() {
 }
 
 #[tokio::test]
+async fn file_fetch_succeeds_when_no_telemetry_observer_is_available() {
+    let (temporary, store, domain) = setup();
+    add_domain(&store, domain.clone()).unwrap();
+    let disk = Disk::new(temporary.path().join("remote"));
+    fs::write(disk.root.join("document"), b"contents remain available without progress telemetry").unwrap();
+    let peer = Peer::new(disk, true, false);
+    let mut journal = checked_journal(&store.home, &store.config, &domain).unwrap();
+    refresh(&store, peer.as_ref(), &domain, &mut journal).await.unwrap();
+    let item = journal.items.values().next().unwrap().item.clone();
+    let home = store.home.clone();
+    drop(store);
+    let (staging, fd) = stage(temporary.path());
+    let response = online_process_inner_with(&home, &staging, &fd,
+        request(json!({"v":1,"op":"fetch","domain":domain.id,"id":item.id,"base_content_version":item.content_version})),
+        Default::default(), None, &Connected(peer)).await.unwrap();
+    assert_eq!(fs::read(response["content_path"].as_str().unwrap()).unwrap(), b"contents remain available without progress telemetry");
+}
+
+#[tokio::test]
 async fn empty_create_and_content_free_modify_preserve_contents_without_reupload() {
     let (temporary, store, domain) = setup();
     add_domain(&store, domain.clone()).unwrap();

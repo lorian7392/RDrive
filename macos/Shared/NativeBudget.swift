@@ -9,6 +9,7 @@ protocol NativeDomainManaging: AnyObject {
     func getUserVisibleURL(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void)
     func evictItem(identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
     func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
+    func signalErrorResolved(_ error: NSError, completionHandler: @escaping (Error?) -> Void)
     func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void)
     func temporaryDirectoryURL() throws -> URL
 }
@@ -25,10 +26,25 @@ final class NativeSystemDomainManager: NativeDomainManaging {
     func signalEnumerator(for identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
         manager.signalEnumerator(for: identifier) { completionHandler($0) }
     }
+    func signalErrorResolved(_ error: NSError, completionHandler: @escaping (Error?) -> Void) {
+        manager.signalErrorResolved(error, completionHandler: completionHandler)
+    }
     func requestDownloadForItem(withIdentifier identifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) {
         manager.requestDownloadForItem(withIdentifier: identifier, requestedRange: nil, completionHandler: completionHandler)
     }
     func temporaryDirectoryURL() throws -> URL { try manager.temporaryDirectoryURL() }
+}
+
+/// Clears only the system's retry backoff for errors the caller has resolved.
+/// Retried operations still pass through the broker's original revision and
+/// retained-edit checks; this neither changes a queue nor confirms an upload.
+func signalNativeSyncErrorsResolved(_ manager: NativeDomainManaging, codes: [NSFileProviderError.Code],
+                                   completionHandler: @escaping (Error?) -> Void) {
+    guard let code = codes.first else { completionHandler(nil); return }
+    manager.signalErrorResolved(NSError(domain: NSFileProviderErrorDomain, code: code.rawValue)) { error in
+        if let error = error { completionHandler(error); return }
+        signalNativeSyncErrorsResolved(manager, codes: Array(codes.dropFirst()), completionHandler: completionHandler)
+    }
 }
 
 protocol NativeSystemManaging {

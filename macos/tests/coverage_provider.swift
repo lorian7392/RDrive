@@ -17,6 +17,7 @@ private final class ProviderTestManager: NativeDomainManaging {
     init(_ temporary: URL) { self.temporary = temporary }
     func temporaryDirectoryURL() throws -> URL { if let failure = temporaryFailure { throw failure }; return temporary }
     func signalEnumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { signals.append(containerItemIdentifier); completionHandler(nil) }
+    func signalErrorResolved(_ error: NSError, completionHandler: @escaping (Error?) -> Void) { completionHandler(nil) }
     func requestDownloadForItem(withIdentifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { downloads.append(itemIdentifier); completionHandler(nil) }
     func evictItem(identifier itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (Error?) -> Void) { evictions.append(itemIdentifier); completionHandler(nil) }
     func getUserVisibleURL(for itemIdentifier: NSFileProviderItemIdentifier, completionHandler: @escaping (URL?, Error?) -> Void) { completionHandler(temporary, nil) }
@@ -90,12 +91,15 @@ enum ProviderCoverageTests {
         func fetch(_ target: RDriveProvider, version: NSFileProviderItemVersion? = nil, expectedFailure: Bool = false) throws {
             let done = DispatchSemaphore(value: 0)
             var delivered: URL?; var received: NSFileProviderItem?; var failure: Error?
-            _ = target.fetchContents(for: providerID("stable-0"), version: version, request: request) { delivered = $0; received = $1; failure = $2; done.signal() }
+            let progress = target.fetchContents(for: providerID("stable-0"), version: version, request: request) { delivered = $0; received = $1; failure = $2; done.signal() }
             try wait(done)
+            try expect(progress.kind == .file && progress.fileOperationKind == .downloading, "Finder download progress lost its operation kind")
             try expect((failure != nil) == expectedFailure, "Provider fetch completion status was incorrect")
             if !expectedFailure {
                 try expect(delivered != nil && received != nil, "Successful native fetch omitted a file/item")
                 try expect(try Data(contentsOf: delivered!) == Data("provider-content".utf8), "Provider delivery changed actual bytes")
+                try expect(progress.totalUnitCount == Int64(Data("provider-content".utf8).count) && progress.completedUnitCount == progress.totalUnitCount,
+                           "Finder download counters were reset by a metadata preflight or finished before delivery")
                 try expect(delivered!.deletingLastPathComponent().path == temporary.path, "Delivery escaped the mocked system temporary directory")
                 try FileManager.default.removeItem(at: delivered!)
             } else { try expect(delivered == nil && received == nil, "Failed fetch acknowledged a delivery") }
@@ -118,10 +122,15 @@ enum ProviderCoverageTests {
         func create(_ target: RDriveProvider = active, fields: NSFileProviderItemFields = [.contents, .tagData, .extendedAttributes], contents: URL? = source,
                     options: NSFileProviderCreateItemOptions = [], expectedFailure: Bool = false) throws {
             let done = DispatchSemaphore(value: 0); var failure: Error?; var pending: NSFileProviderItemFields = []; var received: NSFileProviderItem?
-            _ = target.createItem(basedOn: template, fields: fields, contents: contents, options: options, request: request) {
+            let progress = target.createItem(basedOn: template, fields: fields, contents: contents, options: options, request: request) {
                 received = $0; pending = $1; failure = $3; done.signal()
             }
             try wait(done)
+            try expect(progress.kind == .file && progress.fileOperationKind == .uploading, "Finder creation progress lost its upload direction")
+            if !expectedFailure && contents != nil {
+                try expect(progress.totalUnitCount == Int64(Data("provider-create".utf8).count) && progress.completedUnitCount == progress.totalUnitCount,
+                           "Finder creation did not report actual payload bytes")
+            }
             try expect((failure != nil) == expectedFailure && (received != nil) != expectedFailure, "Provider create completion status was incorrect")
             try expect(pending == (expectedFailure ? fields : []), "Provider create lost pending field information")
         }
@@ -141,10 +150,15 @@ enum ProviderCoverageTests {
         func modify(_ target: RDriveProvider = active, fields: NSFileProviderItemFields = [.contents, .filename, .parentItemIdentifier, .tagData, .extendedAttributes], contents: URL? = source,
                     base: NSFileProviderItemVersion = version, expectedFailure: Bool = false) throws {
             let done = DispatchSemaphore(value: 0); var failure: Error?; var pending: NSFileProviderItemFields = []; var received: NSFileProviderItem?
-            _ = target.modifyItem(template, baseVersion: base, changedFields: fields, contents: contents, options: [], request: request) {
+            let progress = target.modifyItem(template, baseVersion: base, changedFields: fields, contents: contents, options: [], request: request) {
                 received = $0; pending = $1; failure = $3; done.signal()
             }
             try wait(done)
+            try expect(progress.kind == .file && progress.fileOperationKind == .uploading, "Finder edit progress lost its upload direction")
+            if !expectedFailure && fields.contains(.contents) && contents != nil {
+                try expect(progress.totalUnitCount == Int64(Data("provider-create".utf8).count) && progress.completedUnitCount == progress.totalUnitCount,
+                           "Finder upload counters were reset by a metadata preflight")
+            }
             try expect((failure != nil) == expectedFailure && (received != nil) != expectedFailure, "Provider modify completion status was incorrect")
             try expect(pending == (expectedFailure ? fields : []), "Provider modify lost pending fields")
         }
@@ -186,6 +200,27 @@ enum ProviderCoverageTests {
         }
         try expect(manager.downloads.isEmpty && manager.evictions.isEmpty && manager.signals == signalsBeforeUnsupportedActions,
                    "A stale or unknown custom action entered the system manager")
+        func refresh(_ target: RDriveProvider, identifiers: [NSFileProviderItemIdentifier], failureCode: Int? = nil) throws {
+            let done = DispatchSemaphore(value: 0)
+            var failure: NSError?
+            _ = target.performAction(identifier: NSFileProviderExtensionActionIdentifier("rdrive.refresh"), onItemsWithIdentifiers: identifiers) {
+                failure = $0 as NSError?
+                done.signal()
+            }
+            try wait(done)
+            try expect(failure?.code == failureCode, "Refresh completion did not reflect the bridge response or selection")
+        }
+        try refresh(active, identifiers: [providerID("folder-one")])
+        try refresh(active, identifiers: [.rootContainer])
+        try refresh(active, identifiers: [.workingSet])
+        try refresh(active, identifiers: [], failureCode: NSFeatureUnsupportedError)
+        try refresh(active, identifiers: [providerID("folder-one"), .rootContainer], failureCode: NSFeatureUnsupportedError)
+        try refresh(active, identifiers: [providerID("stable-0")], failureCode: NSFeatureUnsupportedError)
+        let missingRefreshAcknowledgement = provider("provider-refresh-no-ack")
+        defer { missingRefreshAcknowledgement.invalidate() }
+        try refresh(missingRefreshAcknowledgement, identifiers: [.rootContainer], failureCode: NSFileProviderError.serverUnreachable.rawValue)
+        try expect(manager.downloads.isEmpty && manager.evictions.isEmpty && manager.signals == signalsBeforeUnsupportedActions,
+                   "Refresh entered the system manager")
         let cancelled = provider("provider-cancel")
         let cancelDone = DispatchSemaphore(value: 0); var cancelError: Error?; var callbacks = 0
         let progress = cancelled.item(for: providerID("stable-0"), request: request) { _, error in cancelError = error; callbacks += 1; cancelDone.signal() }

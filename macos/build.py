@@ -80,7 +80,7 @@ def main():
     namespace_policy = namespace_policy_supported(flags)
     if namespace_policy:
         flags += ["-D", "RDRIVE_HAS_NAMESPACE_POLICY"]
-    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "12", "CFBundleShortVersionString": "0.8.2",
+    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "19", "CFBundleShortVersionString": "0.8.3",
             "LSMinimumSystemVersion": "13.0", "RDriveAppGroup": app_group}
     if development_root:
         base.pop("RDriveAppGroup")
@@ -121,14 +121,17 @@ def main():
             extension.update(NSExtensionFileProviderDocumentGroup=app_group, NSExtensionFileProviderSupportsEnumeration=True,
                 NSExtensionFileProviderDownloadPipelineDepth=4, NSExtensionFileProviderUploadPipelineDepth=2,
                 NSExtensionFileProviderActions=[
+                    {"NSExtensionFileProviderActionIdentifier": "rdrive.refresh", "NSExtensionFileProviderActionName": "Refresh",
+                     "NSExtensionFileProviderActionActivationRule": "fileproviderItems.@count == 1 AND "
+                     "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdriveSmart == YES AND $item.contentType.identifier == 'public.folder').@count == 1"},
                     {"NSExtensionFileProviderActionIdentifier": "rdrive.pin", "NSExtensionFileProviderActionName": "Keep Offline",
                      "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"},
                     {"NSExtensionFileProviderActionIdentifier": "rdrive.unpin", "NSExtensionFileProviderActionName": "Allow Automatic Removal",
                      "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"},
                 ])
             titles = {"online": "Online only", "cached": "Available offline", "pinned": "Kept offline", "syncing": "Syncing",
-                      "queued": "Waiting to sync", "conflict": "Sync conflict", "error": "Needs attention"}
-            badges = {"cached": "checkmark", "pinned": "pinned", "syncing": "syncing", "queued": "in-review", "conflict": "warning", "error": "warning"}
+                      "queued": "Waiting to sync", "blocked": "Excluded by sync rules", "conflict": "Sync conflict", "error": "Needs attention"}
+            badges = {"cached": "checkmark", "pinned": "pinned", "syncing": "syncing", "queued": "in-review", "blocked": "in-review", "conflict": "warning", "error": "warning"}
             extension["NSFileProviderDecorations"] = [
                 {"Identifier": "io.rdrive.native.provider.status." + state, "Category": "Sharing", "Label": title}
                 for state, title in titles.items()
@@ -142,7 +145,11 @@ def main():
         elif framework == "com.apple.fileprovider-actionsui":
             extension["NSExtensionFileProviderActions"] = [{
                 "NSExtensionFileProviderActionIdentifier": "rdrive.status", "NSExtensionFileProviderActionName": "Show Sync Status",
-                "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"}]
+                "NSExtensionFileProviderActionActivationRule": "TRUEPREDICATE"}, {
+                "NSExtensionFileProviderActionIdentifier": "rdrive.repair", "NSExtensionFileProviderActionName": "Repair Sync Issue…",
+                "NSExtensionFileProviderActionActivationRule": "fileproviderItems.@count == 1 AND "
+                "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdriveSmart == YES AND $item.userInfo.rdriveState IN {'conflict', 'blocked', 'queued'} "
+                "AND $item.contentType.identifier == 'public.folder').@count == 1"}]
         plist(bundle / "Contents/Info.plist", dict(base, CFBundleIdentifier=identifier, CFBundleName=name,
             CFBundleExecutable=name, CFBundlePackageType="XPC!", NSExtension=extension))
         run(*flags, "-module-name", name, "-application-extension", "-parse-as-library", *shared, *sources,
@@ -159,7 +166,7 @@ def main():
         shutil.rmtree(final_app)
     app.rename(final_app)
     build_root.rmdir()
-    report = {"app": str(final_app), "version": "0.8.2", "bundle_build": "12", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
+    report = {"app": str(final_app), "version": "0.8.3", "bundle_build": "19", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
               "app_group": None if development_root else app_group, "development_ipc_root": str(development_root) if development_root else None,
               "distribution_ready": options.identity != "-" and development_root is None, "installed": False, "activated": False,
               "signing_status": "ad-hoc review build; no Developer Team identity" if options.identity == "-" else "signed with requested identity"}

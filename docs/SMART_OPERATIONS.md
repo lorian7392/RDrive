@@ -36,6 +36,8 @@ The defaults hide `.DS_Store`, AppleDouble `._*`, `*.tmp`, `*.swp`, `*.swo`, `*.
 
 Filters control Smart listings, background discovery, and destinations of new writes. Changing a rule does not delete remote files, remove indexed recovery records or pending upload snapshots, or interpret excluded entries as deletions to propagate. Exclusion pauses queued operations; they may resume when allowed again. Inspect `smart list` for actual state. Explicit CLI file operations can still access these paths.
 
+Finder labels retained operations blocked by these rules **Excluded by sync rules**. Open **Show Sync Status** for the blocked path; an eligible stale-folder repair also identifies the matching rule. A built-in exclusion such as `*.part` is a local policy decision and can leave the pending edit retained. An existing excluded child does not block a metadata-only update of its containing directory. Renaming, moving, or deleting a directory still checks its descendants, so those operations cannot bypass exclusions.
+
 ## Automatic versions and conflict policy
 
 ```sh
@@ -70,7 +72,11 @@ Use `rdrive smart list DOMAIN` to find the mutation ID when Finder reports that 
 rdrive smart refresh-conflict DOMAIN MUTATION_ID
 ```
 
-This command accepts a stopped directory request in an ordinary Smart domain when the request has no retained contents and no recorded remote publication intent. It refreshes the directory's parent listing and cancels the stale request. Reopen the parent in Finder and repeat the intended operation against the refreshed item if it is still appropriate.
+For an obsolete directory update whose canonical name and parent are unchanged, the Finder status dialog offers **Repair Sync Issue**. This includes a contentless directory callback blocked by an excluded descendant. Its eligibility check reads the local catalog and retained queue, so it remains available while child uploads are running. The repair rechecks the exact mutation ID, saves a permanent cancellation marker, and queues a metadata refresh of that directory. It works offline and preserves other queued operations, their original version conditions, and all retained contents. It does not change filtering rules or delete excluded files. A queued refresh is complete only after the provider successfully reads the directory again. Actual Finder tag or extended-attribute edits require a separate decision and are excluded from this repair.
+
+If another active request directly targets the same directory, the status window explains that it needs review. A cancelled request from an earlier repair cannot hide a newer conflict or make a repeated repair report success for it. Child uploads can continue independently.
+
+The command also handles these obsolete updates locally. Directory renames, moves, and deletions continue to require a successful authoritative parent listing before cancellation. Those namespace repairs stop when related pending work or a recorded publication intent makes cancellation ambiguous. Reopen the parent in Finder and repeat an intended namespace operation against the refreshed item if it is still appropriate.
 
 For a request that reached namespace publication, inspect `rdrive smart recovery DOMAIN` and the server before deciding how to proceed.
 

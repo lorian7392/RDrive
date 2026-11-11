@@ -113,7 +113,7 @@ enum NativeTests {
         try expect(NativeSyncState.item(fixtureItem(["sync_state": "unknown", "pinned": true])) == .pinned, "Unknown state did not preserve pin fallback")
         try expect(NativeSyncState.item(fixtureItem()) == .online, "Default state changed")
         let codes: [String: NSFileProviderError.Code] = ["no_such_item": .noSuchItem, "not_authenticated": .notAuthenticated,
-            "filename_collision": .filenameCollision, "sync_anchor_expired": .syncAnchorExpired, "version_conflict": .cannotSynchronize,
+            "filename_collision": .filenameCollision, "sync_anchor_expired": .syncAnchorExpired, "version_conflict": .cannotSynchronize, "excluded_by_filter": .cannotSynchronize,
             "insufficient_quota": .insufficientQuota, "directory_not_empty": .directoryNotEmpty, "deletion_rejected": .deletionRejected,
             "unknown": .serverUnreachable]
         for (code, expected) in codes { try expect(remoteError(["code": code]).code == expected.rawValue, "Typed backend error changed") }
@@ -127,6 +127,54 @@ enum NativeTests {
         let operation = SocketOperation(progress: progress)
         for (completed, total): (Int64, Int64) in [(-1, 10), (11, 10), (0, 0)] { operation.report(completed: completed, total: total) }
         try expect(progress.totalUnitCount == 7, "Invalid progress widened bounds")
+        let transfer = Progress(totalUnitCount: 100)
+        configureFileProgress(transfer, operation: .downloading)
+        try expect(transfer.kind == .file && transfer.fileOperationKind == .downloading && transfer.isIndeterminate && !transfer.isPausable,
+                   "File transfer progress lost its direction or unknown-size state")
+        let reporting = SocketOperation(progress: transfer)
+        reporting.report(completed: 3, total: nil, bytesPerSecond: 10, etaSeconds: nil)
+        try expect(transfer.isIndeterminate && transfer.completedUnitCount == 3 && (transfer.userInfo[.throughputKey] as? NSNumber)?.doubleValue == 10,
+                   "Unknown transfer length became an invented percentage")
+        reporting.report(completed: 10, total: 10, bytesPerSecond: -.infinity, etaSeconds: -1)
+        try expect(transfer.completedUnitCount == 9 && transfer.userInfo[.throughputKey] == nil && transfer.userInfo[.estimatedTimeRemainingKey] == nil,
+                   "Unconfirmed bytes reached 100 percent or invalid rate/ETA leaked")
+        reporting.report(completed: 5, total: 10, bytesPerSecond: 20, etaSeconds: 0.25)
+        try expect((transfer.userInfo[.estimatedTimeRemainingKey] as? NSNumber)?.doubleValue == 0.25, "Valid byte ETA was discarded")
+        reporting.finishProgress(); reporting.finishProgress()
+        reporting.report(completed: 1, total: 10)
+        try expect(transfer.completedUnitCount == 10 && (transfer.userInfo[.fileCompletedCountKey] as? NSNumber)?.intValue == 1,
+                   "A late progress frame reversed a confirmed receipt")
+        let unknown = Progress(totalUnitCount: -1)
+        SocketOperation(progress: unknown).finishProgress()
+        try expect(unknown.totalUnitCount == 1 && unknown.completedUnitCount == 1, "Confirmed unknown-size transfer did not finish")
+        let cancelledProgress = Progress(totalUnitCount: 10)
+        let cancelledReporting = SocketOperation(progress: cancelledProgress)
+        cancelledReporting.cancel(); cancelledReporting.report(completed: 5, total: 10); cancelledReporting.finishProgress()
+        try expect(cancelledProgress.completedUnitCount == 0, "Cancelled work was reported as confirmed")
+        let observed = Progress(totalUnitCount: 10)
+        let reentrant = SocketOperation(progress: observed)
+        let observation = observed.observe(\.completedUnitCount) { _, _ in reentrant.cancel() }
+        reentrant.report(completed: 5, total: 10)
+        observation.invalidate(); reentrant.finishProgress()
+        try expect(observed.completedUnitCount == 5, "Reentrant KVO cancellation completed the transfer")
+        SocketOperation().report(completed: 1, total: 2)
+        SocketOperation().finishProgress()
+        var snapshot: [String: Any] = ["transfer_id": "attempt", "id": "file", "operation": "upload", "completed": 2,
+            "total": 10, "bytes_per_second": 4, "eta_seconds": 2, "state": "transferring", "background": true]
+        try expect(try NativeTransferSnapshot.decode(snapshot).total == 10, "Valid transfer progress did not decode")
+        snapshot["total"] = NSNull(); snapshot["eta_seconds"] = NSNull()
+        try expect(try NativeTransferSnapshot.decode(snapshot).total == nil, "Unknown transfer length was invented")
+        for change: [String: Any] in [["transfer_id": ""], ["id": ""], ["operation": "rename"], ["state": "unknown"],
+                ["completed": -1], ["completed": NSNumber(value: UInt64.max)], ["total": 1], ["bytes_per_second": -1], ["eta_seconds": -1]] {
+            var invalid = snapshot; invalid.merge(change) { _, next in next }
+            try rejects("Invalid transfer snapshot accepted") { _ = try NativeTransferSnapshot.decode(invalid) }
+        }
+        let indeterminate = Progress(totalUnitCount: -1)
+        _ = try bridge.request(["op": "test.indeterminate-progress"], operation: SocketOperation(progress: indeterminate))
+        try expect(indeterminate.isIndeterminate && indeterminate.completedUnitCount == 3, "Unknown bridge totals did not stay indeterminate")
+        let preflight = Progress(totalUnitCount: 100)
+        _ = try bridge.request(["op": "test.fragmented"], operation: SocketOperation(progress: preflight), reportsProgress: false)
+        try expect(preflight.totalUnitCount == 100 && preflight.completedUnitCount == 0, "Preflight request reset payload progress")
         operation.cancel()
         try rejects("Cancelled operation attached a socket") { try operation.attach(-1) }
         try rejects("Precancelled request started I/O") { _ = try bridge.request(["op": "test.fragmented"], operation: operation) }
@@ -193,6 +241,15 @@ enum NativeTests {
         try expect(ProviderItem(fixtureItem(properties)).contentModificationDate == nil && ProviderItem(fixtureItem(properties)).contentType == .data, "Unknown content/date fallback changed")
         let directory = ProviderItem(try fixtureItem(["kind": "directory", "id": "root"]))
         try expect(directory.documentSize == nil && directory.contentType == .folder && directory.contentPolicy == .downloadLazily && directory.decorations == nil && directory.contentModificationDate == nil, "Root directory properties changed")
+        let refreshRule = NSPredicate(format: "fileproviderItems.@count == 1 AND " +
+            "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdriveSmart == YES AND $item.contentType.identifier == 'public.folder').@count == 1")
+        let smartDirectory = ProviderItem(try fixtureItem(["kind": "directory", "smart": true]))
+        let smartFile = ProviderItem(try fixtureItem(["smart": true]))
+        try expect(smartDirectory.userInfo?["rdriveDirectory"] == nil, "Legacy item fixture unexpectedly includes a directory marker")
+        for (items, visible) in [([smartDirectory], true), ([smartFile], false), ([directory], false), ([], false), ([smartDirectory, smartDirectory], false)] {
+            try expect(refreshRule.evaluate(with: ["fileproviderItems": items]) == visible,
+                       "Refresh activation rejected a cached Smart directory or accepted an invalid selection")
+        }
         for state in ["syncing", "conflict", "error"] {
             let item = ProviderItem(try fixtureItem(["sync_state": state]))
             try expect(item.isUploading == (state == "syncing"), "Uploading state projection changed")
@@ -200,6 +257,13 @@ enum NativeTests {
         }
         let dirty = ProviderItem(try fixtureItem(["has_unsynced_changes": true]))
         try expect(!dirty.isUploaded, "Explicit unsynced flag was ignored")
+        let blocked = ProviderItem(try fixtureItem(["sync_state": "blocked", "sync_message": "Excluded by synchronization filters: backup.part"]))
+        try expect(!blocked.isUploaded && !blocked.isUploading && (blocked.uploadingError as NSError?)?.code == NSFileProviderError.cannotSynchronize.rawValue,
+                   "A filter-blocked local edit was reported as uploaded or unreachable")
+        try expect(blocked.uploadingError?.localizedDescription.contains("backup.part") == true && NativeSyncState.blocked.title == "Excluded by sync rules",
+                   "The filter review reason was hidden")
+        try expect(ProviderItem(try fixtureItem(["sync_state": "blocked"])).uploadingError?.localizedDescription.contains("filters") == true,
+                   "A blocked item lost its default review reason")
         let pinnedDirectory = ProviderItem(try fixtureItem(["kind": "directory", "pinned": true]))
         let pinnedFile = ProviderItem(try fixtureItem(["pinned": true]))
         try expect(pinnedDirectory.contentPolicy == .downloadEagerlyAndKeepDownloaded && pinnedFile.contentPolicy == .downloadEagerlyAndKeepDownloaded, "Pinned content policy changed")
@@ -380,7 +444,9 @@ enum NativeTests {
         let operation = SocketOperation(progress: progress)
         let response = try bridge.request(["op": "test.fragmented"], operation: operation)
         try expect(response["value"] as? String == "fragmented reply", "Fragmented response was lost")
-        try expect(progress.totalUnitCount == 19 && progress.completedUnitCount == 19, "Streaming byte progress was lost")
+        try expect(progress.totalUnitCount == 19 && progress.completedUnitCount == 18, "Transport bytes prematurely confirmed the operation")
+        operation.finishProgress()
+        try expect(progress.completedUnitCount == 19, "Confirmed byte progress was not completed")
         do { _ = try bridge.request(["op": "test.authentication"]); throw TestFailure(message: "Backend error was ignored") }
         catch let error as NSError { try expect(error.domain == NSFileProviderErrorDomain && error.code == NSFileProviderError.notAuthenticated.rawValue, "Wrong auth error mapping") }
         let cancel = SocketOperation()

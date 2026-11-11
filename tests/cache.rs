@@ -86,6 +86,7 @@ async fn real_http_cache_rejects_oversize_before_get_without_discarding_old_payl
         allow_http: true,
         timeout_secs: 5,
         smb_encryption: true,
+        keychain_internet: false,
         nextcloud_upload_url: None,
     };
     let backend = WebDav::new(&profile, "").unwrap();

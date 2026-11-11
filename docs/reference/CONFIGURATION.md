@@ -7,8 +7,24 @@ workflows, and [Features](../FEATURES.md) for recovery and protocol boundaries.
 
 ## State directory and configuration persistence
 
-Path precedence is the global `--home PATH` option, then `RDRIVE_HOME`, then
-`$HOME/Library/Application Support/rdrive`. `--home` does not change the shell's
+Path precedence is the global `--home PATH` option, then `RDRIVE_HOME`, then an
+existing shared-home locator, then `$HOME/Library/Application Support/rdrive`.
+The optional owner-only file `~/Library/Application Support/rdrive/shared-home.json`
+contains `{"version":1,"home":"/absolute/private/existing/state"}`. It references
+the existing state directory; it does not duplicate profiles, credentials, queues,
+or caches. The referenced state must exist and remain private. Explicit overrides
+do not consult this locator. Remove the locator to return to the ordinary default.
+The locator's parent and referenced state directory must be real directories,
+owned by the current user, with no group or other permissions (normally `0700`).
+The locator and the referenced `config.json` must be regular files owned by the
+same user, with no group or other permissions (normally `0600`), and no symbolic
+or hard links. The locator accepts only `version` and `home`, has a 4096-byte
+limit, and requires an absolute existing target with an existing configuration.
+A missing locator preserves ordinary default behavior without creating state.
+An invalid locator or unavailable target reports an error instead of silently
+selecting a different connection set. It never migrates or initializes the
+referenced state. Do not replace the state directory with a symbolic link.
+`--home` does not change the shell's
 `HOME`. Configuration is stored as UTF-8 JSON without comments in `config.json`
 inside that directory. A missing file uses all defaults. An existing JSON file
 must contain a `profiles` object; the other four top-level objects may be omitted
@@ -52,6 +68,14 @@ concurrency, and MCP local roots are not `config.json` fields.
   **environment-variable name**, not a password. `profile add --password-env`
   accepts a nonempty name containing only ASCII letters, digits, and `_`.
   Once configured, a missing variable is an error; it does not fall back to Keychain.
+- `keychain_internet`: a boolean, defaulting to `false` and omitted when false.
+  On macOS, `true` selects an existing Internet password in Keychain using the
+  connection URL's host and the configured username. It is mutually exclusive
+  with `password_env`. RDrive reads that same item without copying its secret
+  into another Keychain item, an environment file, or the connection configuration.
+  A missing username selects the empty account. A missing item or denied access
+  is an error, even for anonymous connections; it never falls back to a generic
+  item or an empty password. Other operating systems reject this credential source.
 - `allow_http`: a boolean, defaulting to `false`. It explicitly permits WebDAV
   HTTP; it does not disable HTTPS certificate validation.
 - `timeout_secs`: positive integer seconds, defaulting to `120`. WebDAV's total
@@ -68,7 +92,7 @@ concurrency, and MCP local roots are not `config.json` fields.
   every upload resumable; `put --resume` is still required.
 
 The corresponding CLI names are `--protocol`, `--url`, `--username`,
-`--password-env`, `--allow-http`, `--timeout`, `--allow-unencrypted-smb`, and
+`--password-env`, `--keychain-internet`, `--allow-http`, `--timeout`, `--allow-unencrypted-smb`, and
 `--nextcloud-upload-url`. A connection name cannot be empty or start with `-`;
 only ASCII letters, digits, `-`, and `_` are accepted. Existing names cannot be
 overwritten directly. Before removing a connection, finish or cancel unfinished
@@ -80,11 +104,16 @@ verify their identity.
 
 Password lookup for Rust file operations follows this order:
 
+Setting both `password_env` and `keychain_internet` is rejected before any
+credential lookup.
+
 1. If `password_env` is set, read that variable and fail if it is missing.
-2. Otherwise, on macOS use `/usr/bin/security` to look up a generic password
+2. If `keychain_internet` is true, look up the existing macOS Internet password
+   for the URL host and configured username, and fail if it cannot be read.
+3. Otherwise, on macOS use `/usr/bin/security` to look up a generic password
    whose service is `rdrive:<connection-name>` and account is `username`
    (an empty account when no username is configured).
-3. If no entry exists and no username was supplied, use an empty password.
+4. If no entry exists and no username was supplied, use an empty password.
    With a username, report missing credentials.
 
 There is no password command-line argument, and passwords are not written to
@@ -271,6 +300,7 @@ manual migration.
       "url": "https://example.invalid/files/",
       "username": null,
       "password_env": null,
+      "keychain_internet": false,
       "allow_http": false,
       "timeout_secs": 120,
       "smb_encryption": true,
@@ -281,6 +311,7 @@ manual migration.
       "url": "smb://example.invalid/share/",
       "username": null,
       "password_env": null,
+      "keychain_internet": false,
       "allow_http": false,
       "timeout_secs": 120,
       "smb_encryption": true,
