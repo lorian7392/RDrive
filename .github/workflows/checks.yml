@@ -25,8 +25,8 @@ jobs:
       RDRIVE_TEST_BINARY: ${{ github.workspace }}/target/coverage/rust-macos/build/debug/rdrive
       LLVM_PROFILE_FILE: ${{ github.workspace }}/target/coverage/post-export-%p-%m.profraw
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Freeze application source identities
@@ -57,7 +57,7 @@ jobs:
         run: python3 tests/source_manifest.py --output target/coverage/source-manifest.json --check
       - name: Preserve measured reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-coverage-${{ github.sha }}
           path: |
@@ -78,8 +78,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Set up Rust
@@ -94,7 +94,7 @@ jobs:
         run: python3 tests/run_rust_coverage.py --output-dir target/coverage/rust-linux --workflows smb --test-suite portable-smb
       - name: Preserve measured reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-coverage-${{ github.sha }}
           path: |
@@ -111,12 +111,12 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           name: macos-coverage-${{ github.sha }}
           path: target
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: linux-coverage-${{ github.sha }}
           path: target/coverage/rust-linux
@@ -140,7 +140,7 @@ jobs:
             --output target/coverage/production.json
       - name: Preserve combined gate evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: production-coverage-${{ github.sha }}
           path: |

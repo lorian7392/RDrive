@@ -23,8 +23,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Select Rust 1.90
@@ -54,7 +54,7 @@ jobs:
           cd target/build-artifacts
           shasum -a 256 rdrive-macos.tar.gz version-report.json native-build-report.json > SHA256SUMS
       - name: Upload CLI and build reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rdrive-macos-${{ runner.arch }}-${{ github.sha }}
           path: target/build-artifacts/
@@ -73,7 +73,7 @@ jobs:
           shasum -a 256 rdrive-macos-arm64 > SHA256SUMS
       - name: Upload staged release files
         if: github.ref_type == 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-assets-${{ github.sha }}
           path: target/release-assets/
