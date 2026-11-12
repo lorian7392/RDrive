@@ -18,6 +18,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -37,6 +38,7 @@ struct Descriptor {
     home_binding: String,
     instance_id: String,
     capacity_bytes: u64,
+    host_lock: Identity,
     image: Option<Identity>,
     volume_uuid: Option<String>,
     ready: bool,
@@ -47,6 +49,7 @@ struct Paths {
     vault: PathBuf,
     image: PathBuf,
     descriptor: PathBuf,
+    host_lock: PathBuf,
     mount: PathBuf,
 }
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ struct Request {
     program: &'static str,
     args: Vec<String>,
     input: Option<Vec<u8>>,
+    lease: Option<Arc<File>>,
 }
 #[derive(Debug)]
 struct Output {
@@ -79,6 +83,7 @@ pub(super) struct System {
     statistics: fn(&Path) -> Result<Statistics>,
     supported: fn() -> bool,
     family: Option<Family>,
+    operation_lock: Option<Arc<File>>,
 }
 impl Default for System {
     fn default() -> Self {
@@ -87,6 +92,7 @@ impl Default for System {
             statistics,
             supported: || cfg!(target_os = "macos"),
             family: None,
+            operation_lock: None,
         }
     }
 }
@@ -157,6 +163,7 @@ fn paths(home: &Path, initialize: bool) -> Result<Option<Paths>> {
         home: home.into(),
         image: vault.join("vault.dmg"),
         descriptor: vault.join("descriptor.json"),
+        host_lock: vault.join("host-operation.lock"),
         mount: vault.join("mount"),
         vault,
     }))
@@ -189,8 +196,15 @@ fn descriptor(paths: &Paths) -> Result<Option<Descriptor>> {
     match fs::symlink_metadata(&paths.descriptor) {
         Ok(_) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if fs::read_dir(&paths.vault)?.next().is_some() {
+            // A crash before descriptor publication can leave only the empty
+            // lease file. An image or any other unbound content is never adopted.
+            if fs::read_dir(&paths.vault)?
+                .any(|entry| entry.map_or(true, |entry| entry.path() != paths.host_lock))
+            {
                 bail!("unrecognized contents in APFS vault; initialization refused");
+            }
+            if paths.host_lock.try_exists()? {
+                lock_identity(&paths.host_lock)?;
             }
             return Ok(None);
         }
@@ -212,6 +226,9 @@ fn descriptor(paths: &Paths) -> Result<Option<Descriptor>> {
     if let Some(id) = &value.volume_uuid {
         uuid::Uuid::parse_str(id)?;
     }
+    if lock_identity(&paths.host_lock)? != value.host_lock {
+        bail!("APFS vault host-operation lease identity changed");
+    }
     if let Some(expected) = &value.image {
         if regular_identity(&paths.image, false)? != *expected
             || fs::metadata(&paths.image)?.len() != value.capacity_bytes
@@ -223,6 +240,58 @@ fn descriptor(paths: &Paths) -> Result<Option<Descriptor>> {
 }
 fn save(paths: &Paths, value: &Descriptor) -> Result<()> {
     crate::state::atomic_json(&paths.descriptor, value)
+}
+fn lock_identity(path: &Path) -> Result<Identity> {
+    let identity = regular_identity(path, false)?;
+    if fs::metadata(path)?.len() != 0 {
+        bail!("APFS vault host-operation lease must remain empty");
+    }
+    Ok(identity)
+}
+fn flock(file: &File, operation: i32) -> std::io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn operation_lock(paths: &Paths, expected: Option<&Identity>) -> Result<Arc<File>> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let (file, created) = match if expected.is_some() {
+        options.open(&paths.host_lock)
+    } else {
+        options.create_new(true).open(&paths.host_lock)
+    } {
+        Ok(file) => (file, expected.is_none()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&paths.host_lock)?,
+            false,
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    let identity = lock_identity(&paths.host_lock)?;
+    let meta = file.metadata()?;
+    if identity.device != meta.dev()
+        || identity.inode != meta.ino()
+        || expected.is_some_and(|value| *value != identity)
+    {
+        bail!("APFS vault host-operation lease identity changed");
+    }
+    flock(&file, libc::LOCK_EX | libc::LOCK_NB)
+        .context("another APFS vault host operation is still active")?;
+    if created {
+        file.sync_all()?;
+        File::open(&paths.vault)?.sync_all()?;
+    }
+    Ok(Arc::new(file))
 }
 fn text(path: &Path) -> Result<String> {
     Ok(path
@@ -267,11 +336,24 @@ impl System {
         args: Vec<String>,
         input: Option<Vec<u8>>,
     ) -> Result<Vec<u8>> {
+        let lease = self
+            .operation_lock
+            .as_ref()
+            .context("APFS vault host-operation lease missing")?;
+        // lockf explicitly unlocks this open-file description on exit. Reacquire
+        // before every command; the caller's independent checkpoint lease still
+        // protects the spaces between commands and filesystem publication.
+        flock(lease, libc::LOCK_EX | libc::LOCK_NB)
+            .context("another APFS vault host operation is still active")?;
         let result = (self.execute)(Request {
             program,
             args,
             input,
-        })?;
+            lease: Some(lease.clone()),
+        });
+        let unlocked = flock(lease, libc::LOCK_UN);
+        let result = result?;
+        unlocked?;
         if result.code != Some(0) {
             bail!(
                 "APFS image command failed: {}",
@@ -546,7 +628,8 @@ impl System {
         File::open(&paths.vault)?.sync_all()?;
         Ok(())
     }
-    fn existing(&self, mount: &Mounted) -> Result<(Paths, Descriptor, String)> {
+    fn existing(&mut self, mount: &Mounted) -> Result<(Paths, Descriptor, String)> {
+        self.operation_lock.take();
         let home = mount
             .root
             .parent()
@@ -558,6 +641,7 @@ impl System {
             bail!("APFS vault mount path changed");
         }
         let value = descriptor(&paths)?.context("APFS vault descriptor missing")?;
+        self.operation_lock = Some(operation_lock(&paths, Some(&value.host_lock))?);
         if !value.ready
             || value.instance_id != mount.instance_id
             || value.capacity_bytes != mount.capacity_bytes
@@ -583,6 +667,7 @@ impl Host for System {
         initialize: bool,
         readonly: bool,
     ) -> Result<Option<Mounted>> {
+        self.operation_lock.take();
         if !(self.supported)() {
             bail!("APFS checkpoint vault requires macOS");
         }
@@ -594,18 +679,24 @@ impl Host for System {
             return Ok(None);
         };
         let mut value = match descriptor(&paths)? {
-            Some(value) => value,
+            Some(value) => {
+                self.operation_lock = Some(operation_lock(&paths, Some(&value.host_lock))?);
+                value
+            }
             None if !initialize => return Ok(None),
             None => {
+                let lease = operation_lock(&paths, None)?;
                 let value = Descriptor {
                     version: 1,
                     home_binding: home_binding(home)?,
                     instance_id: uuid::Uuid::new_v4().to_string(),
                     capacity_bytes: max_bytes,
+                    host_lock: lock_identity(&paths.host_lock)?,
                     image: None,
                     volume_uuid: None,
                     ready: false,
                 };
+                self.operation_lock = Some(lease);
                 save(&paths, &value)?;
                 value
             }
@@ -613,10 +704,8 @@ impl Host for System {
         if value.capacity_bytes != max_bytes {
             bail!("APFS vault fixed capacity differs from configuration; an explicit migration is required");
         }
-        if !value.ready && !initialize {
-            bail!(
-                "APFS vault initialization is incomplete; retry checkpoint creation to recover it"
-            );
+        if !value.ready && readonly {
+            bail!("APFS vault initialization is incomplete; writable reconciliation is required");
         }
         if value.image.is_none() {
             if fs::symlink_metadata(&paths.image)
@@ -789,7 +878,26 @@ fn feed<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<usize> {
     }
 }
 fn execute_with(request: Request, timeout: Duration) -> Result<Output> {
-    let mut command = Command::new(request.program);
+    let mut command = if let Some(lease) = &request.lease {
+        let fd = lease.as_raw_fd();
+        let mut command = Command::new("/usr/bin/lockf");
+        command.args([
+            "-k",
+            "-s",
+            "-t",
+            "0",
+            &format!("/dev/fd/{fd}"),
+            request.program,
+        ]);
+        // Only the child's copy is inheritable. lockf retains this descriptor
+        // while waiting for the real tool, including after an RDrive crash.
+        unsafe {
+            command.pre_exec(move || inheritable(fd));
+        }
+        command
+    } else {
+        Command::new(request.program)
+    };
     command
         .args(&request.args)
         .process_group(0)
@@ -862,6 +970,14 @@ fn execute_with(request: Request, timeout: Duration) -> Result<Output> {
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+fn inheritable(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

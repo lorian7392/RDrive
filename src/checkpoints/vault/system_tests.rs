@@ -41,7 +41,9 @@ fn output(stdout: Vec<u8>) -> Output {
 }
 fn fake(request: Request) -> Result<Output> {
     update(|s| {
-        s.requests.push(request.clone());
+        let mut recorded = request.clone();
+        recorded.lease = None;
+        s.requests.push(recorded);
         let key = format!("{} {}", request.program, request.args.join(" "));
         let failed = s.failure.as_ref().is_some_and(|f| key.contains(f));
         if failed && !s.partial_failure {
@@ -148,6 +150,7 @@ impl Fixture {
                 statistics: stats,
                 supported: || true,
                 family: None,
+                operation_lock: None,
             },
         }
     }
@@ -270,7 +273,7 @@ fn legacy_systems_use_owner_parameters_and_modern_capability_is_checked() {
     assert!(f.system.family().is_err());
 }
 #[test]
-fn crash_preparation_is_resumed_only_by_explicit_creation_and_attached_ownership_is_rechecked() {
+fn crash_preparation_is_resumed_by_owned_writable_reconciliation_and_ownership_is_rechecked() {
     let mut f = Fixture::new();
     let m = f.mount();
     f.system.unmount(&m).unwrap();
@@ -279,7 +282,11 @@ fn crash_preparation_is_resumed_only_by_explicit_creation_and_attached_ownership
         d.volume_uuid = None;
     });
     assert!(f.system.mount(&f.home, MIN_BYTES, false, true).is_err());
-    let recovered = f.mount();
+    let recovered = f
+        .system
+        .mount(&f.home, MIN_BYTES, false, false)
+        .unwrap()
+        .unwrap();
     assert_eq!(recovered.instance_id, m.instance_id);
     f.system.unmount(&recovered).unwrap();
     let p = f.paths();
@@ -373,12 +380,20 @@ fn absent_preparing_image_is_created_and_incorrect_sizes_do_not_publish_ready() 
         home_binding: home_binding(&f.home).unwrap(),
         instance_id: uuid::Uuid::new_v4().to_string(),
         capacity_bytes: MIN_BYTES,
+        host_lock: {
+            let _lease = operation_lock(&p, None).unwrap();
+            lock_identity(&p.host_lock).unwrap()
+        },
         image: None,
         volume_uuid: None,
         ready: false,
     };
     save(&p, &pending).unwrap();
-    let m = f.mount();
+    let m = f
+        .system
+        .mount(&f.home, MIN_BYTES, false, false)
+        .unwrap()
+        .unwrap();
     f.system.unmount(&m).unwrap();
     f.edit(|d| {
         d.image = None;
@@ -526,6 +541,7 @@ fn bounded_runner_preserves_exit_codes_stdin_and_reaps_timed_out_descendants() {
         program: "/bin/sh",
         args: vec!["-c".into(), script.into()],
         input,
+        lease: None,
     };
     let result = execute(request(
         "cat; printf diagnostic >&2; exit 7",
@@ -546,7 +562,8 @@ fn bounded_runner_preserves_exit_codes_stdin_and_reaps_timed_out_descendants() {
     assert!(execute(Request {
         program: "/nonexistent-rdrive-tool",
         args: vec![],
-        input: None
+        input: None,
+        lease: None
     })
     .is_err());
     assert!(nonblocking(-1).is_err());
@@ -665,6 +682,7 @@ fn conversion_io_and_untrusted_space_arithmetic_are_bounded() {
             "exec 1>&-; sleep 0.05; exec 2>&-; sleep 0.05".into(),
         ],
         input: Some(vec![]),
+        lease: None,
     };
     assert_eq!(execute(r).unwrap().code, Some(0));
 }
@@ -721,4 +739,165 @@ fn external_shadow_storage_cannot_bypass_fixed_image_capacity() {
         s.overrides.remove("images");
     });
     f.system.unmount(&m).unwrap();
+}
+#[test]
+fn host_operation_lease_survives_only_its_recorded_inode_and_rejects_busy_operations() {
+    let mut f = Fixture::new();
+    let m = f.mount();
+    f.system.unmount(&m).unwrap();
+    let p = f.paths();
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&p.host_lock)
+        .unwrap();
+    flock(&held, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    let count = update(|s| s.requests.len());
+    let error = f
+        .system
+        .mount(&f.home, MIN_BYTES, false, false)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("still active"));
+    assert_eq!(update(|s| s.requests.len()), count);
+    f.system.operation_lock = Some(Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p.host_lock)
+            .unwrap(),
+    ));
+    assert!(f.system.run("/usr/bin/true", vec![], None).is_err());
+    flock(&held, libc::LOCK_UN).unwrap();
+    let stored = f.value();
+    assert!(operation_lock(
+        &p,
+        Some(&Identity {
+            device: 0,
+            inode: 0
+        })
+    )
+    .is_err());
+    let saved = p.vault.join("saved-host.lock");
+    fs::rename(&p.host_lock, &saved).unwrap();
+    assert!(System::capacity(&f.home).is_err());
+    assert!(operation_lock(&p, Some(&stored.host_lock)).is_err());
+    assert!(
+        !p.host_lock.exists(),
+        "A missing recorded lease is never recreated"
+    );
+    File::create(&p.host_lock)
+        .unwrap()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    assert!(System::capacity(&f.home).is_err());
+    fs::remove_file(&p.host_lock).unwrap();
+    symlink(&saved, &p.host_lock).unwrap();
+    assert!(f.system.mount(&f.home, MIN_BYTES, false, false).is_err());
+    fs::remove_file(&p.host_lock).unwrap();
+    fs::rename(saved, &p.host_lock).unwrap();
+    fs::write(&p.host_lock, b"unexpected contents").unwrap();
+    assert!(System::capacity(&f.home).is_err());
+    fs::write(&p.host_lock, b"").unwrap();
+    let recovered = f
+        .system
+        .mount(&f.home, MIN_BYTES, false, false)
+        .unwrap()
+        .unwrap();
+    f.system.unmount(&recovered).unwrap();
+}
+#[test]
+fn unbound_images_are_never_adopted_but_an_empty_prepublication_lease_can_resume() {
+    let mut f = Fixture::new();
+    let p = paths(&f.home, true).unwrap().unwrap();
+    let file = File::create(&p.image).unwrap();
+    file.set_permissions(fs::Permissions::from_mode(0o640))
+        .unwrap();
+    file.set_len(MIN_BYTES).unwrap();
+    assert!(f.system.mount(&f.home, MIN_BYTES, true, false).is_err());
+    assert!(!p.descriptor.exists() && !p.host_lock.exists());
+    assert_eq!(fs::metadata(&p.image).unwrap().mode() & 0o777, 0o640);
+    assert_eq!(fs::metadata(&p.image).unwrap().len(), MIN_BYTES);
+    fs::remove_file(&p.image).unwrap();
+    let initial = operation_lock(&p, None).unwrap();
+    let identity = lock_identity(&p.host_lock).unwrap();
+    drop(initial);
+    assert!(descriptor(&p).unwrap().is_none());
+    let m = f.mount();
+    assert_eq!(f.value().host_lock, identity);
+    f.system.unmount(&m).unwrap();
+    let moved = p.vault.join("saved-mount");
+    fs::rename(&p.mount, &moved).unwrap();
+    File::create(&p.mount).unwrap();
+    let error = f
+        .system
+        .verify(&p, &f.value(), &m.device, "/dev/disk91s1", false)
+        .unwrap_err();
+    assert!(error.to_string().contains("mount root is not owned"));
+    fs::remove_file(&p.mount).unwrap();
+    fs::rename(moved, &p.mount).unwrap();
+    assert!(inheritable(-1).is_err());
+    let inherit_file = File::open(&p.host_lock).unwrap();
+    let fd = unsafe { libc::fcntl(inherit_file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(fd >= 0);
+    inheritable(fd).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    let bad = paths(&f.home, false).unwrap().unwrap();
+    fs::remove_file(&bad.host_lock).unwrap();
+    fs::create_dir(&bad.host_lock).unwrap();
+    assert!(operation_lock(&bad, None).is_err());
+    fs::remove_dir(&bad.host_lock).unwrap();
+    fs::set_permissions(&bad.vault, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(operation_lock(&bad, None).is_err());
+    fs::set_permissions(&bad.vault, fs::Permissions::from_mode(0o700)).unwrap();
+    let unsupported = System::default();
+    assert!(unsupported.run("/usr/bin/true", vec![], None).is_err());
+}
+#[test]
+#[cfg(target_os = "macos")]
+fn inherited_lockf_runner_holds_a_separate_lease_and_releases_it_after_completion_or_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("lease");
+    let lease = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .unwrap(),
+    );
+    let other = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    let fd_flags = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) };
+    flock(&lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    let request = |script: &str| Request {
+        program: "/bin/sh",
+        args: vec!["-c".into(), script.into()],
+        input: None,
+        lease: Some(lease.clone()),
+    };
+    let output = execute(request("printf held")).unwrap();
+    assert_eq!(output.code, Some(0));
+    assert_eq!(output.stdout, b"held");
+    assert_eq!(
+        unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFD) },
+        fd_flags
+    );
+    flock(&other, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    flock(&other, libc::LOCK_UN).unwrap();
+    flock(&lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    assert!(execute_with(request("sleep 10"), Duration::from_millis(40)).is_err());
+    // SIGKILL skips lockf's cleanup. The live caller still owns its original
+    // description and explicitly unlocks it only after the group is reaped.
+    assert!(flock(&other, libc::LOCK_EX | libc::LOCK_NB).is_err());
+    flock(&lease, libc::LOCK_UN).unwrap();
+    flock(&other, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+    flock(&other, libc::LOCK_UN).unwrap();
 }
