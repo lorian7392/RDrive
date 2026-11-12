@@ -239,6 +239,14 @@ fn device(value: &str) -> Result<()> {
     }
     Ok(())
 }
+fn active_shadow(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        _ => true,
+    }
+}
 impl System {
     pub(super) fn capacity(home: &Path) -> Result<Option<u64>> {
         let Some(paths) = paths(home, false)? else {
@@ -338,6 +346,15 @@ impl System {
         let Some(image) = found.first() else {
             return Ok(None);
         };
+        // A shadow redirects writes outside the fixed host file even when
+        // the base image, volume UUID and interior identity still match.
+        if image.as_object().is_some_and(|fields| {
+            fields.iter().any(|(key, value)| {
+                key.to_ascii_lowercase().contains("shadow") && active_shadow(value)
+            })
+        }) {
+            bail!("APFS vault attachments with external shadow storage are not allowed");
+        }
         let entities = image["system-entities"]
             .as_array()
             .context("disk image devices missing")?;

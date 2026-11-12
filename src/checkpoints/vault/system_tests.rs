@@ -694,3 +694,31 @@ fn mount_placeholder_refuses_foreign_filesystems() {
     assert!(unmounted_directory(Path::new("/dev"), &f.home).is_err());
     assert!(unmounted_directory(Path::new("/missing-rdrive-mount"), &f.home).is_err());
 }
+#[test]
+fn external_shadow_storage_cannot_bypass_fixed_image_capacity() {
+    let mut f = Fixture::new();
+    let m = f.mount();
+    let p = f.paths();
+    for value in [
+        json!("/private/tmp/foreign.shadow"),
+        json!(["/private/tmp/foreign.shadow"]),
+        json!(true),
+        json!({}),
+        json!(1),
+    ] {
+        update(|s| {
+            s.overrides.insert("images",json!({"images":[{"image-path":s.image,"shadow-path":value,"system-entities":[{"dev-entry":"/dev/disk90"},{"dev-entry":"/dev/disk91s1","mount-point":s.mount}]}]}));
+        });
+        assert!(f.system.attached(&p).is_err());
+        assert!(f.system.space(&m).is_err());
+        assert!(f.system.unmount(&m).is_err());
+        assert!(update(|s| s.attached));
+    }
+    for value in [Value::Null, json!(false), json!(""), json!([])] {
+        assert!(!active_shadow(&value));
+    }
+    update(|s| {
+        s.overrides.remove("images");
+    });
+    f.system.unmount(&m).unwrap();
+}
