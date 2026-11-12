@@ -80,15 +80,17 @@ pub fn journal_binding(config:&config::Config,domain:&Domain)->Result<String>{
     let original=serde_json::to_string(&(&domain.id,&domain.profile,&profile.protocol,&profile.url,&profile.username,&domain.remote,domain.repository))?;
     Ok(state::key(&if domain.smart {format!("{original}:smart-v1")}else{original}))
 }
-fn checked_journal(home:&Path,config:&config::Config,domain:&Domain)->Result<Journal>{
+fn checked_journal(home:&Path,config:&config::Config,domain:&Domain)->Result<Journal>{checked_journal_normalization(home,config,domain).map(|(journal,_)|journal)}
+fn checked_journal_normalization(home:&Path,config:&config::Config,domain:&Domain)->Result<(Journal,bool)>{
     let path=home.join("provider").join(format!("{}.json",state::key(&domain.id)));
     let expected=journal_binding(config,domain)?;
     let mut journal=index::load(home,&domain.id,&expected,&path)?.context("provider index initialization failed")?;
     // index::load validates the stored binding and binds empty legacy state
     // before returning a snapshot; account validation has one authoritative path.
+    let mut changed=!journal.pins_migrated;
     if !journal.pins_migrated { journal.pins=journal.items.iter().filter(|(_,r)|r.item.pinned).map(|(id,_)|id.clone()).collect();journal.pins_migrated=true; }
-    for record in journal.items.values_mut(){record.metadata_known|=record.item.tag_data_hex.is_some()||!record.item.extended_attributes.is_empty();}
-    Ok(journal)
+    for record in journal.items.values_mut(){let known=record.metadata_known||record.item.tag_data_hex.is_some()||!record.item.extended_attributes.is_empty();changed|=known!=record.metadata_known;record.metadata_known=known;}
+    Ok((journal,changed))
 }
 pub fn domains(home:&Path)->Result<Vec<Domain>> {
     let path=home.join("provider-domains.json");
@@ -303,8 +305,12 @@ async fn enrich_metadata(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal,id
 fn next_metadata(store:&Store,d:&Domain,j:&Journal,demands:&[CatalogDemand])->Result<Option<String>>{
     let selector=crate::filtering::Selector::new(&store.config,&d.profile)?;
     let now=chrono::Utc::now().timestamp_millis();
+    // Preserve the first matching metadata demand, including duplicate IDs,
+    // without rescanning every demand for every file in a large namespace.
+    let mut requested=BTreeMap::new();
+    for demand in demands.iter().filter(|demand|demand.metadata) {requested.entry(demand.id.as_str()).or_insert(demand.requested);}
     Ok(j.items.iter().filter(|(id,record)|record.item.kind=="file"&&selector.allowed(&record.path,false).unwrap_or(false)&&record.strong.is_some()&&j.metadata_attempts.get(*id).is_none_or(|attempt|attempt.next_try<=now)).filter_map(|(id,record)|{
-        let request=demands.iter().find(|d|d.metadata&&d.id==*id).map(|d|d.requested).unwrap_or(0);
+        let request=requested.get(id.as_str()).copied().unwrap_or(0);
         let priority=if request>record.metadata_checked{0}else if record.metadata_known&&now.saturating_sub(record.metadata_checked)>=30_000{1}else{return None};
         Some(((priority,j.metadata_attempts.get(id).map_or(0,|attempt|attempt.last),record.metadata_checked),id.clone()))
     }).min_by_key(|(priority,_)|*priority).map(|(_,id)|id))
@@ -428,11 +434,20 @@ fn apply_policies(store:&Store,d:&Domain,j:&Journal,records:&mut BTreeMap<String
     let pins:BTreeMap<_,_>=records.keys().map(|id|(id.clone(),explicit_pin(j,id,records))).collect();
     let mutations=if d.smart {crate::smart::read_only(&store.home,&d.id,&journal_binding(&store.config,d)?)?}else{vec![]};
     let native=read_native_cached(&store.home,&store.config,d)?;
-    let deleted=mutations.iter().filter(|m|m.state.active()&&m.request["op"]=="delete").filter_map(|m|m.request["id"].as_str()).filter_map(|id|records.get(id).map(|r|r.path.clone())).collect::<Vec<_>>();
+    // read_only returns sequence order. Index both identities so the newest
+    // active request wins identically for original and replay-assigned IDs.
+    let mut latest=BTreeMap::new();let mut deleted=std::collections::BTreeSet::new();
+    for mutation in mutations.iter().filter(|mutation|mutation.state.active()) {
+        if let Some(id)=mutation.request["id"].as_str() {
+            latest.insert(id,mutation);
+            if mutation.request["op"]=="delete" {if let Some(record)=records.get(id){deleted.insert(record.path.clone());}}
+        }
+        if let Some(id)=j.smart_replays.get(&mutation.id).and_then(|request|request.id.as_deref()) {latest.insert(id,mutation);}
+    }
     for (id,record) in records {
         record.item.pinned=pins.get(id).copied().unwrap_or(false);record.item.smart=d.smart;record.item.native_materialized=native.get(id)==Some(&record.item.content_version);
-        let pending=mutations.iter().rev().find(|m|m.state.active()&&(m.request["id"].as_str()==Some(id)||j.smart_replays.get(&m.id).and_then(|r|r.id.as_ref())==Some(id)));
-        let hidden=deleted.iter().any(|path|record.path==*path||record.path.starts_with(&format!("{path}/")));
+        let pending=latest.get(id.as_str()).copied();
+        let hidden=std::iter::successors(Some(record.path.as_str()),|path|path.rsplit_once('/').map(|(parent,_)|parent)).any(|path|deleted.contains(path));
         if let Some(mutation)=pending.filter(|m|m.request["op"]=="modify"){
             if let Some(name)=mutation.request["name"].as_str(){if !name.is_empty()&&!name.contains('/'){record.item.name=name.into();}}
             if let Some(parent)=mutation.request["parent_id"].as_str(){record.item.parent_id=parent.into();}
@@ -458,9 +473,10 @@ fn is_smart_catalog(home:&Path,req:&Request)->bool {
     ["item","list","changes","watcher_snapshot"].contains(&req.op.as_str())&&domains(home).is_ok_and(|all|all.iter().any(|d|d.id==req.domain&&d.smart))
 }
 fn update_overlay(store:&Store,d:&Domain)->Result<()> {
-    let mut j=checked_journal(&store.home,&store.config,d)?;let old=j.items.clone();let mut next=std::mem::take(&mut j.items);apply_policies(store,d,&j,&mut next)?;
-    let filter=state::key(&serde_json::to_string(&store.config.filters)?);let changed=j.filter_fingerprint.as_ref()!=Some(&filter);
-    for (id,r) in &next {if changed||old.get(id).is_none_or(|old|old.item!=r.item){push_event(&mut j,Some(r.item.clone()),None);}}
+    let (mut j,normalized)=checked_journal_normalization(&store.home,&store.config,d)?;let old=j.items.clone();let mut next=std::mem::take(&mut j.items);apply_policies(store,d,&j,&mut next)?;
+    let filter=state::key(&serde_json::to_string(&store.config.filters)?);let changed=j.filter_fingerprint.as_ref()!=Some(&filter);let mut dirty=changed||normalized;
+    for (id,r) in &next {if changed||old.get(id).is_none_or(|old|old.item!=r.item){dirty=true;push_event(&mut j,Some(r.item.clone()),None);}}
+    if !dirty {return Ok(());}
     j.filter_fingerprint=Some(filter);j.items=next;save_journal(store,&d.id,&j)
 }
 pub fn smart_summary(store:&Store)->Result<Value> {
@@ -1252,3 +1268,7 @@ mod final_coverage_tests;
 #[cfg(test)]
 #[path = "provider/refresh_scheduler_tests.rs"]
 mod refresh_scheduler_tests;
+
+#[cfg(test)]
+#[path = "provider/policy_projection_tests.rs"]
+mod policy_projection_tests;

@@ -208,3 +208,9 @@ The first collection must come from macOS with all ordinary tests and DAV workfl
 These are not side-effect-free baseline CI. Read the script, identify the exact App/domain/IPC paths, and use a dedicated test account or environment. Do not share the default development IPC directory with active personal domains during tests.
 
 Real Finder menus, status icons, placeholders, downloading, eviction, offline editing, and tag display each need observed system evidence. Mock coverage establishes client logic and interface calls, not server power-loss durability, every SMB/WebDAV implementation, or every macOS version.
+
+## Large-catalog regression checks
+
+The macOS Checks job also runs `provider::policy_projection_tests` in release mode with `--include-ignored`. Its ordinary differential cases run in the regular Rust suite; the two larger benchmarks are executed explicitly by this additional step. They compare complete projected records, metadata selection, and unchanged journals against the prior implementation, including request alias precedence and required normalization updates.
+
+The fixtures use 108,675 synthetic catalog items, 529 retained requests, and 14,590 metadata demands. Timings are reported without a hardware-dependent pass threshold. The pipeline measurement separates first publication, control updates, reads, required normalization, and genuinely unchanged overlays. These measurements do not establish a real server’s network or first-scan latency. CI retains `catalog-benchmarks.log` with its validation artifacts.

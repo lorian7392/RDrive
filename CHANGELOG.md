@@ -4,6 +4,8 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Index retained mutations, deletion scopes, and metadata refresh demands once per pass; skip unchanged overlay writes while preserving required normalization updates.
+
 - Run metadata reads independently across Smart connections, revalidate before publication, and retain serialized upload recovery.
 - Enumerate SMB metadata with full 128-bit identities in bulk when supported, with a narrowly scoped compatibility fallback.
 - Keep valid cached listings available when a browse hint cannot be saved.
