@@ -326,12 +326,18 @@ fn unsafe_payloads_and_path_replacement_are_refused() {
     fs::remove_file(linked).unwrap();
     let link = f.store.home.join("spool/link");
     symlink(&path, &link).unwrap();
-    assert!(capture(&f.store)
+    assert!(capture(&f.store, f.limits.max_bytes)
         .unwrap_err()
         .to_string()
         .contains("symbolic"));
     fs::remove_file(link).unwrap();
-    assert!(source(path.clone(), Path::new("spool/a"), Some("wrong")).is_err());
+    assert!(source(
+        path.clone(),
+        Path::new("spool/a"),
+        Some("wrong"),
+        f.limits.max_bytes
+    )
+    .is_err());
     let blobs = f.store.home.join("history/blobs");
     fs::create_dir_all(blobs.join("nested")).unwrap();
     for p in [
@@ -341,11 +347,14 @@ fn unsafe_payloads_and_path_replacement_are_refused() {
     ] {
         fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    assert!(capture(&f.store).unwrap_err().to_string().contains("flat"));
+    assert!(capture(&f.store, f.limits.max_bytes)
+        .unwrap_err()
+        .to_string()
+        .contains("flat"));
     fs::remove_dir(blobs.join("nested")).unwrap();
     fs::write(blobs.join("bad-name"), b"bad").unwrap();
     fs::set_permissions(blobs.join("bad-name"), fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(capture(&f.store).is_err());
+    assert!(capture(&f.store, f.limits.max_bytes).is_err());
 }
 #[test]
 fn corrupt_or_foreign_records_and_blobs_are_preserved_and_never_exported() {
@@ -667,25 +676,29 @@ fn immutable_tree_variants_and_current_account_cache_are_verified() {
         scope: Some(crate::cache::scope(&f.store, "cache").unwrap()),
     };
     f.store.db.cache.insert("cached".into(), cache_item.clone());
-    let out = capture(&f.store).unwrap();
+    let out = capture(&f.store, f.limits.max_bytes).unwrap();
     assert_eq!(out.len(), 3);
     assert!(out.contains_key(Path::new("cache/object")));
     assert!(out.contains_key(Path::new("smart/domain/dirty/edit.data")));
     f.store.db.cache.get_mut("cached").unwrap().scope = None;
-    assert!(capture(&f.store)
+    assert!(capture(&f.store, f.limits.max_bytes)
         .unwrap_err()
         .to_string()
         .contains("unbound"));
     f.store.db.cache.insert("cached".into(), cache_item);
     f.store.db.cache.get_mut("cached").unwrap().entry.size = 7;
-    assert!(capture(&f.store).unwrap_err().to_string().contains("size"));
+    assert!(capture(&f.store, f.limits.max_bytes)
+        .unwrap_err()
+        .to_string()
+        .contains("size"));
     let mut out = BTreeMap::new();
     assert!(collect_tree(
         Path::new("/dev"),
         &f.store.home.join("spool"),
         Path::new("spool"),
         &mut out,
-        false
+        false,
+        f.limits.max_bytes
     )
     .is_err());
 }
@@ -693,7 +706,13 @@ fn immutable_tree_variants_and_current_account_cache_are_verified() {
 fn source_copy_races_and_duplicate_sequences_do_not_publish_or_prune() {
     let mut f = fixture();
     let source_path = payload(&f, "a", b"one");
-    let selected = source(source_path.clone(), Path::new("spool/a"), None).unwrap();
+    let selected = source(
+        source_path.clone(),
+        Path::new("spool/a"),
+        None,
+        f.limits.max_bytes,
+    )
+    .unwrap();
     fs::write(&source_path, b"new content").unwrap();
     let mount = f.host.mounted(&f.store.home, false);
     layout(&mount, &f.store.home, true).unwrap();
@@ -768,7 +787,7 @@ fn prepared_atomic_manifest_write_failure_recovers_without_touching_last_checkpo
     let temporary = blobs.join(format!(".capture-{}", uid(60)));
     fs::write(&temporary, b"mutable partial capture").unwrap();
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(!capture(&f.store)
+    assert!(!capture(&f.store, f.limits.max_bytes)
         .unwrap()
         .keys()
         .any(|p| p.to_string_lossy().contains(".capture-")));
@@ -886,4 +905,20 @@ fn capacity_cleanup_retries_space_measurement_before_publishing_new_checkpoint()
     assert!(contains_with(&f.store.home, &uid(2), &f.limits, &mut f.host).unwrap());
     assert!(contains_with(&f.store.home, &uid(3), &f.limits, &mut f.host).unwrap());
     assert_eq!(fs::read(f.store.home.join("spool/a")).unwrap(), b"three");
+}
+#[test]
+fn payload_larger_than_the_entire_vault_is_rejected_before_scanning_sparse_contents() {
+    let f = fixture();
+    let path = payload(&f, "too-large", b"");
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(f.limits.max_bytes + 1)
+        .unwrap();
+    assert!(capture(&f.store, f.limits.max_bytes)
+        .unwrap_err()
+        .to_string()
+        .contains("insufficient_quota"));
+    assert_eq!(fs::metadata(path).unwrap().len(), f.limits.max_bytes + 1);
 }

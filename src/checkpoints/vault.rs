@@ -351,10 +351,10 @@ fn garbage_collect(mount: &Mounted) -> Result<u64> {
             remove.push((entry.path(), fs::metadata(entry.path())?.len()));
         }
     }
-    let mut bytes = 0;
+    let mut bytes = 0u64;
     for (path, size) in remove {
         fs::remove_file(path)?;
-        bytes += size;
+        bytes = bytes.saturating_add(size);
     }
     File::open(mount.root.join("blobs"))?.sync_all()?;
     Ok(bytes)
@@ -581,9 +581,12 @@ fn identity(file: &File) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
         m.ctime_nsec(),
     ))
 }
-fn source(path: PathBuf, logical: &Path, expected: Option<&str>) -> Result<Source> {
+fn source(path: PathBuf, logical: &Path, expected: Option<&str>, maximum: u64) -> Result<Source> {
     let mut file = source_file(&path)?;
     let before = identity(&file)?;
+    if before.2 > maximum {
+        bail!("insufficient_quota: a checkpoint payload exceeds the entire vault capacity");
+    }
     let hash = crate::cache::hash_fd(&mut file)?;
     if identity(&file)? != before || expected.is_some_and(|v| v != hash) {
         bail!("checkpoint source changed or its verified checksum is invalid");
@@ -604,6 +607,7 @@ fn collect_tree(
     logical: &Path,
     out: &mut BTreeMap<PathBuf, Source>,
     hash_name: bool,
+    maximum: u64,
 ) -> Result<()> {
     if !path.try_exists()? {
         return Ok(());
@@ -624,7 +628,7 @@ fn collect_tree(
             if hash_name {
                 bail!("history blobs must be flat verified files");
             }
-            collect_tree(base, &entry.path(), &child, out, hash_name)?;
+            collect_tree(base, &entry.path(), &child, out, hash_name, maximum)?;
         } else {
             if hash_name
                 && entry
@@ -653,13 +657,13 @@ fn collect_tree(
             }
             out.insert(
                 child.clone(),
-                source(entry.path(), &child, expected.as_deref())?,
+                source(entry.path(), &child, expected.as_deref(), maximum)?,
             );
         }
     }
     Ok(())
 }
-fn capture(store: &Store) -> Result<BTreeMap<PathBuf, Source>> {
+fn capture(store: &Store, maximum: u64) -> Result<BTreeMap<PathBuf, Source>> {
     let mut out = BTreeMap::new();
     for name in ["spool", "smart", "history/blobs"] {
         collect_tree(
@@ -668,6 +672,7 @@ fn capture(store: &Store) -> Result<BTreeMap<PathBuf, Source>> {
             Path::new(name),
             &mut out,
             name == "history/blobs",
+            maximum,
         )?;
     }
     for item in store.db.cache.values() {
@@ -677,7 +682,7 @@ fn capture(store: &Store) -> Result<BTreeMap<PathBuf, Source>> {
         let logical = Path::new("cache").join(&item.object);
         relative(&logical)?;
         let path = crate::cache::object_path(store, &item.object)?;
-        let value = source(path, &logical, Some(&item.sha256))?;
+        let value = source(path, &logical, Some(&item.sha256), maximum)?;
         if value.content.bytes != item.entry.size {
             bail!("cached payload size differs from its verified index");
         }
@@ -772,7 +777,7 @@ fn create_with(
         let mut old=rows(mount)?;if let Some(latest)=old.first(){verify(mount,latest)?;}
         if !limits.auto_prune && old.len()>=limits.max_records{bail!("checkpoint record limit reached; no checkpoint was removed");}
         garbage_collect(mount)?;
-        let sources=capture(store)?;
+        let sources=capture(store,limits.max_bytes)?;
         let value=Manifest{version:1,id:checkpoint.into(),created:state::now(),sequence:old.iter().map(|v|v.sequence).max().unwrap_or(0).checked_add(1).context("vault checkpoint sequence exhausted")?,home:mount.home_binding.clone(),instance_id:mount.instance_id.clone(),volume_uuid:mount.volume_uuid.clone(),files:sources.iter().map(|(p,s)|(p.clone(),s.content.clone())).collect()};
         let raw_manifest=serde_json::to_vec(&value)?;
         let stage=mount.root.join("staging").join(checkpoint);directory(&stage)?;File::open(mount.root.join("staging"))?.sync_all()?;state::atomic_write(&stage.join("intent.json"),&raw_manifest)?;
