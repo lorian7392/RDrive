@@ -275,12 +275,26 @@ impl Directory {
         }
     }
     fn save(&self, state: &Runtime) -> Result<()> {
+        self.save_with_parent_sync(state, |parent| Ok(File::open(parent)?.sync_all()?))
+    }
+    fn save_with_parent_sync(
+        &self,
+        state: &Runtime,
+        mut sync_parent: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
         let raw = serde_json::to_vec_pretty(state)?;
         if raw.len() as u64 > MAX_STATE_BYTES {
             bail!("checkpoint scheduler state exceeds its size bound");
         }
         state.validate()?;
         self.read()?;
+        // Another caller can observe a newly created directory before its
+        // creator syncs the parent. Anchor that entry before persisting intent.
+        sync_parent(
+            self.path
+                .parent()
+                .context("checkpoint scheduler needs a parent")?,
+        )?;
         let path = self
             .path
             .join(format!(".schedule-{}.tmp", uuid::Uuid::new_v4()));

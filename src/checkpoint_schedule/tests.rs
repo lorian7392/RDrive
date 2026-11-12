@@ -678,3 +678,42 @@ fn contradictory_receipts_and_detached_failure_state_are_never_reset_as_idle() {
         assert_eq!(fs::read(directory.path.join("state.json")).unwrap(), raw);
     }
 }
+
+#[test]
+fn unsynced_parent_directory_never_authorizes_a_checkpoint_publication() {
+    for scenario in 0..3 {
+        let mut f = Fixture::new();
+        if scenario == 1 {
+            Directory::open(&f.home, true).unwrap();
+        }
+        if scenario == 2 {
+            f.tick(Trigger::Manual).unwrap();
+        }
+        let state_path = f.home.join("checkpoint-scheduler/state.json");
+        let prior = fs::read(&state_path).ok();
+        let publications = f.backend.creates.len();
+        let clock = f.clock.clone();
+        let expected_parent = f.home.clone();
+        let result = tick_with_save(
+            &f.home,
+            &f.options,
+            Trigger::Manual,
+            &move || clock.get(),
+            &mut f.backend,
+            |directory, state| {
+                directory.save_with_parent_sync(state, |parent| {
+                    assert_eq!(parent, expected_parent);
+                    bail!("injected parent-directory fsync failure");
+                })
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("parent-directory fsync"));
+        assert_eq!(f.backend.creates.len(), publications);
+        assert_eq!(fs::read(&state_path).ok(), prior);
+        assert_eq!(f.tick(Trigger::Manual).unwrap()["created"], true);
+        assert_eq!(f.backend.creates.len(), publications + 1);
+    }
+}
