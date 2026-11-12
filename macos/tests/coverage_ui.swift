@@ -347,6 +347,24 @@ enum UICoverageTests {
         try pump("An unavailable native manager hid the saved repair") { details().contains("Reopen this connection") }
         controller.integration = integration
 
+        itemState = "error"
+        itemMessage = "unsupported: fetch this file before editing metadata"
+        try prepare("rdrive.status")
+        try expect(details().contains(itemMessage) && requests.last?["op"] as? String == "smart_repair_status",
+                   "A failed folder no-op did not ask the backend whether it is safely repairable")
+        controller.repairConflict()
+        try pump("The failed folder no-op repair did not finish") { details().contains("Stale folder request cleared") }
+        eligibility = ["eligible": false, "message": "Real folder metadata changes require review."]
+        let failedRequests = requests.count
+        controller.prepare(forAction: "rdrive.repair", itemIdentifiers: [providerID("folder")])
+        try pump("An ineligible failed folder omitted its protected-intent reason") { details().contains("Real folder metadata changes require review.") }
+        try expect(repairButton().isHidden && requests.count == failedRequests + 1,
+                   "A failed folder was repaired without backend approval")
+        controller.repairConflict()
+        try expect(requests.count == failedRequests + 1, "An ineligible failed folder sent a repair")
+        eligibility = ["eligible": true, "mutation_id": "immutable-request",
+                       "message": "Clear this stale folder request and queue a folder refresh. Local contents and other pending edits are retained."]
+
         itemMessage = "excluded_by_filter: synchronization filters exclude Backup/a.part; built-in temporary rule *.part"
         eligibility["filter_reason"] = "Excluded by temporary-file rule *.part at Backup/a.part"
         for state in ["blocked", "queued"] {

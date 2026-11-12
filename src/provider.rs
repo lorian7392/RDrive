@@ -1021,6 +1021,8 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
         else {
             let dest=remote(&d,&target)?;
             if let Some(old)=&existing {if target!=old.path{bail!("unsupported: use managed repository mode for version-guarded rename/reparent");}}
+            let directory_no_op=source.is_none()&&existing.as_ref().is_some_and(|record|record.item.kind=="directory");
+            if directory_no_op&&(req.tag_data_hex.is_some()||req.extended_attributes.is_some()){bail!("unsupported: directory tags and extended attributes are not supported; local edit retained");}
             let confirmed=j.requests.get(&key).and_then(|p|p.confirmed.clone());
             let entry=if let Some(confirmed)=confirmed {let observed=b.stat(&dest).await?.context("version_conflict: confirmed content disappeared")?;if !observed.same_revision(&confirmed){bail!("version_conflict: target changed after confirmed upload");}observed}
             else if let Some(source)=&source {
@@ -1028,6 +1030,10 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
                 if let WriteCondition::Match(expected)=&condition{if j.requests.get(&key).and_then(|p|p.version.as_ref()).is_none(){let archived=if let Some(planned)=resolution::planned_version(&store,&d,&req)?{if planned.path!=dest||!planned.original.same_revision(expected){bail!("version_conflict: saved replacement version does not match the guarded target");}Some(planned)}else{crate::policies::prepare_version(&store,b.as_ref(),&d.profile,&dest,expected,&key,false).await?};j.requests.get_mut(&key).unwrap().version=archived;save_journal(&store,&d.id,&j)?;}}
                 if let Some(activity)=activity {activity.bind(dest.clone(),fs::metadata(source)?.len());}
                 b.upload(source,&dest,condition).await?
+            }else if directory_no_op {
+                // A same-location directory callback has no content to fetch
+                // or publish. Keep its checked metadata identity for replay.
+                existing.as_ref().unwrap().entry.clone().context("no_such_item: directory metadata missing")?
             }else{existing.as_ref().expect("content-free modifications always have an existing item").strong.clone().context("unsupported: fetch this file before editing metadata")?};
             j.requests.get_mut(&key).unwrap().confirmed=Some(entry.clone());save_journal(&store,&d.id,&j)?;
             if metadata.is_none()&&source.is_none()&&(req.tag_data_hex.is_some()||req.extended_attributes.is_some()) {

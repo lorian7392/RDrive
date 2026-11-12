@@ -33,6 +33,45 @@ fn setup()->(tempfile::TempDir,Store,Domain,Journal){
 fn id(j:&Journal,path:&str)->String{j.items.values().find(|r|r.path==path).unwrap().item.id.clone()}
 
 #[tokio::test]
+async fn weak_directory_no_op_needs_no_content_fetch_and_retains_real_metadata_intent() {
+    struct Connected(Arc<ScopedBackend>);
+    #[async_trait]
+    impl Connector for Connected {
+        async fn connect(&self, _: &config::Profile, _: &str, _: crate::transfer::TransferContext) -> Result<Arc<dyn Backend>> { Ok(self.0.clone()) }
+    }
+    let (_temp,store,d,mut j)=setup();
+    let backend=Arc::new(ScopedBackend::default());
+    let mut directory=ScopedBackend::entry("GH666",true);
+    directory.etag=Some("W/smb-meta:directory-identity".into());
+    backend.set("",vec![directory.clone()]);
+    refresh_directory(&store,backend.as_ref(),&d,&mut j,"root").await.unwrap();
+    let item_id=id(&j,"GH666");let item=j.items[&item_id].item.clone();
+    assert!(j.items[&item_id].strong.is_none());
+    let home=store.home.clone();let stage=private(&home.join("staging")).unwrap();let fd=open_staging(&stage).unwrap();drop(store);
+    let request:Request=serde_json::from_value(json!({"v":1,"op":"modify","domain":d.id,"id":item_id,
+        "name":"GH666","parent_id":"root","request_id":"directory-no-op",
+        "base_content_version":item.content_version,"base_metadata_version":item.metadata_version})).unwrap();
+    let connector=Connected(backend.clone());
+    let reply=online_process_inner_with(&home,&stage,&fd,request.clone(),Default::default(),None,&connector).await.unwrap();
+    assert_eq!(reply["item"]["id"],item_id);assert_eq!(reply["item"]["has_unsynced_changes"],false);
+    assert_eq!(backend.rows.lock().unwrap()[""],vec![directory.clone()]);
+    let store=Store::open(home.clone()).unwrap();let journal=checked_journal(&home,&store.config,&d).unwrap();
+    let key=format!("{}:directory-no-op",state::key(&d.id));assert_eq!(journal.requests[&key].response.as_ref(),Some(&reply));
+    assert!(journal.items[&item_id].strong.is_none(),"a no-op must not invent a strong content guard");drop(store);
+    assert_eq!(online_process_inner_with(&home,&stage,&fd,request.clone(),Default::default(),None,&connector).await.unwrap(),reply);
+    let mut stale=request.clone();stale.request_id=Some("stale".into());stale.base_content_version=Some("external".into());
+    assert!(online_process_inner_with(&home,&stage,&fd,stale,Default::default(),None,&connector).await.unwrap_err().to_string().contains("version_conflict"));
+    for (identity,tags,attributes) in [("clear-tags",Some(String::new()),None),("clear-xattrs",None,Some(BTreeMap::new()))] {
+        let mut metadata=request.clone();metadata.request_id=Some(identity.into());metadata.tag_data_hex=tags;metadata.extended_attributes=attributes;
+        let error=online_process_inner_with(&home,&stage,&fd,metadata,Default::default(),None,&connector).await.unwrap_err();
+        assert!(error.to_string().contains("directory tags and extended attributes"),"{error:#}");
+        let store=Store::open(home.clone()).unwrap();let journal=checked_journal(&home,&store.config,&d).unwrap();
+        assert!(journal.requests[&format!("{}:{identity}",state::key(&d.id))].response.is_none());
+        assert_eq!(backend.rows.lock().unwrap()[""],vec![directory.clone()]);
+    }
+}
+
+#[tokio::test]
 async fn parent_namespace_is_published_without_descendant_or_sidecar_requests(){
     let (_temp,store,d,mut j)=setup();let b=ScopedBackend::default();
     b.set("",vec![ScopedBackend::entry("a",true),ScopedBackend::entry("doc",false)]);

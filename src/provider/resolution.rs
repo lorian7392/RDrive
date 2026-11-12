@@ -245,10 +245,11 @@ pub fn smart_repair_status(home: &Path, domain_id: &str, item_id: &str) -> Resul
     let mut message = "This item has no eligible stale directory request.".to_owned();
     // A recovery marker belongs to an earlier local repair. Prefer an actual
     // current conflict before considering unfinished overlay publication.
-    let conflicts = mutations.iter().filter(|mutation| mutation.state == MutationState::Conflict || filter_blocked(mutation));
+    let conflicts = mutations.iter().filter(|mutation| mutation.state == MutationState::Conflict || filter_blocked(mutation) || legacy_metadata_directory_failure(mutation));
     let interrupted = mutations.iter().filter(|mutation| mutation.stale_directory_cancelled()
         && journal.items.get(item_id).is_some_and(|record| record.item.sync_state.as_deref() == Some("conflict")
-            || record.item.sync_message.as_deref().and_then(crate::filtering::exclusion_path).is_some()));
+            || record.item.sync_message.as_deref().and_then(crate::filtering::exclusion_path).is_some()
+            || record.item.sync_state.as_deref() == Some("error")));
     for mutation in conflicts.chain(interrupted) {
         if mutation.request["id"].as_str() != Some(item_id) {
             continue;
@@ -452,11 +453,12 @@ fn stale_directory_record<'a>(
     journal: &'a Journal,
     mutation: &Mutation,
     request: &Request,
-    allow_filter_blocked: bool,
+    allow_local_no_op: bool,
 ) -> Result<&'a Record> {
     let exact_conflict = mutation.state == MutationState::Conflict
         && mutation.error.as_deref() == Some(STALE_SYSTEM_SNAPSHOT);
-    if !exact_conflict && !mutation.stale_directory_cancelled() && !(allow_filter_blocked && filter_blocked(mutation)) {
+    let legacy = legacy_metadata_directory_failure(mutation) || mutation.stale_directory_cancelled();
+    if !exact_conflict && !mutation.stale_directory_cancelled() && !(allow_local_no_op && (filter_blocked(mutation) || legacy)) {
         bail!("Smart request is not stopped on a stale system snapshot");
     }
     if mutation.snapshot.is_some()
@@ -481,22 +483,24 @@ fn stale_directory_record<'a>(
         .request_id
         .as_deref()
         .context("Smart request identity missing")?;
-    if journal
-        .requests
-        .contains_key(&format!("{key_prefix}:{request_id}"))
-    {
-        bail!("Smart request has a durable provider intent or receipt");
+    if let Some(pending) = journal.requests.get(&format!("{key_prefix}:{request_id}")) {
+        // The old file-only metadata guard persisted an empty intent before
+        // rejecting a directory. Only its exact, unpublished no-op is safe.
+        let attempted = journal.smart_replays.get(&mutation.id)
+            .filter(|replay| replay.request_id == request.request_id).unwrap_or(request);
+        if !(allow_local_no_op && legacy && unpublished_directory_no_op(d,journal,attempted,pending)?) {
+            bail!("Smart request has a durable provider intent or receipt");
+        }
     }
     if let Some(replay) = journal.smart_replays.get(&mutation.id) {
         let replay_id = replay
             .request_id
             .as_deref()
             .context("Smart replay identity missing")?;
-        if journal
-            .requests
-            .contains_key(&format!("{key_prefix}:{replay_id}"))
-        {
-            bail!("Smart replay has a durable provider intent or receipt");
+        if let Some(pending) = journal.requests.get(&format!("{key_prefix}:{replay_id}")) {
+            if !(allow_local_no_op && legacy && unpublished_directory_no_op(d,journal,replay,pending)?) {
+                bail!("Smart replay has a durable provider intent or receipt");
+            }
         }
         if replay.op != request.op
             || replay.domain != request.domain
@@ -512,6 +516,29 @@ fn stale_directory_record<'a>(
         }
     }
     Ok(record)
+}
+
+fn legacy_metadata_directory_failure(mutation: &Mutation) -> bool {
+    mutation.state == MutationState::Failed
+        && mutation.error.as_deref() == Some("unsupported: fetch this file before editing metadata")
+}
+
+fn unpublished_directory_no_op(d: &Domain, journal: &Journal, request: &Request, pending: &Pending) -> Result<bool> {
+    let Some(record) = request.id.as_deref().and_then(|id|journal.items.get(id)) else { return Ok(false); };
+    if request.op != "modify" || record.item.kind != "directory"
+        || request.content_path.is_some() || request.tag_data_hex.is_some() || request.extended_attributes.is_some()
+        || directory_modify_target(d,journal,request,record)? != record.path {
+        return Ok(false);
+    }
+    let metadata: Option<String> = None;
+    let fingerprint = state::key(&serde_json::to_string(&(&request.op, &request.domain, &request.id,
+        &request.parent_id, &request.name, &request.kind, &request.base_content_version,
+        &request.base_metadata_version, &request.tag_data_hex, &request.extended_attributes,
+        &metadata, request.recursive))?);
+    Ok(pending.fingerprint == fingerprint && pending.metadata.is_none() && pending.source_fingerprint.is_none()
+        && pending.transaction.is_none() && pending.confirmed.is_none() && pending.response.is_none()
+        && pending.deletion_path.is_none() && pending.deletion_expected.is_none() && pending.metadata_base_fingerprint.is_none()
+        && pending.namespace.is_none() && pending.version.is_none())
 }
 
 fn filter_blocked(mutation: &Mutation) -> bool {
@@ -1284,6 +1311,108 @@ mod tests {
         let mut tagged=cancelled.clone();tagged.request["tag_data_hex"]=json!("");
         assert!(cancelled_directory_response(&store,&domain,&tagged).unwrap_err().to_string().contains("includes content"));
         assert_eq!(disk.connections.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
+
+    fn contentless_fingerprint(request: &Request) -> String {
+        let metadata: Option<String> = None;
+        state::key(&serde_json::to_string(&(&request.op, &request.domain, &request.id,
+            &request.parent_id, &request.name, &request.kind, &request.base_content_version,
+            &request.base_metadata_version, &request.tag_data_hex, &request.extended_attributes,
+            &metadata, request.recursive)).unwrap())
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_directory_failure_repairs_only_the_immutable_unpublished_no_op() {
+        let (_temporary,store,domain,mut queue,mutation,disk)=no_op_directory_fixture().await;
+        let failed=queue.fail(&mutation.id,crate::smart::FailureKind::Other,
+            "unsupported: fetch this file before editing metadata").unwrap();
+        let id=failed.request["id"].as_str().unwrap().to_owned();
+        let mut journal=checked_journal(&store.home,&store.config,&domain).unwrap();
+        let mut replay=request(failed.request.clone());
+        replay.base_metadata_version=Some(format!("{}:status-overlay",replay.base_metadata_version.unwrap()));
+        let key=format!("{}:{}",state::key(&domain.id),replay.request_id.as_deref().unwrap());
+        let intent:Pending=serde_json::from_value(json!({"fingerprint":contentless_fingerprint(&replay)})).unwrap();
+        journal.smart_replays.insert(failed.id.clone(),replay.clone());
+        journal.requests.insert(key.clone(),intent.clone());
+        save_journal(&store,&domain.id,&journal).unwrap();
+        let source=store.home.join("tmp/legacy-child");fs::write(&source,b"retained child payload").unwrap();
+        let child=queue.enqueue(json!({"v":1,"op":"create","domain":domain.id,"parent_id":id,
+            "client_item_id":"legacy-child","name":"child.txt","kind":"file"}),Some(&File::open(&source).unwrap())).unwrap();
+        update_overlay(&store,&domain).unwrap();
+        let status=smart_repair_status(&store.home,&domain.id,&id).unwrap();
+        assert_eq!(status["eligible"],true);assert_eq!(status["mutation_id"],failed.id);
+        let before=queue.list().into_iter().filter(|row|row.id!=failed.id).map(|row|(row.id.clone(),serde_json::to_value(row).unwrap())).collect::<BTreeMap<_,_>>();
+        let snapshot=queue.snapshot(&child.id).unwrap().unwrap().path().to_path_buf();
+        let home=store.home.clone();let binding=queue.binding().to_owned();
+        let blocked=demand_directory(&home,&domain.id);state::atomic_write(&blocked,b"interrupted local refresh publication").unwrap();
+        drop(queue);drop(store);
+        assert!(repair_stale_smart_directory(&home,&domain.id,&id,&failed.id).unwrap_err().to_string().contains("retry this repair"));
+        assert_eq!(smart_repair_status(&home,&domain.id,&id).unwrap()["eligible"],true);
+        fs::remove_file(blocked).unwrap();
+        let repaired=repair_stale_smart_directory(&home,&domain.id,&id,&failed.id).unwrap();
+        assert_eq!(repaired["repaired"],true);assert_eq!(repaired["remote_changed"],false);
+        assert_eq!(repair_stale_smart_directory(&home,&domain.id,&id,&failed.id).unwrap()["mutation"],repaired["mutation"]);
+        let after=crate::smart::read_only(&home,&domain.id,&binding).unwrap().into_iter().filter(|row|row.id!=failed.id).map(|row|(row.id.clone(),serde_json::to_value(row).unwrap())).collect::<BTreeMap<_,_>>();
+        assert_eq!(before,after);assert_eq!(fs::read(snapshot).unwrap(),b"retained child payload");
+        let store=Store::open(home.clone()).unwrap();let journal=checked_journal(&home,&store.config,&domain).unwrap();
+        assert_eq!(serde_json::to_value(&journal.requests[&key]).unwrap(),serde_json::to_value(intent).unwrap());
+        let cancelled=crate::smart::read_only(&home,&domain.id,&binding).unwrap().into_iter().find(|row|row.id==failed.id).unwrap();
+        assert_eq!(cancelled_directory_response(&store,&domain,&cancelled).unwrap().unwrap()["cancelled_no_op"],true);
+        assert_eq!(smart_repair_status(&home,&domain.id,&id).unwrap()["eligible"],false);
+        assert_eq!(disk.connections.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_directory_repair_refuses_real_edits_and_incomplete_publications() {
+        let (_temporary,store,domain,mut queue,mutation,_disk)=no_op_directory_fixture().await;
+        let failed=queue.fail(&mutation.id,crate::smart::FailureKind::Other,
+            "unsupported: fetch this file before editing metadata").unwrap();
+        let mut journal=checked_journal(&store.home,&store.config,&domain).unwrap();
+        let original=request(failed.request.clone());
+        assert!(no_op_directory_source(&domain,&journal,&failed,&original).is_ok());
+        for state in [MutationState::Pending,MutationState::Running,MutationState::Interrupted,MutationState::Conflict,MutationState::Done] {
+            let mut unrelated=failed.clone();unrelated.state=state;
+            assert!(no_op_directory_source(&domain,&journal,&unrelated,&original).is_err());
+        }
+        for error in ["unsupported: directory tags", "unsupported: fetch this file before editing metadata suffix", "server_unreachable: timed out"] {
+            let mut unrelated=failed.clone();unrelated.error=Some(error.into());
+            assert!(no_op_directory_source(&domain,&journal,&unrelated,&original).is_err());
+        }
+        for (field,value) in [("tag_data_hex",json!("")),("extended_attributes",json!({})),("content_path",json!("payload")),("name",json!("rename")),("parent_id",json!("root")),("op",json!("delete"))] {
+            let mut changed=failed.request.clone();changed[field]=value;
+            assert!(no_op_directory_source(&domain,&journal,&failed,&request(changed)).is_err(),"field {field} must remain retained");
+        }
+        let id=original.id.as_deref().unwrap();let directory=journal.items[id].clone();
+        journal.items.get_mut(id).unwrap().item.kind="file".into();
+        assert!(no_op_directory_source(&domain,&journal,&failed,&original).is_err());
+        journal.items.insert(id.into(),directory);
+        let key=format!("{}:{}",state::key(&domain.id),original.request_id.as_deref().unwrap());
+        let intent:Pending=serde_json::from_value(json!({"fingerprint":contentless_fingerprint(&original)})).unwrap();
+        for (field,value) in [("fingerprint",json!("another-request")),("source_fingerprint",json!("source")),("transaction",json!("transaction")),("response",json!({"item":{}})),("deletion_path",json!("directory")),("metadata_base_fingerprint",json!("metadata")),("confirmed",serde_json::to_value(journal.items[id].entry.clone()).unwrap()),("deletion_expected",serde_json::to_value(journal.items[id].entry.clone()).unwrap())] {
+            let mut changed=serde_json::to_value(&intent).unwrap();changed[field]=value;
+            journal.requests.insert(key.clone(),serde_json::from_value(changed).unwrap());
+            assert!(no_op_directory_source(&domain,&journal,&failed,&original).is_err(),"publication field {field} must block repair");
+        }
+        journal.requests.insert(key.clone(),intent);
+        assert!(no_op_directory_source(&domain,&journal,&failed,&original).is_ok());
+        let mut missing=original.clone();missing.id=Some("unknown-directory".into());
+        assert!(!unpublished_directory_no_op(&domain,&journal,&missing,&journal.requests[&key]).unwrap());
+        let mut real=original.clone();real.tag_data_hex=Some(String::new());
+        assert!(!unpublished_directory_no_op(&domain,&journal,&real,&journal.requests[&key]).unwrap());
+        real=original.clone();real.parent_id=Some("unknown-parent".into());
+        assert!(unpublished_directory_no_op(&domain,&journal,&real,&journal.requests[&key]).is_err());
+        let entry=journal.items[id].entry.as_ref().unwrap();
+        let source=store.home.join("tmp/metadata-proof");fs::write(&source,b"metadata contents").unwrap();
+        for (field,value) in [
+            ("metadata",serde_json::to_value(crate::metadata::capture(&source,&Default::default()).unwrap()).unwrap()),
+            ("namespace",json!({"from":"parent/folder","to":"renamed","deleted":false,"expected":entry,"nodes":[],"records":[],"phase":"prepared"})),
+            ("version",json!({"id":"version","path":"parent/folder","saved":"archive","original":entry,"sha256":"00"}))
+        ] {
+            let mut changed=serde_json::to_value(&journal.requests[&key]).unwrap();changed[field]=value;
+            let pending:Pending=serde_json::from_value(changed).unwrap();
+            assert!(!unpublished_directory_no_op(&domain,&journal,&original,&pending).unwrap(),"publication field {field} must block repair");
+        }
     }
 
 }

@@ -90,7 +90,7 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
                     var line = item.name + ": " + state.title
                     if item.smart == true { line += " · Smart Synchronization" }
                     if let message = item.sync_message, !message.isEmpty { line += "\n" + String(message.prefix(500)) }
-                    let repairableState = state == .conflict || state == .blocked
+                    let repairableState = state == .conflict || state == .blocked || state == .error
                         || (state == .queued && item.sync_message?.contains("synchronization filters exclude") == true)
                     if itemIdentifiers.count == 1 && item.smart == true && item.kind == "directory" && repairableState {
                         let eligibility = try self.integration.request(bridge, ["op": "smart_repair_status",

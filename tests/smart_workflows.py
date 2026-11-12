@@ -40,6 +40,10 @@ def run(binary):
         (remote / "pinned-lazy").mkdir()
         (remote / "Backup").mkdir()
         (remote / "Backup" / "remote.part").write_bytes(b"existing excluded temporary contents")
+        (remote / "GH666").mkdir()
+        (remote / "GH666" / "keep.txt").write_bytes(b"untouched directory contents")
+        (remote / "GH666Legacy").mkdir()
+        (remote / "GH666Legacy" / "keep.txt").write_bytes(b"retained legacy directory contents")
         class Fixture(Dav):
             online = True
             requests_seen = []
@@ -50,6 +54,9 @@ def run(binary):
             failed_directories = set()
             failed_directory_requests = []
             directory_lock = threading.Lock()
+            def etag(self, path):
+                value = super().etag(path)
+                return "W/" + value if path.name in ("GH666", "GH666Legacy") and path.is_dir() else value
             def handle_dav(self):
                 type(self).request_attempts.append((self.command, self.path))
                 path = self.path.rstrip("/")
@@ -252,6 +259,19 @@ def run(binary):
             cli("smart", "export", "smart-fixture", entry["id"], str(export))
             assert export.read_bytes() == b"local conflict copy"
             passed("concurrent remote changes stop overwrites and retain an exportable local conflict copy")
+
+            weak_folder = next(item for item in items if item["name"] == "GH666")
+            no_op = dict(op="modify", id=weak_folder["id"], name=weak_folder["name"], parent_id="root",
+                         request_id="weak-folder-no-op", base_content_version=weak_folder["content_version"],
+                         base_metadata_version=weak_folder["metadata_version"])
+            request_offset = len(Fixture.request_attempts)
+            updated_folder = ok(**no_op)
+            assert updated_folder["item"]["id"] == weak_folder["id"]
+            assert not updated_folder["item"]["has_unsynced_changes"]
+            assert ok(**no_op)["item"]["id"] == weak_folder["id"]
+            assert all(method == "PROPFIND" for method, _ in Fixture.request_attempts[request_offset:]), "a directory no-op downloaded or wrote remote contents"
+            assert (remote / "GH666/keep.txt").read_bytes() == b"untouched directory contents"
+            passed("a weak-identity directory no-op and its exact retry succeed without content hydration or remote writes")
 
             folder = next(i for i in items if i["name"] == "folder")
             ok(op="pin", id=folder["id"], pinned=True)
@@ -566,6 +586,69 @@ def run(binary):
             assert Fixture.request_attempts[request_offset:] == [], "local filter-blocked repair or its retry contacted the server"
             assert not ok(op="smart_repair_status", id=backup["id"])["eligible"]
             passed("legacy filter-blocked directory no-op repair and the exact OS retry stay offline and preserve excluded file edits, immutable queue records, snapshots, remote contents and rules")
+
+            legacy_folder = next(item for item in ok(op="list")["items"] if item["name"] == "GH666Legacy")
+            weak_now = ok(op="item", id=legacy_folder["id"])["item"]
+            legacy_metadata_request = dict(op="modify", id=legacy_folder["id"], name="GH666Legacy", parent_id="root",
+                                           request_id="legacy-weak-directory-metadata",
+                                           base_content_version=weak_now["content_version"],
+                                           base_metadata_version=weak_now["metadata_version"])
+            assert not rpc(**legacy_metadata_request)["ok"]
+            stop()
+            stored = json.loads(queue_path.read_text())
+            selected = next(row for row in stored["mutations"].values()
+                            if row["request"].get("id") == legacy_folder["id"] and row["state"] == "pending")
+            selected.update(state="failed", attempts=2, error="unsupported: fetch this file before editing metadata")
+            queue_path.write_text(json.dumps(stored))
+            original_request = selected["request"]
+            replay = dict(original_request)
+            replay["base_metadata_version"] = original_request["base_metadata_version"].split(":")[0] + ":legacy-replay-overlay"
+            fingerprint_fields = [replay.get(key) for key in ("op", "domain", "id", "parent_id", "name", "kind",
+                                  "base_content_version", "base_metadata_version", "tag_data_hex", "extended_attributes")]
+            fingerprint_fields.extend([None, replay.get("recursive", False)])
+            fingerprint = hashlib.sha256(json.dumps(fingerprint_fields, separators=(",", ":")).encode()).hexdigest()
+            intent = dict(fingerprint=fingerprint, metadata=None, source_fingerprint=None, transaction=None,
+                          confirmed=None, response=None, deletion_path=None, deletion_expected=None,
+                          metadata_base_fingerprint=None, namespace=None, version=None)
+            intent_key = hashlib.sha256(b"smart-fixture").hexdigest() + ":" + replay["request_id"]
+            with sqlite3.connect(database) as catalog:
+                control = json.loads(catalog.execute("SELECT control_json FROM meta").fetchone()[0])
+                control["requests"][intent_key] = intent
+                control["smart_replays"][selected["id"]] = replay
+                catalog.execute("UPDATE meta SET control_json=?", (json.dumps(control),))
+                record = json.loads(catalog.execute("SELECT record_json FROM items WHERE id=?", (legacy_folder["id"],)).fetchone()[0])
+                assert record["entry"]["etag"].startswith("W/") and record["strong"] is None
+            before = json.loads(queue_path.read_text())["mutations"]
+            snapshots = {row["id"]: (smart_root / "dirty" / row["snapshot"]["file"]).read_bytes()
+                         for row in before.values() if row.get("snapshot") and not row.get("payload_discarded")}
+            remote_before = {path.relative_to(remote).as_posix(): path.read_bytes() for path in remote.rglob("*") if path.is_file()}
+            config_before = (home / "config.json").read_bytes()
+            request_offset = len(Fixture.request_attempts)
+            start()
+            wait(lambda: ok(op="status", id=legacy_folder["id"])["state"] == "error", "legacy directory metadata failure overlay")
+            preview = ok(op="smart_repair_status", id=legacy_folder["id"])
+            assert preview["eligible"] and preview["mutation_id"] == selected["id"], preview
+            repaired = ok(op="repair_stale_directory", id=legacy_folder["id"], mutation_id=selected["id"])
+            assert repaired["repaired"] and repaired["refresh_queued"] and not repaired["remote_changed"], repaired
+            repeated = ok(op="repair_stale_directory", id=legacy_folder["id"], mutation_id=selected["id"])
+            assert repeated["repaired"] and not repeated["remote_changed"], repeated
+            acknowledged = ok(**legacy_metadata_request)
+            assert acknowledged["cancelled_no_op"] and acknowledged["item"]["sync_state"] != "error", acknowledged
+            after = json.loads(queue_path.read_text())["mutations"]
+            assert after[selected["id"]]["state"] == "cancelled"
+            assert {key: value for key, value in before.items() if key != selected["id"]} == {
+                key: value for key, value in after.items() if key != selected["id"]}
+            for mutation_id, contents in snapshots.items():
+                assert (smart_root / "dirty" / after[mutation_id]["snapshot"]["file"]).read_bytes() == contents
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as catalog:
+                control = json.loads(catalog.execute("SELECT control_json FROM meta").fetchone()[0])
+                assert control["requests"][intent_key] == intent, "repair altered the original unpublished provider intent"
+                assert control["smart_replays"][selected["id"]]["base_metadata_version"] == replay["base_metadata_version"]
+            assert (home / "config.json").read_bytes() == config_before
+            assert {path.relative_to(remote).as_posix(): path.read_bytes() for path in remote.rglob("*") if path.is_file()} == remote_before
+            assert Fixture.request_attempts[request_offset:] == [], "legacy metadata no-op repair or its retry contacted the server"
+            assert not ok(op="smart_repair_status", id=legacy_folder["id"])["eligible"]
+            passed("legacy failed weak-directory no-op repair validates an empty intent with its saved overlay revision, works offline, and preserves other requests, snapshots, remote contents and configuration")
         finally:
             stop()
             server.shutdown()

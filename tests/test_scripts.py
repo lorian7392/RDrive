@@ -305,7 +305,7 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
         self.assertEqual(report["cli_version"], "rdrive 0.8.3")
         self.assertEqual(report["version"], "0.8.3")
-        self.assertEqual(report["bundle_build"], "24")
+        self.assertEqual(report["bundle_build"], "25")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])
@@ -338,7 +338,7 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual(repair["NSExtensionFileProviderActionName"], "Repair Sync Issue…")
         self.assertEqual(repair["NSExtensionFileProviderActionActivationRule"],
                          "fileproviderItems.@count == 1 AND SUBQUERY(fileproviderItems, $item, "
-                         "$item.userInfo.rdriveSmart == YES AND $item.userInfo.rdriveState IN {'conflict', 'blocked', 'queued'} "
+                         "$item.userInfo.rdriveSmart == YES AND $item.userInfo.rdriveState IN {'conflict', 'blocked', 'queued', 'error'} "
                          "AND $item.contentType.identifier == 'public.folder').@count == 1")
         self.assertTrue(self.read_plist("RDriveProvider.entitlements")["com.apple.security.app-sandbox"])
 

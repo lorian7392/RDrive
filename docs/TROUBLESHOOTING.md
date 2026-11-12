@@ -101,6 +101,8 @@ rdrive smart export DOMAIN MUTATION_ID ./recovered.txt
 
 Choose `keep-both`, `replace`, or `remote` through [Smart management](SMART_OPERATIONS.md). Replacement remains revision-protected. `remote` abandons local publication while retaining an exportable recovery snapshot. `smart retry` preserves original conditions; `smart discard` explicitly reclaims an eligible recovery snapshot.
 
+If a Smart folder shows **Needs attention** with `unsupported: fetch this file before editing metadata`, open **Show Sync Status** or **Repair Sync Issue…** in Finder. Older versions could mistake an unchanged directory callback for a file metadata edit. The repair is offered only when the same folder has no content, tag, attribute, rename, or move intent and no evidence of publication. It clears that obsolete request and queues a folder refresh while preserving other retained edits. Downloading a directory cannot resolve this message. A genuine directory tag or extended-attribute edit remains unsupported and requires separate review.
+
 ## SMB recovery files or a temporarily missing path
 
 Protected overwrite may leave `.rdrive-backup-*`, `.rdrive-upload-*`, and `.rdrive-recovery-*.json`. An interruption between renames can leave the original path temporarily absent. Sync stops on the unfinished receipt rather than treating this as deletion.
