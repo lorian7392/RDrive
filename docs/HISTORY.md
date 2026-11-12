@@ -91,6 +91,21 @@ rdrive history clear nas --apply
 
 `prune` applies the retention policy; `clear` selects eligible confirmed entries regardless of their age. Both preview by default and retain protected prepared entries.
 
+If the history budget cannot hold the required before-image, RDrive reports `insufficient_quota` and preserves both the remote item and the pending local edit. Smart Synchronization marks that edit **Needs attention** and stops automatic retries. This is a local history budget problem; reconnecting does not free the required space.
+
+Use the shared history settings to increase the budget, or preview and apply cleanup of eligible confirmed history. Prepared entries remain protected. Then find the retained request and explicitly retry it:
+
+```sh
+rdrive history status nas
+rdrive history config --profile nas --max-bytes 10737418240
+rdrive history prune nas
+rdrive history prune nas --apply
+rdrive smart list
+rdrive smart retry DOMAIN_ID MUTATION_ID
+```
+
+Replace `DOMAIN_ID` and `MUTATION_ID` with the identifiers from `smart list`. Increasing the budget or pruning history does not silently restart failed work. The explicit retry retains the original local payload and remote version conditions; a newer remote change still causes a conflict. A resident service processes the retry normally. With the service stopped, `rdrive smart run` performs one replay pass.
+
 Do not remove history blobs, manifests, SQLite files, or retained Smart snapshots by hand. A manifest and its verified contents form one recovery record; deleting pieces makes recovery impossible. Use the program's configuration, history, and cleanup commands.
 
 ## Optional APFS checkpoints

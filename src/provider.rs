@@ -645,7 +645,8 @@ fn release_confirmed_payload(home:&Path,d:&Domain,queue:&mut crate::smart::Queue
     }}
 }
 fn smart_failure(error:&anyhow::Error)->crate::smart::FailureKind {
-    let text=format!("{error:#}");if text.contains("version_conflict")||text.contains("revision")||text.contains("conflict"){crate::smart::FailureKind::Conflict}
+    let text=format!("{error:#}");if text.contains("insufficient_quota:"){crate::smart::FailureKind::Other}
+    else if text.contains("version_conflict")||text.contains("revision")||text.contains("conflict"){crate::smart::FailureKind::Conflict}
     else if text.contains("unsupported")||text.contains("invalid")||text.contains("checksum")||text.contains("snapshot")||text.contains("No space"){crate::smart::FailureKind::Other}else{crate::smart::FailureKind::Offline}
 }
 async fn replay(home:&Path,staging:&Path,fd:&File,d:&Domain,queue:&mut crate::smart::Queue,mutation:&crate::smart::Mutation,context:crate::transfer::TransferContext,background:bool)->Result<Value> {
@@ -1293,3 +1294,17 @@ mod refresh_scheduler_tests;
 #[cfg(test)]
 #[path = "provider/policy_projection_tests.rs"]
 mod policy_projection_tests;
+
+#[cfg(test)]
+mod history_quota_tests {
+    use super::*;
+    #[test]
+    fn typed_history_quota_stops_replay_and_takes_priority_over_revision_context() {
+        for message in ["insufficient_quota: history capacity is insufficient; remote operation was not started", "cannot preserve the prior revision: insufficient_quota: history capacity is insufficient"] {
+            assert!(matches!(smart_failure(&anyhow::anyhow!(message)),crate::smart::FailureKind::Other));
+            assert_eq!(error(anyhow::anyhow!(message))["error"]["code"],"insufficient_quota");
+        }
+        assert!(matches!(smart_failure(&anyhow::anyhow!("version_conflict: remote revision changed")),crate::smart::FailureKind::Conflict));
+        assert!(matches!(smart_failure(&anyhow::anyhow!("server_unreachable: request timed out")),crate::smart::FailureKind::Offline));
+    }
+}

@@ -505,7 +505,7 @@ async fn capture_is_fail_closed_on_corruption_capacity_account_and_source_change
     .await
     .unwrap_err()
     .to_string()
-    .contains("capacity"));
+    .starts_with("insufficient_quota: history capacity"));
     assert_eq!(fs::read(disk.at("file")).unwrap(), b"old");
     store.config.history.default.max_bytes = None;
     disk.mutate_download.store(true, Ordering::SeqCst);
@@ -1130,9 +1130,9 @@ async fn journals_and_local_imports_refuse_changed_identity_or_invalid_sources()
     assert_eq!(imported.kind, "file");
     assert!(capture_import(&store, "test", "other", &disk.at("file"), "import").is_err());
     store.config.history.default.max_bytes = Some(1);
-    assert!(capture_import(&store, "test", "other", &disk.at("file"), "quota").is_err());
+    assert!(capture_import(&store, "test", "other", &disk.at("file"), "quota").unwrap_err().to_string().starts_with("insufficient_quota: history capacity"));
     store.config.history.default.max_bytes = Some(4);
-    assert!(capture_import(&store, "test", "other", &disk.at("file"), "global-quota").is_err());
+    assert!(capture_import(&store, "test", "other", &disk.at("file"), "global-quota").unwrap_err().to_string().starts_with("insufficient_quota: history capacity"));
     let weird = temp.path().join("weird");
     fs::create_dir(&weird).unwrap();
     use std::os::unix::ffi::OsStringExt;
@@ -1244,7 +1244,7 @@ async fn safety_error_paths_preserve_current_data_and_local_payloads() {
     .await
     .unwrap_err()
     .to_string()
-    .contains("capacity"));
+    .starts_with("insufficient_quota: history capacity"));
     store.config.history.default.max_bytes = None;
     let output = temp.path().join("exists");
     fs::write(&output, b"preserve").unwrap();

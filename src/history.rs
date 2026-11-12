@@ -545,7 +545,7 @@ pub async fn capture(
     })?;
     if let Some(maximum) = policy.max_bytes {
         if bytes > maximum {
-            bail!("history capacity is insufficient; remote operation was not started");
+            bail!("insufficient_quota: history capacity is insufficient; remote operation was not started");
         }
         let mut reserved = policy.clone();
         reserved.max_bytes = Some(maximum - bytes);
@@ -561,7 +561,7 @@ pub async fn capture(
         .max_bytes
         .is_some_and(|maximum| used.checked_add(bytes).is_none_or(|total| total > maximum))
     {
-        bail!("history capacity is insufficient; remote operation was not started");
+        bail!("insufficient_quota: history capacity is insufficient; remote operation was not started");
     }
     let mut nodes = Vec::new();
     for (suffix, entry) in &before {
@@ -1027,7 +1027,7 @@ pub fn capture_import(
                 .checked_add(info.len())
                 .context("history size overflow")?;
             if policy.max_bytes.is_some_and(|maximum| bytes > maximum) {
-                bail!("history capacity is insufficient for checkpoint payload");
+                bail!("insufficient_quota: history capacity is insufficient for checkpoint payload");
             }
             contents.push((local.clone(), metadata.content_sha256.clone(), info.len()));
             nodes.push(Node {
@@ -1072,7 +1072,7 @@ pub fn capture_import(
         .max_bytes
         .is_some_and(|maximum| used.checked_add(bytes).is_none_or(|sum| sum > maximum))
     {
-        bail!("history capacity is insufficient; checkpoint payload was not published");
+        bail!("insufficient_quota: history capacity is insufficient; checkpoint payload was not published");
     }
     for (local, hash, bytes) in contents {
         import_blob(&root, &local, &hash, bytes)?;

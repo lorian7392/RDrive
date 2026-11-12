@@ -430,6 +430,114 @@ def run(binary, report_path=None):
             assert snapshot() == retained_before
             passed("retention pruning previews without deletion and never removes retained Smart queue payloads")
 
+            # A separate state home keeps the earlier offline edit untouched
+            # while a real broker encounters and then recovers a history quota.
+            quota_remote = remote / "quota"
+            quota_remote.mkdir()
+            quota_before = b"before-image larger than the one-byte history limit"
+            (quota_remote / "doc.txt").write_bytes(quota_before)
+            quota_home, quota_ipc = root / "quota-state", root / "quota-ipc"
+            quota_ipc.mkdir(mode=0o700)
+            quota_stage = quota_ipc / "Transfers"
+            quota_base = [str(binary), "--home", str(quota_home), "--json", "--progress", "off"]
+            quota_process = None
+            def quota_command(*args):
+                result = subprocess.run(quota_base + list(map(str, args)), env=environment, capture_output=True, text=True, timeout=40)
+                assert result.returncode == 0, (args, result.stdout, result.stderr)
+                return json.loads(result.stdout)
+            def quota_rpc(**request):
+                endpoint = json.loads((quota_ipc / "bridge-endpoint.json").read_text())
+                request.update(v=1, domain="quota-fixture", auth_token=endpoint["token"], request_id=uuid.uuid4().hex)
+                with socket.create_connection(("127.0.0.1", endpoint["port"]), timeout=20) as client:
+                    client.sendall(json.dumps(request).encode() + b"\n")
+                    with client.makefile("rb") as stream:
+                        while True:
+                            line = stream.readline()
+                            assert line, "quota bridge disconnected"
+                            reply = json.loads(line)
+                            if "progress" not in reply:
+                                return reply
+            def quota_mutation():
+                path = quota_home / "smart" / hashlib.sha256(b"quota-fixture").hexdigest() / "queue.json"
+                records = json.loads(path.read_text())["mutations"]
+                selected_edits = [row for row in records.values() if row["request"]["op"] == "modify" and row["request"]["id"] == selected_quota["id"]]
+                assert len(selected_edits) == 1, records
+                return path, selected_edits[0]
+            def quota_start():
+                nonlocal quota_process
+                quota_process = subprocess.Popen(quota_base + ["provider", "serve", "--socket", str(quota_ipc / "bridge.sock"), "--staging", str(quota_stage), "--development-tcp"], env=environment, stdout=subprocess.DEVNULL, stderr=log)
+                def ready():
+                    assert quota_process.poll() is None, "quota broker exited"
+                    try:
+                        return quota_rpc(op="domains").get("ok")
+                    except (OSError, json.JSONDecodeError):
+                        return False
+                wait(ready, "quota broker startup", 15)
+            def quota_stop():
+                nonlocal quota_process
+                if quota_process and quota_process.poll() is None:
+                    quota_process.send_signal(signal.SIGINT)
+                    quota_process.wait(timeout=20)
+                quota_process = None
+            try:
+                quota_command("profile", "add", "quota", "--protocol", "webdav", "--url", f"http://127.0.0.1:{server.server_port}/dav/quota/", "--allow-http", "--username", "user", "--password-env", "RDRIVE_HISTORY_TEST_PASSWORD")
+                quota_command("history", "config", "--profile", "quota", "--enabled", "true", "--max-bytes", "1")
+                assert json.loads((quota_home / "config.json").read_bytes())["history"]["profiles"]["quota"]["max_bytes"] == 1
+                quota_command("index", "config", "--disable")
+                quota_command("smart", "setup", "quota-fixture", "quota")
+                quota_start()
+                selected_quota = next(item for item in wait(lambda: quota_rpc(op="list", parent_id="root").get("items"), "quota catalog") if item["name"] == "doc.txt")
+                fetched = quota_rpc(op="fetch", id=selected_quota["id"], base_content_version=selected_quota["content_version"], base_metadata_version=selected_quota["metadata_version"])
+                assert fetched["ok"], fetched
+                selected_quota = fetched["item"]
+                quota_source = quota_stage / "retained-quota-edit"
+                quota_source.write_bytes(b"the exact guarded local payload must survive quota recovery")
+                quota_source.chmod(0o600)
+                requests_before_quota = len(Fixture.attempts)
+                rejected = quota_rpc(op="modify", id=selected_quota["id"], content_path=str(quota_source), base_content_version=selected_quota["content_version"], base_metadata_version=selected_quota["metadata_version"])
+                assert not rejected["ok"] and rejected["error"]["code"] == "insufficient_quota", rejected
+                assert rejected["error"]["message"].startswith("insufficient_quota: history capacity"), rejected
+                quota_queue, failed = quota_mutation()
+                assert failed["state"] == "failed" and failed["attempts"] == 1, failed
+                quota_snapshot = quota_queue.parent / "dirty" / failed["snapshot"]["file"]
+                retained_quota = quota_snapshot.read_bytes()
+                assert retained_quota == quota_source.read_bytes() and (quota_remote / "doc.txt").read_bytes() == quota_before
+                time.sleep(2.2)
+                assert quota_mutation()[1] == failed, "quota failure was retried automatically"
+                assert not [(method, path) for method, path in Fixture.attempts[requests_before_quota:] if path.startswith("/dav/quota/") and method in ("PUT", "DELETE", "MOVE", "COPY", "MKCOL")]
+                # A stopped quota failure must not monopolize the domain.
+                # Creating an absent item requires no history before-image.
+                independent_source = quota_stage / "independent-create"
+                independent_source.write_bytes(b"unrelated create remains available")
+                independent_source.chmod(0o600)
+                independent = quota_rpc(op="create", parent_id="root", name="independent.txt", kind="file", client_item_id=uuid.uuid4().hex, content_path=str(independent_source))
+                assert independent["ok"] and (quota_remote / "independent.txt").read_bytes() == independent_source.read_bytes(), independent
+                assert quota_mutation()[1] == failed and quota_snapshot.read_bytes() == retained_quota
+                # Shared configuration remains programmatic with the broker
+                # resident. A larger budget alone must not restart failed work.
+                quota_command("history", "config", "--profile", "quota", "--max-bytes", "1024")
+                quota_policy = json.loads((quota_home / "config.json").read_bytes())["history"]["profiles"]["quota"]
+                assert quota_policy["enabled"] and quota_policy["max_bytes"] == 1024
+                time.sleep(1.1)
+                assert quota_mutation()[1] == failed and quota_snapshot.read_bytes() == retained_quota
+                quota_stop()
+                retry = quota_command("smart", "retry", "quota-fixture", failed["id"])
+                pending = retry["retried"][0]
+                assert pending["state"] == "pending" and pending["request"] == failed["request"] and pending["fingerprint"] == failed["fingerprint"]
+                assert pending["snapshot"] == failed["snapshot"] and quota_snapshot.read_bytes() == retained_quota
+                quota_start()
+                wait(lambda: quota_mutation()[1]["state"] == "done", "explicit quota retry publication")
+                assert quota_mutation()[1]["request"] == failed["request"] and (quota_remote / "doc.txt").read_bytes() == retained_quota
+                retained_history = quota_command("history", "files", "quota", "doc.txt")["entries"]
+                prior = next(entry for entry in retained_history if entry["reason"] == "overwrite")
+                prior_copy = root / "quota-prior-remote.txt"
+                quota_command("history", "export", "quota", prior["id"], prior_copy)
+                assert prior_copy.read_bytes() == quota_before
+                assert snapshot() == retained_before
+                passed("history quota stops automatic replay without blocking unrelated creates and preserves the original guarded edit until programmatic capacity change and explicit retry")
+            finally:
+                quota_stop()
+
             checkpoint = command("checkpoint", "status")
             assert "available" in checkpoint and checkpoint["system_managed"]
             listing = command("checkpoint", "list")
