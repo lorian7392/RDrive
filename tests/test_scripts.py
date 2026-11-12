@@ -305,7 +305,7 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
         self.assertEqual(report["cli_version"], "rdrive 0.8.3")
         self.assertEqual(report["version"], "0.8.3")
-        self.assertEqual(report["bundle_build"], "25")
+        self.assertEqual(report["bundle_build"], "26")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])

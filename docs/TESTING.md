@@ -71,6 +71,7 @@ python3 tests/provider_receipts_workflows.py target/debug/rdrive
 python3 tests/coverage_cli_workflows.py target/debug/rdrive
 python3 tests/cache_directory_workflows.py target/debug/rdrive --report target/validation/cache.json
 python3 tests/mcp_workflows.py target/debug/rdrive --report target/validation/mcp.json
+python3 tests/mcp_startup_workflows.py target/debug/rdrive --report target/validation/mcp-startup.json
 python3 tests/index_workflows.py target/debug/rdrive --output target/validation/index.json
 python3 tests/search_workflows.py target/debug/rdrive --report target/validation/search.json
 python3 tests/policy_workflows.py target/debug/rdrive --output target/validation/policy.json
@@ -78,6 +79,8 @@ python3 tests/service_workflows.py target/debug/rdrive --output target/validatio
 ```
 
 These workflows verify actual requests, bytes, persistent state, process termination, and independent-writer competition. Record the binary version/hash with results; do not attribute one executable's behavior to another. Scripts without report-path options print results, and some also write Git-ignored `docs/*.debug.json`. Do not overwrite committed version evidence.
+
+The MCP startup workflow launches 128 real processes with each of one and two Tokio workers while four existing sessions and four temporary CPU workers compete. It checks every initialization using the ordinary 35-second response bound, verifies the existing sessions still respond, and records each case plus the binary hash. A timeout fails the workflow; on macOS the shared client captures the owned child's live stack before cleanup.
 
 Run full SMB workflows and the raw/Smart bridges separately:
 

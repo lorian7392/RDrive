@@ -27,7 +27,7 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 sha2 = "=0.10.9"
 smb = { version = "=0.12.1", default-features = false, features = ["async", "sign", "encrypt"] }
-tokio = { version = "=1.52.0", features = ["full"] }
+tokio = { version = "=1.52.1", features = ["full"] }
 tokio-util = { version = "=0.7.18", features = ["io", "rt"] }
 url = "=2.5.8"
 uuid = { version = "=1.23.0", features = ["v4"] }

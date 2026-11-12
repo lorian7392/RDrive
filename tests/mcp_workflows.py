@@ -49,6 +49,19 @@ class LocalDav(Dav):
         return super().handle_dav()
 
 
+def sample_stalled_process(process):
+    """Sample only the fixture-owned child after an unexpected timeout."""
+    if sys.platform != "darwin" or process.poll() is not None:
+        return ""
+    try:
+        result = subprocess.run(["/usr/bin/sample", str(process.pid), "1", "1", "-mayDie"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=15)
+        return "\nMCP child sample:\n" + result.stdout[:512 * 1024]
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return "\nMCP child sample unavailable: " + type(error).__name__
+
+
 class Client:
     def __init__(self, binary, home, env, *, write=False, roots=(), timeout=30):
         args = [str(binary), "--home", str(home), "mcp", "serve", "--timeout", str(timeout)]
@@ -87,9 +100,10 @@ class Client:
         except queue.Empty:
             stderr = self.stderr.decode(errors="replace").replace(PASSWORD, "<redacted>")[-2000:]
             readers = [reader.is_alive() for reader in self.readers]
+            sample = sample_stalled_process(self.process).replace(PASSWORD, "<redacted>")
             raise AssertionError(
                 f"MCP server did not return a response (pid={self.process.pid}, "
-                f"exit={self.process.poll()!r}, readers={readers}); stderr={stderr or '<empty>'}"
+                f"exit={self.process.poll()!r}, readers={readers}); stderr={stderr or '<empty>'}{sample}"
             ) from None
         if line is None:
             raise AssertionError(f"MCP server exited early: {self.stderr.decode(errors='replace')}")

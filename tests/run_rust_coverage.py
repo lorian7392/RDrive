@@ -84,7 +84,7 @@ def workflows(python, binary, group, output, library):
             ("cli", None), ("advanced", None), ("smart", None),
             ("namespace", None), ("provider_receipts", None),
             ("coverage_cli", None), ("cache_directory", "--report"),
-            ("mcp", "--report"), ("index", "--output"),
+            ("mcp", "--report"), ("mcp_startup", "--report"), ("index", "--output"),
             ("search", "--report"), ("policy", "--output"),
             ("service", "--output"), ("profile_admin", "--report"),
             ("state_directory", "--report"),

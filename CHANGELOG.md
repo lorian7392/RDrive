@@ -4,6 +4,8 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Pin Tokio 1.52.1 to fix the upstream blocking-task hang that could stall MCP standard-input/output initialization.
+
 - Complete unchanged-directory callbacks without requiring a file content guard; offer conservative offline repair for legacy metadata-guard failures from Finder's Needs attention state while preserving real metadata edits and retained contents.
 
 - Prioritize an explicitly opened or refreshed cold folder over inherited recursive connection-refresh work.
