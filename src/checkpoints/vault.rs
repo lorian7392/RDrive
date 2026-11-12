@@ -105,27 +105,71 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     }
     Ok(serde_json::from_reader(file)?)
 }
-fn layout(mount: &Mounted, home: &Path, initialize: bool) -> Result<()> {
+const LAYOUT_MARKER: &str = ".rdrive-checkpoint-layout.json";
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LayoutIdentity {
+    version: u32,
+    home: String,
+    instance_id: String,
+    volume_uuid: String,
+}
+fn layout(mount: &Mounted, home: &Path) -> Result<()> {
     private(&mount.root, true)?;
     id(&mount.instance_id)?;
     uuid::Uuid::parse_str(&mount.volume_uuid)?;
     if mount.device.is_empty() || mount.home_binding != binding(home)? {
         bail!("vault belongs to another state directory");
     }
+    let expected = LayoutIdentity {
+        version: 1,
+        home: mount.home_binding.clone(),
+        instance_id: mount.instance_id.clone(),
+        volume_uuid: mount.volume_uuid.clone(),
+    };
+    let marker = mount.root.join(LAYOUT_MARKER);
+    let committed = match fs::symlink_metadata(&marker) {
+        Ok(info) => {
+            if info.len() > 16 * 1024 {
+                bail!("vault layout marker exceeds its size bound");
+            }
+            let actual: LayoutIdentity = read_json(&marker)?;
+            if actual != expected {
+                bail!("vault layout marker identifies a different store");
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !committed && mount.readonly {
+        bail!("APFS vault file layout is incomplete; writable reconciliation is required");
+    }
+    let device = fs::metadata(&mount.root)?.dev();
     for name in ["blobs", "checkpoints", "staging"] {
         let path = mount.root.join(name);
-        if initialize {
-            directory(&path)?;
-        } else {
-            private(&path, true)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                private(&path, true)?;
+                same_device(fs::metadata(&path)?.dev(), device)?;
+                if !committed && fs::read_dir(&path)?.next().is_some() {
+                    bail!("unrecognized contents precede the vault layout marker; nothing was removed");
+                }
+            }
+            Err(error) if !committed && error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
         }
-        same_device(fs::metadata(path)?.dev(), fs::metadata(&mount.root)?.dev())?;
     }
-    if initialize {
+    if !committed {
+        for name in ["blobs", "checkpoints", "staging"] {
+            directory(&mount.root.join(name))?;
+        }
         File::open(&mount.root)?.sync_all()?;
+        state::atomic_json(&marker, &expected)?;
     }
     Ok(())
 }
+
 fn same_device(actual: u64, expected: u64) -> Result<()> {
     if actual != expected {
         bail!("vault entries cross a filesystem boundary");
@@ -392,10 +436,10 @@ fn with_mount<T>(
         return Ok(None);
     };
     let result = (|| {
-        layout(&mount, home, initialize)?;
         if mount.readonly != readonly || mount.capacity_bytes != limits.max_bytes {
             bail!("vault mount or capacity differs from the requested operation");
         }
+        layout(&mount, home)?;
         action(&mount, host)
     })();
     let detached = host.unmount(&mount);

@@ -601,7 +601,7 @@ fn platform_identity_payload_bounds_busy_files_and_failed_unlink_are_checked() {
     assert!(read_json::<Manifest>(&oversized).is_err());
     let mut foreign = mount.clone();
     foreign.home_binding = "foreign".into();
-    assert!(layout(&foreign, &f.store.home, false).is_err());
+    assert!(layout(&foreign, &f.store.home).is_err());
     let mut bad = record.clone();
     bad.version = 2;
     state::atomic_json(
@@ -715,7 +715,7 @@ fn source_copy_races_and_duplicate_sequences_do_not_publish_or_prune() {
     .unwrap();
     fs::write(&source_path, b"new content").unwrap();
     let mount = f.host.mounted(&f.store.home, false);
-    layout(&mount, &f.store.home, true).unwrap();
+    layout(&mount, &f.store.home).unwrap();
     let stage = mount.root.join("staging").join(uid(1));
     directory(&stage).unwrap();
     assert!(copy_blob(&mount, &stage, &selected)
@@ -921,4 +921,145 @@ fn payload_larger_than_the_entire_vault_is_rejected_before_scanning_sparse_conte
         .to_string()
         .contains("insufficient_quota"));
     assert_eq!(fs::metadata(path).unwrap().len(), f.limits.max_bytes + 1);
+}
+#[test]
+fn writable_reconciliation_completes_an_owned_interrupted_first_layout() {
+    let mut f = fixture();
+    payload(&f, "a", b"pending edit");
+    let mount = f.host.mounted(&f.store.home, false);
+    fs::write(
+        mount.root.join(".rdrive-vault.json"),
+        b"system identity remains separate",
+    )
+    .unwrap();
+    directory(&mount.root.join("blobs")).unwrap();
+    assert!(status_with(&f.store.home, &f.limits, &mut f.host)
+        .unwrap_err()
+        .to_string()
+        .contains("writable reconciliation"));
+    assert!(!mount.root.join("checkpoints").exists());
+    assert!(!mount.root.join(LAYOUT_MARKER).exists());
+    let result = reconcile_with(&f.store.home, &uid(1), &f.limits, &mut f.host).unwrap();
+    assert_eq!(result["safe_to_retry_same_id"], true);
+    for name in ["blobs", "checkpoints", "staging"] {
+        assert!(mount.root.join(name).is_dir());
+    }
+    let committed: LayoutIdentity = read_json(&mount.root.join(LAYOUT_MARKER)).unwrap();
+    assert_eq!(committed.home, mount.home_binding);
+    assert_eq!(committed.instance_id, mount.instance_id);
+    assert_eq!(committed.volume_uuid, mount.volume_uuid);
+    assert_eq!(
+        fs::read(mount.root.join(".rdrive-vault.json")).unwrap(),
+        b"system identity remains separate"
+    );
+    create_with(&f.store, &uid(1), &f.limits, &mut f.host).unwrap();
+    assert_eq!(
+        reconcile_with(&f.store.home, &uid(1), &f.limits, &mut f.host).unwrap()["confirmed"],
+        true
+    );
+    assert_eq!(
+        fs::read(f.store.home.join("spool/a")).unwrap(),
+        b"pending edit"
+    );
+}
+#[test]
+fn a_committed_layout_never_recreates_missing_checkpoint_directories() {
+    for missing in ["blobs", "checkpoints", "staging"] {
+        let mut f = fixture();
+        payload(&f, "a", b"last verified bytes");
+        create_with(&f.store, &uid(1), &f.limits, &mut f.host).unwrap();
+        let root = f.host.root.clone();
+        let marker = fs::read(root.join(LAYOUT_MARKER)).unwrap();
+        fs::remove_dir_all(root.join(missing)).unwrap();
+        assert!(create_with(&f.store, &uid(2), &f.limits, &mut f.host).is_err());
+        assert!(reconcile_with(&f.store.home, &uid(2), &f.limits, &mut f.host).is_err());
+        assert!(status_with(&f.store.home, &f.limits, &mut f.host).is_err());
+        assert!(!root.join(missing).exists());
+        assert_eq!(fs::read(root.join(LAYOUT_MARKER)).unwrap(), marker);
+        assert_eq!(
+            fs::read(f.store.home.join("spool/a")).unwrap(),
+            b"last verified bytes"
+        );
+        if missing == "checkpoints" {
+            assert_eq!(
+                fs::read(root.join("blobs").join(state::key("last verified bytes"))).unwrap(),
+                b"last verified bytes"
+            );
+        }
+    }
+}
+#[test]
+fn a_missing_layout_marker_never_adopts_existing_payloads_or_records() {
+    let mut f = fixture();
+    payload(&f, "a", b"one");
+    create_with(&f.store, &uid(1), &f.limits, &mut f.host).unwrap();
+    let marker = f.host.root.join(LAYOUT_MARKER);
+    fs::remove_file(&marker).unwrap();
+    let blob = f.host.root.join("blobs").join(state::key("one"));
+    assert!(
+        reconcile_with(&f.store.home, &uid(2), &f.limits, &mut f.host)
+            .unwrap_err()
+            .to_string()
+            .contains("unrecognized contents")
+    );
+    assert!(create_with(&f.store, &uid(2), &f.limits, &mut f.host).is_err());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(blob).unwrap(), b"one");
+}
+#[test]
+fn malformed_foreign_or_redirected_layout_identity_is_preserved_and_refused() {
+    let mut f = fixture();
+    payload(&f, "a", b"one");
+    create_with(&f.store, &uid(1), &f.limits, &mut f.host).unwrap();
+    let marker = f.host.root.join(LAYOUT_MARKER);
+    let original = fs::read(&marker).unwrap();
+    let mut foreign: LayoutIdentity = serde_json::from_slice(&original).unwrap();
+    foreign.instance_id = uid(99);
+    state::atomic_json(&marker, &foreign).unwrap();
+    assert!(status_with(&f.store.home, &f.limits, &mut f.host)
+        .unwrap_err()
+        .to_string()
+        .contains("different store"));
+    fs::write(&marker, b"truncated JSON").unwrap();
+    assert!(status_with(&f.store.home, &f.limits, &mut f.host).is_err());
+    OpenOptions::new()
+        .write(true)
+        .open(&marker)
+        .unwrap()
+        .set_len(16 * 1024 + 1)
+        .unwrap();
+    assert!(
+        reconcile_with(&f.store.home, &uid(2), &f.limits, &mut f.host)
+            .unwrap_err()
+            .to_string()
+            .contains("layout marker exceeds")
+    );
+    fs::remove_file(&marker).unwrap();
+    let foreign_file = f.temp.path().join("foreign");
+    fs::write(&foreign_file, &original).unwrap();
+    fs::set_permissions(&foreign_file, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&foreign_file, &marker).unwrap();
+    assert!(reconcile_with(&f.store.home, &uid(2), &f.limits, &mut f.host).is_err());
+    assert_eq!(fs::read(&foreign_file).unwrap(), original);
+    assert!(fs::symlink_metadata(marker)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+#[test]
+fn inaccessible_layout_metadata_fails_closed_without_assuming_absence() {
+    let f = fixture();
+    let mount = f.host.mounted(&f.store.home, false);
+    fs::set_permissions(&mount.root, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = layout(&mount, &f.store.home);
+    fs::set_permissions(&mount.root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        result
+            .unwrap_err()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(!mount.root.join(LAYOUT_MARKER).exists());
 }
