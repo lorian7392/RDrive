@@ -150,6 +150,24 @@ Only these explicit objects are exported with Rust's bundled LLVM. Outputs inclu
 
 The library harness runs with `--test-threads=1` to isolate fixtures that exercise process-global signals, subprocess creation, and file-lock lifetimes. Every selected test still runs, and deliberate thread/process concurrency inside individual tests remains enabled. Separate integration-test executables keep their normal harness settings; the manifest records the exact commands.
 
+Every executable and workflow phase receives a fixed, sanitized label in its
+`LLVM_PROFILE_FILE` basename, followed by the unchanged `%p-%16m` process/merge-pool
+pattern. `phases.json` records the exact command, profile pattern, start/end time,
+exit code, and failure type, including failed or timed-out phases. Phase labels
+identify provenance; they do not establish why a raw profile became invalid.
+
+If `llvm-profdata merge` fails, collection still fails with the original error.
+The runner preserves only known raw inputs explicitly named in LLVM error or
+warning diagnostics, with size, modification time, SHA-256 and initial header
+bytes. Evidence is bounded to eight profiles, 16 MiB for a complete file and
+32 MiB of copied bytes overall. Oversized inputs retain a bounded header copy
+plus full streamed hash/metadata; the report marks incomplete or unavailable
+preservation and any omitted profiles. It never excludes a profile from the
+merge, retries a failed merge, or substitutes a partial coverage result.
+Both existing always-run CI artifact uploads include `phases.json` and the
+`profile-merge-diagnostics/` directory, while valid raw-profile collections are
+not uploaded wholesale. Original command logs remain available alongside them.
+
 `--target-dir PATH` may reuse build caches while retaining fresh profiles and exact current Cargo artifacts. `--offline` disables Cargo networking, and `--cargo-llvm-cov PATH` selects an installed tool. `--workflows dav` collects DAV/IPC, `smb` collects Samba, and `none` runs only Rust tests; none of these subsets is complete acceptance. `--test-suite portable-smb` runs only SMB library tests and operations integration tests and requires `--workflows smb`. It supplements Linux protocol testing; macOS acceptance retains the default `all`.
 
 Do not clear collection directories, remove `.profraw`, or replace objects before aggregation. Source changes require new collection; old line mappings cannot be reused for a new revision.

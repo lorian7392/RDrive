@@ -72,6 +72,8 @@ jobs:
             target/coverage/rust-macos/test-spans.json
             target/coverage/rust-macos/*.json
             target/coverage/rust-macos/logs/
+            target/coverage/rust-macos/phases.json
+            target/coverage/rust-macos/profile-merge-diagnostics/
             target/native-tests-coverage/coverage*.json
             target/native-tests-coverage/coverage.lcov
             target/validation/*.json
@@ -108,6 +110,8 @@ jobs:
             target/coverage/rust-linux/test-spans.json
             target/coverage/rust-linux/*.json
             target/coverage/rust-linux/logs/
+            target/coverage/rust-linux/phases.json
+            target/coverage/rust-linux/profile-merge-diagnostics/
           if-no-files-found: error
           overwrite: true
 

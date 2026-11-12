@@ -104,6 +104,220 @@ class RustCoverageToolsTests(unittest.TestCase):
         self.assertEqual(failure.exception.returncode, 17)
         self.assertIn("synthetic stderr", log.read_text())
 
+    def test_phase_profile_names_are_sanitized_without_changing_runtime_tokens(self):
+        values = {"workflow Smart/../../%p ☃": "workflow-smart-p", "___ / %m": "m", "???": "phase"}
+        original = {"LLVM_PROFILE_FILE": "ambient", "KEEP": "unchanged"}
+        for label, expected in values.items():
+            environment = runner.phase_environment(original, self.root, label)
+            self.assertEqual(Path(environment["LLVM_PROFILE_FILE"]).name, f"rdrive-{expected}-%p-%16m.profraw")
+            self.assertEqual(environment["KEEP"], "unchanged")
+        self.assertEqual(original["LLVM_PROFILE_FILE"], "ambient")
+        self.assertEqual(len(runner.phase_label("a" * 100)), 64)
+
+    def test_phase_manifest_records_success_failure_timeout_and_exact_command(self):
+        phases = runner.PhaseLog(self.root / "phases.json")
+        command = ["literal $(not-a-shell)", "argument with spaces"]
+        outcomes = [subprocess.CompletedProcess(command, 0, "passed", ""),
+                    subprocess.CompletedProcess(command, 17, "partial", "failure")]
+        for index, outcome in enumerate(outcomes):
+            with mock.patch.object(runner.subprocess, "run", return_value=outcome) as execute:
+                if index:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        runner.run(command, root=self.root, environment={}, log=self.root / f"{index}.log",
+                                   phases=phases, phase=f"TEST/{index}", profiles=self.root)
+                else:
+                    runner.run(command, root=self.root, environment={}, log=self.root / f"{index}.log",
+                               phases=phases, phase=f"TEST/{index}", profiles=self.root)
+                self.assertEqual(execute.call_args.args[0], command)
+                self.assertIn(f"rdrive-test-{index}-%p-%16m", execute.call_args.kwargs["env"]["LLVM_PROFILE_FILE"])
+        timeout = subprocess.TimeoutExpired(command, 3, output=b"before timeout", stderr=b"partial diagnostic")
+        with mock.patch.object(runner.subprocess, "run", side_effect=timeout), self.assertRaises(subprocess.TimeoutExpired) as failure:
+            runner.run(command, root=self.root, environment={}, log=self.root / "timeout.log",
+                       phases=phases, phase="timeout", profiles=self.root)
+        self.assertIs(failure.exception, timeout)
+        self.assertIn("partial diagnostic", (self.root / "timeout.log").read_text())
+        records = json.loads(phases.path.read_text())["phases"]
+        self.assertEqual([record["exit_code"] for record in records], [0, 17, None])
+        self.assertEqual([record["status"] for record in records], ["passed", "failed", "failed"])
+        self.assertEqual(records[-1]["error_type"], "TimeoutExpired")
+        for record in records:
+            self.assertEqual(record["command"], command)
+            self.assertIsNotNone(record["started"])
+            self.assertIsNotNone(record["ended"])
+            self.assertGreaterEqual(record["elapsed_seconds"], 0)
+
+    def test_spawn_failure_keeps_original_exception_and_finishes_phase(self):
+        phases = runner.PhaseLog(self.root / "phases.json")
+        original = FileNotFoundError("missing tool")
+        with mock.patch.object(runner.subprocess, "run", side_effect=original), self.assertRaises(FileNotFoundError) as failure:
+            runner.run(["missing"], root=self.root, environment={}, log=self.root / "missing.log",
+                       phases=phases, phase="missing", profiles=self.root)
+        self.assertIs(failure.exception, original)
+        self.assertEqual(json.loads(phases.path.read_text())["phases"][0]["error_type"], "FileNotFoundError")
+
+    def merge_fixture(self, names):
+        output = self.root / "output with spaces"
+        (output / "profiles").mkdir(parents=True)
+        (output / "logs").mkdir()
+        paths = []
+        for name, content in names:
+            path = output / "profiles" / name
+            path.write_bytes(content)
+            paths.append(path)
+        phases = runner.PhaseLog(output / "phases.json")
+        phases.records = [{"phase": "workflow-smart", "profile_pattern": str(output / "profiles/rdrive-workflow-smart-%p-%16m.profraw")}]
+        return output, paths, phases
+
+    def test_actual_corrupt_header_message_preserves_only_reported_input(self):
+        bad_name = "rdrive-workflow-smart-9684-5469779597299527299_4.profraw"
+        output, raw, phases = self.merge_fixture([(bad_name, b"corrupt header\0\1"), ("valid.profraw", b"valid bytes")])
+        log = f"warning: {raw[0]}: invalid instrumentation profile data (file header is corrupt)\nerror: no profile can be merged\nRead {raw[1]} successfully\n"
+        (output / "logs/profile-merge.log").write_text(log)
+        original = subprocess.CalledProcessError(1, ["llvm-profdata", "merge"])
+        runner.preserve_merge_failure(output, raw, phases, original)
+        directory = output / "profile-merge-diagnostics"
+        report = json.loads((directory / "diagnostics.json").read_text())
+        self.assertEqual(report["reported_profile_count"], 1)
+        self.assertIn("error: no profile can be merged", report["diagnostic_lines"])
+        self.assertFalse(report["merge_retried"] or report["merge_inputs_changed"])
+        evidence = report["profiles"][0]
+        self.assertEqual(evidence["size"], raw[0].stat().st_size)
+        self.assertEqual(evidence["mtime_ns"], raw[0].stat().st_mtime_ns)
+        self.assertEqual(evidence["sha256"], hashlib.sha256(raw[0].read_bytes()).hexdigest())
+        self.assertEqual(evidence["header_hex"], raw[0].read_bytes().hex())
+        self.assertEqual(evidence["phases"], ["workflow-smart"])
+        self.assertEqual(evidence["preservation_status"], "complete")
+        self.assertEqual((directory / evidence["preserved_file"]).read_bytes(), raw[0].read_bytes())
+        self.assertFalse((directory / "valid.profraw").exists())
+
+    def test_evidence_file_byte_and_diagnostic_bounds_are_explicit(self):
+        output, raw, phases = self.merge_fixture([(f"bad-{index}.profraw", b"x" * size) for index, size in enumerate([4, 12, 16])])
+        lines = [f"warning: {path}: file header is corrupt " + "x" * 4000 for path in raw]
+        (output / "logs/profile-merge.log").write_text("\n".join(lines * 10))
+        with mock.patch.object(runner, "MAX_DIAGNOSTIC_PROFILES", 2), mock.patch.object(runner, "MAX_DIAGNOSTIC_FILE_BYTES", 8), mock.patch.object(runner, "MAX_DIAGNOSTIC_TOTAL_BYTES", 8):
+            runner.preserve_merge_failure(output, raw, phases, subprocess.CalledProcessError(1, "merge"))
+        report = json.loads((output / "profile-merge-diagnostics/diagnostics.json").read_text())
+        self.assertEqual(len(report["profiles"]), 2)
+        self.assertEqual(report["omitted_profiles"], 1)
+        self.assertLessEqual(sum(profile["preserved_bytes"] for profile in report["profiles"]), 8)
+        self.assertEqual(report["profiles"][1]["preservation_status"], "header_only_limit")
+        self.assertFalse(report["profiles"][1]["full_copy"])
+        self.assertEqual(report["profiles"][1]["sha256"], hashlib.sha256(raw[1].read_bytes()).hexdigest())
+        self.assertEqual(len(report["diagnostic_lines"]), runner.MAX_DIAGNOSTIC_LINES)
+        self.assertTrue(all(len(line) <= runner.MAX_DIAGNOSTIC_LINE_CHARS for line in report["diagnostic_lines"]))
+        self.assertGreater(report["omitted_diagnostic_lines"], 0)
+        self.assertLess((output / "profile-merge-diagnostics/diagnostics.json").stat().st_size, 40000)
+
+    def test_evidence_never_follows_reported_symlink(self):
+        output, raw, phases = self.merge_fixture([])
+        outside = self.root / "outside.txt"
+        outside.write_text("must not be copied")
+        link = output / "profiles/linked.profraw"
+        link.symlink_to(outside)
+        (output / "logs/profile-merge.log").write_text(f"warning: {link}: invalid instrumentation profile\n")
+        runner.preserve_merge_failure(output, [link], phases, subprocess.CalledProcessError(1, "merge"))
+        report = json.loads((output / "profile-merge-diagnostics/diagnostics.json").read_text())
+        self.assertEqual(report["profiles"][0]["preservation_status"], "unavailable")
+        self.assertEqual(list((output / "profile-merge-diagnostics").glob("*.profraw")), [])
+
+    def fake_collection(self, *, merge_exit=0):
+        objects = self.root / "objects"
+        objects.mkdir()
+        binary, library = objects / "rdrive", objects / "rdrive-tests"
+        binary.write_bytes(b"compiled CLI")
+        library.write_bytes(b"compiled tests")
+        output = self.root / "collection"
+        options = mock.Mock(output_dir=output, target_dir=None, cargo="cargo", rustc="rustc",
+                            cargo_llvm_cov="cargo-llvm-cov", offline=True, workflows="none", test_suite="all")
+        def artifact(path, kind, is_test):
+            return json.dumps({"reason": "compiler-artifact", "executable": str(path),
+                               "target": {"src_path": str(self.root / "src/main.rs"), "name": "rdrive", "kind": [kind]},
+                               "profile": {"test": is_test}})
+        def execute(command, **kwargs):
+            first = Path(command[0]).name
+            stdout, stderr, code = "", "", 0
+            if first == "cargo-llvm-cov":
+                stdout = "RUSTC_WRAPPER=wrapper\nCARGO_LLVM_COV=1\n"
+            elif first == "cargo" and command[1] == "build":
+                stdout = artifact(binary, "bin", False)
+            elif first == "cargo" and command[1] == "test":
+                stdout = artifact(library, "lib", True)
+            elif first == library.name:
+                path = Path(kwargs["env"]["LLVM_PROFILE_FILE"].replace("%p", "9684").replace("%16m", "5469779597299527299_4"))
+                path.write_bytes(b"synthetic raw header")
+            elif first == "rustc":
+                stdout = str(self.root / "toolchain") + "\n" if "--print" in command else "host: aarch64-apple-darwin\n"
+            elif first == "llvm-profdata":
+                code = merge_exit
+                raw = next((output / "profiles").glob("*.profraw"))
+                stderr = f"warning: {raw}: invalid instrumentation profile data (file header is corrupt)\nerror: no profile can be merged\n" if code else ""
+            elif first == "llvm-cov":
+                stdout = "SF:" + str(self.root / "src/main.rs") + "\nDA:1,1\nend_of_record\n"
+            elif first == "cargo" and command[1] == "run":
+                stdout = '{"files":{"src/main.rs":[]}}'
+            elif first == "git":
+                stdout = "fixture-commit\n"
+            else:
+                self.fail(f"unexpected tool command: {command}")
+            return subprocess.CompletedProcess(command, code, stdout, stderr)
+        return output, options, execute
+
+    def test_collection_binds_phase_manifest_and_keeps_merge_flags(self):
+        output, options, execute = self.fake_collection()
+        with mock.patch.object(runner, "ROOT", self.root), mock.patch.object(runner.subprocess, "run", side_effect=execute):
+            runner.collect(options)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["phase_manifest_sha256"], runner.digest(output / "phases.json"))
+        phases = json.loads((output / "phases.json").read_text())["phases"]
+        self.assertTrue(all(phase["status"] == "passed" for phase in phases))
+        self.assertTrue(all("-%p-%16m.profraw" in phase["profile_pattern"] for phase in phases))
+        merge = next(phase for phase in phases if phase["phase"] == "profile-merge")
+        self.assertEqual(merge["command"][1:4], ["merge", "-sparse", "-f"])
+        self.assertEqual(len(list((output / "profiles").glob("*.profraw"))), 1)
+
+    def test_merge_failure_preserves_provenance_and_original_exception_even_if_evidence_fails(self):
+        for fail_evidence in [False, True]:
+            with self.subTest(fail_evidence=fail_evidence), tempfile.TemporaryDirectory() as directory:
+                previous = self.root
+                self.root = Path(directory)
+                (self.root / "src").mkdir()
+                (self.root / "src/main.rs").write_text("fn main() {}\n")
+                try:
+                    output, options, execute = self.fake_collection(merge_exit=17)
+                    errors = []
+                    actual = runner.run
+                    def remember(*args, **kwargs):
+                        try:
+                            return actual(*args, **kwargs)
+                        except subprocess.CalledProcessError as error:
+                            errors.append(error)
+                            raise
+                    with mock.patch.object(runner, "ROOT", self.root), mock.patch.object(runner.subprocess, "run", side_effect=execute), mock.patch.object(runner, "run", side_effect=remember):
+                        if fail_evidence:
+                            with mock.patch.object(runner, "preserve_merge_failure", side_effect=OSError("evidence unavailable")), self.assertRaises(subprocess.CalledProcessError) as failure:
+                                runner.collect(options)
+                        else:
+                            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                                runner.collect(options)
+                    self.assertIs(failure.exception, errors[0])
+                    self.assertEqual(failure.exception.returncode, 17)
+                    phases = json.loads((output / "phases.json").read_text())["phases"]
+                    self.assertEqual(phases[-1]["phase"], "profile-merge")
+                    self.assertEqual(phases[-1]["exit_code"], 17)
+                    self.assertFalse((output / "manifest.json").exists())
+                    if not fail_evidence:
+                        self.assertTrue((output / "profile-merge-diagnostics/diagnostics.json").exists())
+                finally:
+                    self.root = previous
+
+    def test_always_uploads_include_bounded_diagnostics_not_entire_profile_sets(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/checks.yml").read_text()
+        for platform in ["macos", "linux"]:
+            self.assertIn(f"target/coverage/rust-{platform}/phases.json", workflow)
+            self.assertIn(f"target/coverage/rust-{platform}/profile-merge-diagnostics/", workflow)
+            self.assertNotIn(f"target/coverage/rust-{platform}/profiles/", workflow)
+        self.assertGreaterEqual(workflow.count("if: always()"), 3)
+
     def collection(self, name, origin, hits, **changes):
         directory = self.root / name
         directory.mkdir()

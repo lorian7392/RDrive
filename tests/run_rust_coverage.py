@@ -6,15 +6,150 @@ storage, reads Keychain credentials, or changes a user's service. The optional
 Samba fixture requires Docker and uses disposable synthetic shares.
 """
 import argparse
+import datetime
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
+import stat
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
+MAX_DIAGNOSTIC_PROFILES = 8
+MAX_DIAGNOSTIC_FILE_BYTES = 16 * 1024 * 1024
+MAX_DIAGNOSTIC_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_DIAGNOSTIC_LINES = 16
+MAX_DIAGNOSTIC_LINE_CHARS = 2048
+
+
+def phase_label(value):
+    """Keep fixed phase names filename-safe without accepting LLVM escapes."""
+    return re.sub(r"[^a-z0-9_-]+", "-", value.lower()).strip("-_")[:64] or "phase"
+
+
+def phase_environment(environment, profiles, phase):
+    return dict(environment, LLVM_PROFILE_FILE=str(
+        profiles / ("rdrive-" + phase_label(phase) + "-%p-%16m.profraw")))
+
+
+def timestamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+class PhaseLog:
+    def __init__(self, path):
+        self.path = path
+        self.records = []
+        self.save()
+
+    def save(self):
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"schema": 1, "phases": self.records}, indent=2) + "\n")
+        temporary.replace(self.path)
+
+    def start(self, phase, command, environment, log):
+        record = {"phase": phase_label(phase), "command": list(map(str, command)),
+                  "profile_pattern": environment.get("LLVM_PROFILE_FILE"),
+                  "log": str(log), "started": timestamp(), "ended": None,
+                  "exit_code": None, "status": "running"}
+        self.records.append(record)
+        self.save()
+        return record
+
+    def finish(self, record, status, code, elapsed, error=None):
+        record.update(ended=timestamp(), status=status, exit_code=code, elapsed_seconds=elapsed)
+        if error is not None:
+            record["error_type"] = type(error).__name__
+        self.save()
+
+
+def profile_phases(name, records):
+    matches = []
+    for phase in records:
+        pattern = phase.get("profile_pattern")
+        if pattern and fnmatch.fnmatchcase(name, re.sub(r"%\d*[a-zA-Z]", "*", Path(pattern).name)):
+            matches.append(phase["phase"])
+    return matches
+
+
+def profile_evidence(path, directory, remaining):
+    """Hash the reported regular file; cap copied evidence, never merge inputs."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Reported profile is not a regular file")
+        complete = before.st_size <= MAX_DIAGNOSTIC_FILE_BYTES and before.st_size <= remaining
+        copy_limit = before.st_size if complete else min(128, remaining)
+        name = path.name if complete else path.name + ".header"
+        destination = directory / name
+        checksum, header, copied, hashed = hashlib.sha256(), b"", 0, 0
+        with destination.open("xb") as preserved:
+            while block := source.read(1024 * 1024):
+                checksum.update(block)
+                header = (header + block[:128])[:128]
+                hashed += len(block)
+                selected = block[:max(0, copy_limit - copied)]
+                preserved.write(selected)
+                copied += len(selected)
+        after = os.fstat(source.fileno())
+    stable = (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+    complete = complete and stable and hashed == before.st_size and copied == hashed
+    return {"path": str(path), "size": before.st_size, "mtime_ns": before.st_mtime_ns,
+            "sha256": checksum.hexdigest(), "header_hex": header.hex(), "bytes_hashed": hashed,
+            "stable_during_read": stable,
+            "preserved_file": name, "preserved_bytes": copied, "full_copy": complete,
+            "preservation_status": "changed_during_read" if not stable else (
+                "complete" if complete else "header_only_limit" if copied else "metadata_only_limit")}, copied
+
+
+def preserve_merge_failure(output, raw, phases, error):
+    """Preserve only known raw inputs explicitly named in LLVM diagnostics."""
+    directory = output / "profile-merge-diagnostics"
+    directory.mkdir()
+    known = {path.name: path for path in raw}
+    reported, lines, omitted_lines = [], [], 0
+    log = output / "logs/profile-merge.log"
+    if log.exists():
+        with log.open(errors="replace") as source:
+            for line in source:
+                if not re.search(
+                        r"warning:|error:|malformed|corrupt|invalid|truncated|unsupported|cannot|unable|failed|bad magic", line, re.I):
+                    continue
+                if len(lines) < MAX_DIAGNOSTIC_LINES:
+                    lines.append(line.rstrip()[:MAX_DIAGNOSTIC_LINE_CHARS])
+                else:
+                    omitted_lines += 1
+                names = set(re.findall(r"[^\s/\\'\"():]+\.profraw", line))
+                for name, path in known.items():
+                    if (name in names or str(path) in line) and name not in reported:
+                        reported.append(name)
+    remaining = MAX_DIAGNOSTIC_TOTAL_BYTES
+    files = []
+    for name in reported[:MAX_DIAGNOSTIC_PROFILES]:
+        path = known[name]
+        try:
+            evidence, used = profile_evidence(path, directory, remaining)
+            remaining -= used
+            evidence["phases"] = profile_phases(name, phases.records)
+            files.append(evidence)
+        except (OSError, ValueError) as failure:
+            files.append({"path": str(path), "error_type": type(failure).__name__,
+                          "error": str(failure)[:512], "phases": profile_phases(name, phases.records),
+                          "full_copy": False, "preserved_bytes": 0, "preservation_status": "unavailable"})
+    report = {"schema": 1, "merge_error_type": type(error).__name__,
+              "merge_exit_code": getattr(error, "returncode", None), "raw_input_count": len(raw),
+              "reported_profile_count": len(reported), "omitted_profiles": max(0, len(reported) - len(files)),
+              "diagnostic_lines": lines, "omitted_diagnostic_lines": omitted_lines, "profiles": files,
+              "limits": {"profiles": MAX_DIAGNOSTIC_PROFILES, "full_file_bytes": MAX_DIAGNOSTIC_FILE_BYTES,
+                         "total_preserved_bytes": MAX_DIAGNOSTIC_TOTAL_BYTES},
+              "merge_retried": False, "merge_inputs_changed": False}
+    (directory / "diagnostics.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 def digest(path):
@@ -106,15 +241,43 @@ def workflows(python, binary, group, output, library):
     return commands
 
 
-def run(command, *, root, environment, log, capture=False, timeout=1800):
+def run(command, *, root, environment, log, capture=False, timeout=1800,
+        phases=None, phase=None, profiles=None):
+    if profiles is not None:
+        environment = phase_environment(environment, profiles, phase)
+    record = phases.start(phase, command, environment, log) if phases else None
+    started = time.monotonic()
     print("RUN " + shlex.join(map(str, command)), flush=True)
-    result = subprocess.run(list(map(str, command)), cwd=root, env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=timeout)
-    log.write_text(result.stdout + "\n--- stderr ---\n" + result.stderr)
-    if result.returncode:
-        print((result.stdout + result.stderr)[-12000:], file=sys.stderr)
-        raise subprocess.CalledProcessError(result.returncode, command)
+    result = None
+    try:
+        result = subprocess.run(list(map(str, command)), cwd=root, env=environment,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=timeout)
+        try:
+            log.write_text(result.stdout + "\n--- stderr ---\n" + result.stderr)
+        except OSError as failure:
+            if not result.returncode:
+                raise
+            print("Could not save failed command log: " + str(failure), file=sys.stderr)
+        if result.returncode:
+            print((result.stdout + result.stderr)[-12000:], file=sys.stderr)
+            raise subprocess.CalledProcessError(result.returncode, command)
+    except BaseException as error:
+        if isinstance(error, subprocess.TimeoutExpired):
+            text = lambda value: value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+            try:
+                log.write_text(text(error.stdout) + "\n--- stderr ---\n" + text(error.stderr))
+            except OSError as failure:
+                print("Could not save timed-out command log: " + str(failure), file=sys.stderr)
+        if phases:
+            try:
+                phases.finish(record, "failed", result.returncode if result else None,
+                              time.monotonic() - started, error)
+            except OSError as failure:
+                print("Could not finish coverage phase evidence: " + str(failure), file=sys.stderr)
+        raise
+    if phases:
+        phases.finish(record, "passed", result.returncode, time.monotonic() - started)
     return result.stdout if capture else None
 
 
@@ -129,19 +292,22 @@ def collect(options):
     profiles.mkdir()
     logs = output / "logs"
     logs.mkdir()
+    phases = PhaseLog(output / "phases.json")
     target = options.target_dir.resolve() if options.target_dir else output / "build"
     frozen = sources(root)
     environment = dict(os.environ, CARGO_LLVM_COV_TARGET_DIR=str(target), CARGO_TARGET_DIR=str(target))
-    show = run([options.cargo_llvm_cov, "llvm-cov", "show-env", "--export-prefix"],
-               root=root, environment=environment, log=logs / "show-env.log", capture=True)
+    def execute(phase, command, *, log=None, capture=False, environment_override=None):
+        return run(command, root=root,
+                   environment=environment if environment_override is None else environment_override,
+                   log=log or logs / (phase + ".log"), capture=capture,
+                   phases=phases, phase=phase, profiles=profiles)
+    show = execute("show-env", [options.cargo_llvm_cov, "llvm-cov", "show-env", "--export-prefix"], capture=True)
     environment.update(parse_environment(show))
-    environment["LLVM_PROFILE_FILE"] = str(profiles / "rdrive-%p-%16m.profraw")
     arguments = ["--locked"] + (["--offline"] if options.offline else [])
     objects = {}
     for name, cargo_args in [("cli-build", ["build", "--bin", "rdrive"]),
                              ("test-build", ["test", "--tests", "--no-run"])]:
-        output_json = run([options.cargo, *cargo_args, *arguments, "--message-format=json"],
-                          root=root, environment=environment, log=logs / (name + ".log"), capture=True)
+        output_json = execute(name, [options.cargo, *cargo_args, *arguments, "--message-format=json"], capture=True)
         objects.update({obj["path"]: obj for obj in artifacts(output_json, root)})
     executable = [obj for obj in objects.values() if not obj["test"] and obj["kind"] == ["bin"] and obj["name"] == "rdrive"]
     library = [obj for obj in objects.values() if obj["test"] and "lib" in obj["kind"] and obj["name"] == "rdrive"]
@@ -157,8 +323,7 @@ def collect(options):
         if options.test_suite == "portable-smb" and obj["path"] != str(library) and obj["name"] != "coverage_operations":
             continue
         command = test_command(obj, library, options.test_suite)
-        run(command, root=root, environment=environment,
-            log=logs / (f"test-{index:02d}-" + obj["name"] + ".log"))
+        execute(f"test-{index:02d}-" + obj["name"], command)
         executed_tests.append(command)
     jobs = workflows(sys.executable, binary, options.workflows, output, library)
     # Fixture selectors are test controls; ambient leftovers must not turn a
@@ -167,7 +332,8 @@ def collect(options):
                  "RDRIVE_SMB_SMART", "RDRIVE_SMB_NOTIFY_ONLY", "RDRIVE_SMB_REPORT", "RDRIVE_SMB_TEST_RUNNER"):
         environment.pop(name, None)
     for name, command, extra in jobs:
-        run(command, root=root, environment=dict(environment, **extra), log=logs / (name + ".log"))
+        execute("workflow-" + name, command, log=logs / (name + ".log"),
+                environment_override=dict(environment, **extra))
     check_sources(root, frozen)
     for obj in objects.values():
         if digest(Path(obj["path"])) != obj["sha256"]:
@@ -175,28 +341,32 @@ def collect(options):
     raw = sorted(profiles.glob("*.profraw"))
     if not raw:
         raise RuntimeError("No Rust profiles produced")
-    sysroot = run([options.rustc, "--print", "sysroot"], root=root, environment=environment,
-                  log=logs / "sysroot.log", capture=True).strip()
-    version = run([options.rustc, "-vV"], root=root, environment=environment,
-                  log=logs / "rustc.log", capture=True)
+    sysroot = execute("sysroot", [options.rustc, "--print", "sysroot"], capture=True).strip()
+    version = execute("rustc", [options.rustc, "-vV"], capture=True)
     host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
     llvm = Path(sysroot) / "lib/rustlib" / host / "bin"
     profile_list = output / "profiles.txt"
     profile_list.write_text("\n".join(map(str, raw)) + "\n")
     merged = output / "coverage.profdata"
-    run([llvm / "llvm-profdata", "merge", "-sparse", "-f", profile_list, "-o", merged],
-        root=root, environment=environment, log=logs / "profile-merge.log")
+    try:
+        execute("profile-merge", [llvm / "llvm-profdata", "merge", "-sparse", "-f", profile_list, "-o", merged])
+    except Exception as error:
+        try:
+            preserve_merge_failure(output, raw, phases, error)
+        except Exception as failure:
+            print("Could not preserve merge failure evidence: " + str(failure), file=sys.stderr)
+        raise
     explicit_objects = [item["path"] for item in sorted(objects.values(), key=lambda obj: obj["path"])]
     command = [llvm / "llvm-cov", "export", "--format=lcov", "--instr-profile=" + str(merged), explicit_objects[0]]
     command += ["--object=" + path for path in explicit_objects[1:]]
     command += [str(root / name) for name in frozen]
-    lcov = run(command, root=root, environment=environment, log=logs / "llvm-export.log", capture=True)
+    lcov = execute("llvm-export", command, capture=True)
     (output / "coverage.lcov").write_text(lcov)
     scope_environment = dict(os.environ)
     scope_environment["CARGO_TARGET_DIR"] = str(output / "scope-build")
-    spans = run([options.cargo, "run", *arguments, "--quiet", "--manifest-path",
-                 root / "tools/coverage-scope/Cargo.toml", "--", root],
-                root=root, environment=scope_environment, log=logs / "scope.log", capture=True)
+    spans = execute("scope", [options.cargo, "run", *arguments, "--quiet", "--manifest-path",
+                    root / "tools/coverage-scope/Cargo.toml", "--", root],
+                    environment_override=scope_environment, capture=True)
     json.loads(spans)
     (output / "test-spans.json").write_text(spans)
     check_sources(root, frozen)
@@ -208,6 +378,7 @@ def collect(options):
                 "git_head": git, "rustc": version,
                 "coverage_lcov": "coverage.lcov", "coverage_sha256": digest(output / "coverage.lcov"),
                 "test_spans_sha256": digest(output / "test-spans.json"), "source_hashes_verified": True,
+                "phase_manifest": "phases.json", "phase_manifest_sha256": digest(phases.path),
                 "profile_files": len(raw), "status": "passed"}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print("Rust collection passed: " + str(output / "manifest.json"), flush=True)
