@@ -116,6 +116,126 @@ fn migration_markers_metadata_permissions_and_links_fail_closed() {
     fs::remove_file(reference).unwrap();fs::set_permissions(&f.source,fs::Permissions::from_mode(0o755)).unwrap();assert!(private_directory(&f.source).is_err());
 }
 
+#[derive(Default)]
+struct VaultMigrationSpy { inner:Fake, observed:Vec<String>, initialize_at_planned:Option<PathBuf> }
+impl Operations for VaultMigrationSpy {
+    fn options(&mut self,home:&Path)->Result<Option<ServiceOptions>> {self.observed.push("options".into());self.inner.options(home)}
+    fn running(&mut self,home:&Path)->Result<bool> {self.observed.push("running".into());self.inner.running(home)}
+    fn action(&mut self,home:&Path,action:ServiceAction)->Result<()> {self.observed.push(format!("{action:?}"));self.inner.action(home,action)}
+    fn install(&mut self,options:&ServiceOptions)->Result<()> {self.observed.push("install".into());self.inner.install(options)}
+    fn wait_ready(&mut self,home:&Path)->Result<()> {self.observed.push("ready".into());self.inner.wait_ready(home)}
+    fn checkpoint(&mut self,phase:&str)->Result<()> {
+        self.observed.push(format!("phase:{phase}"));
+        if phase=="planned" {
+            if let Some(home)=self.initialize_at_planned.take() {
+                let _writer=crate::state::Store::open(home.clone())?;
+                bytes(&home.join("checkpoints/vault/descriptor.json"),br#"{"home_binding":"retained-original-home"}"#);
+                bytes(&home.join("checkpoints/vault/vault.dmg"),b"the only retained checkpoint image");
+            }
+        }
+        self.inner.checkpoint(phase)
+    }
+}
+
+#[test]
+fn retained_or_unrecognized_vaults_are_rejected_before_any_migration_action() {
+    for enabled in [false,true] {
+        for artifact in ["descriptor.json","vault.dmg","unexpected-owner-file"] {
+            let f=fixture();let mut store=crate::state::Store::open(f.source.clone()).unwrap();
+            store.config.checkpoints.enabled=enabled;store.save_config().unwrap();drop(store);
+            bytes(&f.source.join("checkpoints/vault").join(artifact),b"retained vault bytes");
+            bytes(&f.standard.join(JOURNAL),b"retained migration journal must not be changed");
+            let source=walk(&f.source).unwrap();let locator=fs::read(f.standard.join(LOCATOR)).unwrap();
+            let pause=fs::read(f.source.join("smart/control.json")).unwrap();let journal=fs::read(f.standard.join(JOURNAL)).unwrap();
+            for apply in [false,true] {
+                let mut ops=VaultMigrationSpy::default();
+                let error=migrate_with(&f.source,&f.destination,&f.standard,apply,&mut ops).unwrap_err();
+                assert!(error.to_string().contains("retained APFS checkpoint vault"));
+                assert!(ops.observed.is_empty());assert_eq!(walk(&f.source).unwrap(),source);
+                assert_eq!(fs::read(f.standard.join(LOCATOR)).unwrap(),locator);
+                assert_eq!(fs::read(f.source.join("smart/control.json")).unwrap(),pause);
+                assert_eq!(fs::read(f.standard.join(JOURNAL)).unwrap(),journal);
+                assert!(!f.destination.exists());assert!(!f.source.join(MARKER).exists());
+                retained_at(&f.source);
+            }
+        }
+    }
+}
+
+#[test]
+fn vault_paths_must_be_private_real_directories_even_when_no_image_is_recorded() {
+    for shape in ["vault-file","vault-symlink","vault-public","checkpoints-file","checkpoints-symlink"] {
+        let f=fixture();let vault=f.source.join("checkpoints/vault");
+        let outside=f.standard.join("outside-vault");private(&outside);bytes(&outside.join("unrelated"),b"unrelated bytes");
+        match shape {
+            "vault-file"=>bytes(&vault,b"not a directory"),
+            "vault-symlink"=>{private(vault.parent().unwrap());symlink(&outside,&vault).unwrap();},
+            "vault-public"=>{private(&vault);fs::set_permissions(&vault,fs::Permissions::from_mode(0o755)).unwrap();},
+            "checkpoints-file"=>bytes(vault.parent().unwrap(),b"not a directory"),
+            "checkpoints-symlink"=>symlink(&outside,vault.parent().unwrap()).unwrap(),
+            _=>unreachable!(),
+        }
+        let locator=fs::read(f.standard.join(LOCATOR)).unwrap();let control=fs::read(f.source.join("smart/control.json")).unwrap();
+        for apply in [false,true] {
+            let mut ops=VaultMigrationSpy::default();assert!(migrate_with(&f.source,&f.destination,&f.standard,apply,&mut ops).is_err());
+            assert!(ops.observed.is_empty());assert_eq!(fs::read(f.standard.join(LOCATOR)).unwrap(),locator);
+            assert_eq!(fs::read(f.source.join("smart/control.json")).unwrap(),control);
+            assert_eq!(fs::read(outside.join("unrelated")).unwrap(),b"unrelated bytes");
+            assert!(!f.standard.join(JOURNAL).exists());assert!(!f.destination.exists());retained_at(&f.source);
+        }
+    }
+}
+
+#[test]
+fn empty_private_vault_directories_can_still_move_without_recovery_data_loss() {
+    for include_vault in [false,true] {
+        let f=fixture();let root=f.source.join("checkpoints");private(&root);
+        if include_vault {private(&root.join("vault"));}
+        let before=walk(&f.source).unwrap();let mut ops=Fake::default();
+        assert_eq!(migrate_with(&f.source,&f.destination,&f.standard,false,&mut ops).unwrap()["apply"],false);
+        assert_eq!(walk(&f.source).unwrap(),before);
+        assert_eq!(apply(&f,&mut ops).unwrap()["migrated"],true);retained_at(&f.destination);
+        assert!(f.destination.join("checkpoints").is_dir());
+        if include_vault {assert!(fs::read_dir(f.destination.join("checkpoints/vault")).unwrap().next().is_none());}
+    }
+}
+
+#[test]
+fn vault_initialization_between_preflight_and_writer_freeze_rolls_back_service_and_pause() {
+    let f=fixture();let original=ServiceOptions{home:f.source.clone(),executable:f.standard.join("rdrive"),ipc_root:f.standard.join("ipc"),app:None,development_tcp:false,launch_agents_dir:None};
+    let mut ops=VaultMigrationSpy{inner:Fake{installed:Some(original.clone()),running:true,..Default::default()},initialize_at_planned:Some(f.source.clone()),..Default::default()};
+    let before=walk(&f.source).unwrap();let locator=fs::read(f.standard.join(LOCATOR)).unwrap();
+    let error=migrate_with(&f.source,&f.destination,&f.standard,true,&mut ops).unwrap_err();
+    assert!(format!("{error:#}").contains("retained APFS checkpoint vault"));
+    assert_eq!(selected(&f),f.source);assert_eq!(fs::read(f.standard.join(LOCATOR)).unwrap(),locator);
+    assert!(!paused(&f.source).unwrap());assert!(ops.inner.running);
+    assert_eq!(ops.inner.installed.unwrap(),original);
+    assert_eq!(ops.observed.iter().filter(|x|x.as_str()=="Stop").count(),1);
+    assert!(ops.observed.contains(&"Start".into()));assert!(ops.observed.contains(&"ready".into()));
+    assert!(!ops.observed.contains(&"Uninstall".into()));assert!(!f.destination.exists());assert!(!f.source.join(MARKER).exists());
+    let after=walk(&f.source).unwrap();
+    for (path,mut object) in before {if path!=Path::new("smart/control.json") {
+        if path==Path::new("smart") || path==Path::new("smart/domain") {let actual=&after[&path];object.modified_secs=actual.modified_secs;object.modified_nanos=actual.modified_nanos;}
+        assert_eq!(after.get(&path),Some(&object),"{}",path.display());
+    }}
+    assert_eq!(fs::read(f.source.join("checkpoints/vault/vault.dmg")).unwrap(),b"the only retained checkpoint image");
+    assert_eq!(fs::read(f.source.join("checkpoints/vault/descriptor.json")).unwrap(),br#"{"home_binding":"retained-original-home"}"#);
+    let journal:Intent=read_json(&f.standard.join(JOURNAL)).unwrap();assert_eq!(journal.phase,Phase::RolledBack);
+    assert_eq!(recover_with(&f.standard,&mut Fake::default()).unwrap()["committed"],false);
+    retained_at(&f.source);
+}
+
+#[test]
+fn checkpoint_guard_surfaces_inaccessible_metadata_and_directory_errors() {
+    let f=fixture();let checkpoints=f.source.join("checkpoints");let vault=checkpoints.join("vault");private(&vault);
+    for path in [&f.source,&checkpoints,&vault] {
+        fs::set_permissions(path,fs::Permissions::from_mode(0o000)).unwrap();
+        let result=require_relocatable_checkpoints(&f.source);
+        fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+    }
+}
+
 #[test]
 fn absent_and_invalid_recovery_journals_are_bounded_and_non_destructive() {
     let f=fixture();let mut ops=Fake::default();assert_eq!(recover_with(&f.standard,&mut ops).unwrap()["pending"],false);

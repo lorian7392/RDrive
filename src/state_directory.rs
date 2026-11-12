@@ -390,9 +390,28 @@ pub fn show(home: &Path, standard: &Path) -> Result<Value> {
     guard(home)?;
     Ok(json!({"home":home,"configuration":home.join("config.json"),"shared_locator":standard.join(LOCATOR),"migration_journal":standard.join(JOURNAL),"standard_home":standard.join("state")}))
 }
+fn require_relocatable_checkpoints(home: &Path) -> Result<()> {
+    let checkpoints = home.join("checkpoints");
+    match fs::symlink_metadata(&checkpoints) {
+        Ok(_) => private_directory(&checkpoints)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let vault = checkpoints.join("vault");
+    match fs::symlink_metadata(&vault) {
+        Ok(_) => private_directory(&vault)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if fs::read_dir(&vault)?.next().transpose()?.is_some() {
+        bail!("state relocation with a retained APFS checkpoint vault is not supported; keep the current state location and export checkpoint payloads for recovery");
+    }
+    Ok(())
+}
 pub fn migrate(home: &Path, destination: &Path, standard: &Path, apply: bool) -> Result<Value> { migrate_with(home, destination, standard, apply, &mut System::default()) }
 fn migrate_with(home: &Path, destination: &Path, standard: &Path, apply: bool, operations: &mut dyn Operations) -> Result<Value> {
     guard(home)?; private_directory(home)?;
+    require_relocatable_checkpoints(home)?;
     let source = home.canonicalize()?; let destination = state::resolve_location(destination)?; let standard = state::resolve_location(standard)?;
     if source == destination || destination.starts_with(&source) || source.starts_with(&destination) || source == standard || standard.starts_with(&source) { bail!("state source, destination and migration-control directory must not overlap"); }
     if fs::symlink_metadata(&destination).is_ok() { bail!("migration destination must not already exist; existing data was preserved"); }
@@ -419,6 +438,7 @@ fn migrate_with(home: &Path, destination: &Path, standard: &Path, apply: bool, o
         if intent.running { operations.action(&source,ServiceAction::Stop)?; }
         let leases = locks(&source,Duration::from_secs(15))?;
         if active_work(&source)? { bail!("active work remains after stopping the service; original data was retained"); }
+        require_relocatable_checkpoints(&source)?;
         write_json(&source.join(MARKER),&marker(&intent,"migrating"))?;
         operations.checkpoint("stopped")?;
         intent.manifest=walk(&source)?;
