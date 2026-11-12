@@ -97,16 +97,20 @@ def run(binary):
         cli_base = [str(binary), "--home", str(home), "--json", "--progress", "off"]
         process = None
         log = (root / "bridge.log").open("w+")
-        def cli(*args):
+        def command(*args, timeout=50):
             deadline = time.monotonic() + 45
             while True:
-                result = subprocess.run(cli_base + list(args), env=env, capture_output=True, text=True, timeout=50)
-                if result.returncode == 0:
-                    return json.loads(result.stdout)
-                if "another rdrive process" not in result.stderr and "already locked" not in result.stderr and "state directory is in use" not in result.stderr:
-                    raise AssertionError(result.stderr)
-                assert time.monotonic() < deadline, result.stderr
+                result = subprocess.run(cli_base + list(args), env=env, capture_output=True, text=True, timeout=timeout)
+                busy = any(message in result.stderr for message in
+                           ("another rdrive process", "already locked", "state directory is in use"))
+                if result.returncode == 0 or not busy:
+                    return result
+                assert time.monotonic() < deadline, (result.returncode, result.stderr)
                 time.sleep(.1)
+        def cli(*args):
+            result = command(*args)
+            assert result.returncode == 0, (result.returncode, result.stderr)
+            return json.loads(result.stdout)
         def rpc(**message):
             settings = json.loads((ipc / "bridge-endpoint.json").read_text())
             message.update(v=1, auth_token=settings["token"])
@@ -345,9 +349,19 @@ def run(binary):
             assert acknowledged["item"]["sync_state"] != "conflict", acknowledged
             assert json.loads(queue_path.read_text())["mutations"] == after, "acknowledging the obsolete callback changed queue history"
             assert snapshot.read_bytes() == child_contents and not Fixture.request_attempts[request_offset:]
-            denied_retry = subprocess.run(cli_base + ["smart", "retry", "smart-fixture", stale_entry["id"]],
-                                          env=env, capture_output=True, text=True, timeout=30)
-            assert denied_retry.returncode != 0 and "cancelled" in denied_retry.stderr
+            # A paused broker still publishes local overlays under client.lock.
+            # The negative CLI assertion must reach the cancellation guard,
+            # even if it first meets a brief background writer lease.
+            with (home / "client.lock").open("r+b") as writer_lock:
+                fcntl.flock(writer_lock, fcntl.LOCK_EX)
+                release = threading.Timer(.5, lambda: fcntl.flock(writer_lock, fcntl.LOCK_UN))
+                release.start()
+                try:
+                    denied_retry = command("smart", "retry", "smart-fixture", stale_entry["id"], timeout=30)
+                    assert denied_retry.returncode != 0 and "cancelled" in denied_retry.stderr, (denied_retry.returncode, denied_retry.stderr)
+                finally:
+                    release.join(timeout=2)
+                    fcntl.flock(writer_lock, fcntl.LOCK_UN)
             assert not ok(op="smart_repair_status", id=folder["id"])["eligible"]
             Fixture.online = True
             cli("index", "config", "--refresh-seconds", "3", "--active-refresh-seconds", "3")
@@ -374,8 +388,8 @@ def run(binary):
             denied = rpc(op="cache_budget", native_accounting_id="fileprovider:smart-fixture", native_used_bytes=8, native_reserved_bytes=4, native_pinned_bytes=0)
             assert not denied["ok"]
             assert ok(op="cache_budget")["used_bytes"] == 8
-            blocked = subprocess.run(cli_base + ["cache", "fetch", "fixture", "four.txt"],env=env,capture_output=True,text=True,timeout=30)
-            assert blocked.returncode != 0, blocked.stdout
+            blocked = command("cache", "fetch", "fixture", "four.txt", timeout=30)
+            assert blocked.returncode != 0 and "cache capacity is insufficient" in blocked.stderr, (blocked.returncode, blocked.stderr)
             cli("cache", "config", "--max-bytes", "12")
             cli("cache", "fetch", "fixture", "four.txt")
             budget = ok(op="cache_budget")

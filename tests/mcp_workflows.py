@@ -85,7 +85,12 @@ class Client:
         try:
             line = self.lines.get(timeout=timeout)
         except queue.Empty:
-            raise AssertionError("MCP server did not return a response") from None
+            stderr = self.stderr.decode(errors="replace").replace(PASSWORD, "<redacted>")[-2000:]
+            readers = [reader.is_alive() for reader in self.readers]
+            raise AssertionError(
+                f"MCP server did not return a response (pid={self.process.pid}, "
+                f"exit={self.process.poll()!r}, readers={readers}); stderr={stderr or '<empty>'}"
+            ) from None
         if line is None:
             raise AssertionError(f"MCP server exited early: {self.stderr.decode(errors='replace')}")
         try:
