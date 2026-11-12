@@ -35,3 +35,4 @@ pub mod state_directory;
 pub mod history;
 pub mod history_control;
 pub mod checkpoints;
+pub mod checkpoint_schedule;

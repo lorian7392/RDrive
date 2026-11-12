@@ -4,6 +4,9 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Add a dedicated fixed-capacity APFS file checkpoint vault with hourly-capable durable scheduling, crash reconciliation, verified payload recovery and cleanup of owned old checkpoints. Preserve the latest confirmed recovery point during replacement and keep native system snapshots outside automatic cleanup.
+- Reject stale concurrent checkpoint-setting updates and state relocations that would invalidate a retained vault identity.
+
 - Add account-bound local file history with immutable verified contents and selected metadata, rename continuity, protected retention, and a budget separate from clean-cache eviction.
 - Preserve before-images for enabled Smart/queued uploads, explicit destructive file operations, and guarded remote synchronization; recycle supported deletions without losing retained content.
 - Add Finder file history with pagination, preview, verified export, restore-copy defaults, and explicit revision-bound replacement plans that preserve the current version and pending edits.

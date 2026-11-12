@@ -100,6 +100,7 @@ impl Fixture {
         Policy {
             enabled: true,
             max_records: 64,
+            ..Policy::default()
         }
     }
     fn create(&mut self) -> String {
@@ -200,9 +201,134 @@ impl Host for FakeHost {
         Ok(())
     }
 }
-fn error(result: Result<Value>, text: &str) {
+fn error<T: std::fmt::Debug>(result: Result<T>, text: &str) {
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains(text), "expected {text:?}, got {error:?}");
+}
+
+#[test]
+fn managed_policy_requires_a_real_capacity_boundary_and_preserves_legacy_defaults() {
+    let old: Policy = serde_json::from_value(json!({"enabled":true,"max_records":64})).unwrap();
+    assert_eq!(old.storage, Storage::SystemSnapshot);
+    assert!(old.interval_secs.is_none() && old.max_bytes.is_none() && !old.auto_prune);
+    old.validate().unwrap();
+    let mut managed = Policy {
+        enabled:true,
+        max_records:48,
+        storage:Storage::ApfsVault,
+        interval_secs:Some(3600),
+        max_bytes:Some(20 * 1024 * 1024 * 1024),
+        auto_prune:true,
+    };
+    managed.validate().unwrap();
+    managed.max_bytes=None;
+    error(managed.validate(), "finite max_bytes");
+    for bytes in [0, 256 * 1024 * 1024 - 512, i64::MAX as u64 + 1, 256 * 1024 * 1024 + 1] {
+        managed.max_bytes=Some(bytes);
+        error(managed.validate(), "vault capacity");
+    }
+    managed.max_bytes=Some(256 * 1024 * 1024);
+    for interval in [60, 31_536_000] {
+        managed.interval_secs=Some(interval);
+        managed.validate().unwrap();
+    }
+    for interval in [0, 59, 31_536_001] {
+        managed.interval_secs=Some(interval);
+        error(managed.validate(), "checkpoint interval");
+    }
+    managed.interval_secs=None;
+    managed.validate().unwrap();
+    for unsupported in [
+        Policy { interval_secs:Some(3600), ..Policy::default() },
+        Policy { max_bytes:Some(1024 * 1024 * 1024), ..Policy::default() },
+        Policy { auto_prune:true, ..Policy::default() },
+    ] {
+        error(unsupported.validate(), "require apfs_vault");
+    }
+    assert!(serde_json::from_value::<Policy>(json!({"storage":"not_a_backend"})).is_err());
+}
+
+#[test]
+fn an_active_vault_still_exposes_the_policy_and_durable_schedule() {
+    let f=Fixture::new();
+    let policy=Policy{enabled:true,storage:Storage::ApfsVault,max_bytes:Some(512*1024*1024),interval_secs:Some(3600),auto_prune:true,max_records:48};
+    let _active=lease(&f.store.home).unwrap();
+    let value=status(&f.store.home,&policy).unwrap();
+    assert_eq!(value["busy"],true);
+    assert_eq!(value["enabled"],true);
+    assert_eq!(value["configured_capacity_bytes"],512*1024*1024u64);
+    assert!(value.get("schedule").is_some());
+    assert!(!root(&f.store.home).join("vault").exists());
+    let invalid=f.destination("invalid-home");fs::write(&invalid,b"not a state directory").unwrap();
+    assert!(status(&invalid,&policy).is_err());
+}
+
+#[test]
+fn native_and_file_checkpoint_lists_never_hide_an_ambiguous_identity() {
+    let mut legacy=json!({"checkpoints":[{"id":"native"}]});
+    merge_rows(&mut legacy,&json!({"checkpoints":[{"id":"vault"}]})).unwrap();
+    assert_eq!(legacy["checkpoints"].as_array().unwrap().len(),2);
+    error(merge_rows(&mut legacy,&json!({"checkpoints":[{"id":"native"}]})),"ambiguous checkpoint");
+    assert_eq!(legacy["checkpoints"].as_array().unwrap().len(),2);
+    error(merge_rows(&mut json!({"checkpoints":null}),&json!({"checkpoints":[]})),"checkpoint list missing");
+    error(merge_rows(&mut legacy,&json!({"checkpoints":null})),"vault checkpoint list missing");
+}
+
+#[test]
+fn pending_scheduler_identity_routes_recovery_before_incomplete_vault_inspection() {
+    let f = Fixture::new();
+    let home = &f.store.home;
+    let checkpoint = uuid::Uuid::new_v4().to_string();
+    let scheduler = home.join("checkpoint-scheduler");
+    directory(&scheduler).unwrap();
+    state::atomic_json(&scheduler.join("state.json"), &json!({
+        "version": 1,
+        "inflight": {"id": checkpoint, "backend_key": "apfs_vault:536870912", "started_at": 1},
+        "last_success": null,
+        "failure_count": 0,
+        "retry_at": null,
+        "last_error": null,
+        "last_deferred": null
+    })).unwrap();
+    directory(&root(home)).unwrap();
+    let vault = root(home).join("vault");
+    directory(&vault).unwrap();
+    write(&vault.join("descriptor.json"), b"{");
+    let config_before = fs::read(home.join("config.json")).unwrap();
+    let scheduler_before = fs::read(scheduler.join("state.json")).unwrap();
+
+    // The persisted attempt is enough to select its backend. Inspecting the
+    // incomplete descriptor first would lose that routing authority.
+    assert!(managed_id(home, &checkpoint).unwrap());
+    error(managed_id(home, &uuid::Uuid::new_v4().to_string()), "EOF");
+    let destination = f.destination("unpublished-recovery.data");
+    for result in [
+        inspect(home, &checkpoint),
+        reconcile(&f.store, &checkpoint, false),
+        forget(&f.store, &checkpoint),
+        export_file(home, &checkpoint, Path::new("spool/upload"), &destination, false),
+    ] {
+        error(result, "EOF");
+    }
+    assert_eq!(fs::read(home.join("config.json")).unwrap(), config_before);
+    assert_eq!(fs::read(scheduler.join("state.json")).unwrap(), scheduler_before);
+    assert_eq!(fs::read(vault.join("descriptor.json")).unwrap(), b"{");
+    assert_eq!(fs::read(home.join("spool/upload")).unwrap(), b"retained upload");
+    assert!(!vault.join("vault.dmg").exists());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn native_checkpoint_manifest_excludes_scheduler_intent_and_preserves_payloads() {
+    let mut f = Fixture::new();
+    let scheduler = f.store.home.join("checkpoint-scheduler/state.json");
+    write(&scheduler, b"retained unfinished scheduler intent");
+    let checkpoint = f.create();
+    let record = load(&f.store.home, &checkpoint).unwrap();
+    assert!(record.manifest.files[Path::new("spool/upload")].exportable);
+    assert!(!record.manifest.files.keys().any(|path| path.starts_with("checkpoint-scheduler")));
+    assert_eq!(fs::read(scheduler).unwrap(), b"retained unfinished scheduler intent");
+    assert_eq!(f.host.calls, ["create:false", "mount:false", "unmount:false"]);
 }
 
 #[test]
@@ -212,7 +338,8 @@ fn policy_and_default_disabled_never_create() {
     for max_records in [0, 4097] {
         assert!(Policy {
             enabled: true,
-            max_records
+            max_records,
+            ..Policy::default()
         }
         .validate()
         .is_err());
@@ -574,6 +701,7 @@ fn record_cap_and_administration_leases_are_enforced() {
             &Policy {
                 enabled: true,
                 max_records: 1,
+                ..Policy::default()
             },
             false,
             &mut f.host,
@@ -1128,6 +1256,7 @@ fn public_entrypoints_validate_inputs_before_any_os_mutation() {
     let invalid = Policy {
         enabled: true,
         max_records: 0,
+        ..Policy::default()
     };
     assert!(status(&f.store.home, &invalid).is_err());
     assert!(create(&f.store, &Policy::default(), false).is_err());

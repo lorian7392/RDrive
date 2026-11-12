@@ -223,6 +223,7 @@ def workflows(python, binary, group, output, library):
             ("search", "--report"), ("policy", "--output"),
             ("service", "--output"), ("profile_admin", "--report"),
             ("state_directory", "--report"), ("history", "--report"),
+            ("checkpoint", "--report"),
         ]:
             command = [python, str(ROOT / "tests" / (name + "_workflows.py")), str(binary)]
             if flag:

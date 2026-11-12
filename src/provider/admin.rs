@@ -9,12 +9,12 @@ pub(super) struct Priority {
     changed: Notify,
 }
 
-struct Waiting<'a>(&'a Priority);
+pub(super) struct Waiting<'a>(&'a Priority);
 impl Drop for Waiting<'_> {
     fn drop(&mut self) { self.0.waiting.fetch_sub(1, Ordering::SeqCst); }
 }
 impl Priority {
-    fn request(&self) -> Waiting<'_> {
+    pub(super) fn request(&self) -> Waiting<'_> {
         self.waiting.fetch_add(1, Ordering::SeqCst);
         self.changed.notify_waiters();
         Waiting(self)

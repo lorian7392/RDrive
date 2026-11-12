@@ -12,6 +12,7 @@ mod namespace;
 mod resolution;
 mod transfers;
 mod admin;
+mod checkpoint_worker;
 mod background_index;
 mod history;
 pub(crate) fn history_replacement_guard(home:&Path,config:&config::Config,profile:&str,target:&str)->Result<()>{history::replacement_guard(home,config,profile,target)}
@@ -1124,10 +1125,12 @@ pub async fn serve(home:PathBuf,socket:PathBuf,staging:PathBuf,development_tcp:b
     let coordinator=Arc::new(tokio::sync::Mutex::new(()));
     let replay_busy=Arc::new(tokio::sync::Mutex::new(()));
     let mut metadata_workers=background_index::Workers::default();
+    let mut checkpoint_worker=checkpoint_worker::Worker::default();
     let mut smart_tick=tokio::time::interval(std::time::Duration::from_millis(500));
     loop{tokio::select!{
         _=tokio::signal::ctrl_c()=>break,
         _=smart_tick.tick()=>{
+            let _=checkpoint_worker.schedule(&home,coordinator.clone(),administration.priority.clone());
             let _=metadata_workers.schedule(&home,coordinator.clone(),administration.priority.clone());
             if let Ok(busy)=replay_busy.clone().try_lock_owned() {let home=home.clone();let staging=staging.clone();let fd=staging_fd.clone();let coordinator=coordinator.clone();let administration=administration.clone();tokio::spawn(async move{let _busy=busy;let _=background_index::replay_once(&home,&staging,fd.as_ref(),administration.priority.as_ref(),coordinator.as_ref()).await;});}
         },
@@ -1139,6 +1142,7 @@ pub async fn serve(home:PathBuf,socket:PathBuf,staging:PathBuf,development_tcp:b
             let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let coordinator=coordinator.clone();let administration=administration.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),None,coordinator,Some(administration)).await;});}
         accepted=async{if let Some(listener)=&tcp{listener.accept().await}else{std::future::pending().await}}=>{let (stream,address)=accepted?;if !address.ip().is_loopback(){continue;}let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let token=token.clone();let coordinator=coordinator.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),Some(&token),coordinator,None).await;});}
     }}
+    checkpoint_worker.shutdown().await;
     if development_tcp{let _=fs::remove_file(endpoint);}
     fs::remove_file(socket)?;drop(lock);Ok(())
 }

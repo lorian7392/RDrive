@@ -22,6 +22,7 @@ fn values(tool: &Tool, field: &Field, local: &Path) -> Vec<Value> {
     match field.kind {
         Kind::Bool => vec![json!(true), json!(false)],
         Kind::Direction => vec![json!("push"), json!("pull"), json!("both")],
+        Kind::CheckpointStorage => vec![json!("system-snapshot"), json!("apfs-vault")],
         Kind::Patterns => vec![
             json!(["**/*.txt", "reports/**"]),
             json!([]),
@@ -29,6 +30,9 @@ fn values(tool: &Tool, field: &Field, local: &Path) -> Vec<Value> {
             json!(["x".repeat(4096)]),
         ],
         Kind::Number => match field.name {
+            "max_bytes" if tool.name=="rdrive_checkpoint_config" => vec![json!(268435456_u64),json!(21474836480_u64),json!(9007199254740480_u64)],
+            "max_records" => vec![json!(1),json!(48),json!(4096)],
+            "interval_secs" => vec![json!(60),json!(3600),json!(31_536_000)],
             "depth" => vec![json!(0), json!(1), json!(u32::MAX)],
             "refresh_seconds" | "active_refresh_seconds" => vec![json!(1), json!(31_536_000)],
             "page_size" => vec![json!(1), json!(1000)],
@@ -266,6 +270,9 @@ fn bad_values(field: &Field) -> Vec<Value> {
             if matches!(field.kind, Kind::Direction) {
                 bad.push(json!("sideways"));
             }
+            if matches!(field.kind, Kind::CheckpointStorage) {
+                bad.push(json!("unsupported-storage"));
+            }
             if field.name == "profile" {
                 bad.extend([json!("invalid/profile"), json!("space name"), json!("用户")]);
             }
@@ -369,6 +376,13 @@ fn all_mcp_tools_and_fields_validate_map_and_parse_without_executing() {
     }
     let tool = |name: &str| tools.iter().find(|tool| tool.name == name).unwrap();
     for (name, invalid) in [
+        ("rdrive_checkpoint_config", json!({"manual":true,"interval_secs":3600})),
+        ("rdrive_checkpoint_config", json!({"interval_secs":59})),
+        ("rdrive_checkpoint_config", json!({"interval_secs":31536001})),
+        ("rdrive_checkpoint_config", json!({"max_records":0})),
+        ("rdrive_checkpoint_config", json!({"max_records":4097})),
+        ("rdrive_checkpoint_config", json!({"max_bytes":268435455})),
+        ("rdrive_checkpoint_config", json!({"max_bytes":268435457})),
         ("rdrive_cache_config", json!({})),
         ("rdrive_cache_config", json!({"unlimited":false})),
         (

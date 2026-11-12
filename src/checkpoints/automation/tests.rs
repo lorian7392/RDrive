@@ -572,3 +572,13 @@ fn malformed_shared_configuration_or_scheduler_state_is_reported_without_repairi
     );
     assert!(!f.home.join("checkpoints/vault").exists());
 }
+#[test]
+fn inherited_host_lock_defers_only_real_would_block_errors() {
+    let held=anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        .context("another APFS vault host operation is still active");
+    assert!(busy(&held));
+    let disk_fault=anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::Other))
+        .context("another APFS vault host operation is still active");
+    assert!(!busy(&disk_fault));
+    assert!(!busy(&anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock)).context("unrelated read failed")));
+}

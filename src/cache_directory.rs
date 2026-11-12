@@ -414,7 +414,7 @@ fn verify_copy(path: &Path, object: &Object) -> Result<File> {
     }
     Ok(file)
 }
-fn install(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn install(source: &Path, destination: &Path) -> Result<()> {
     let source = CString::new(source.as_os_str().as_bytes())?;
     let destination = CString::new(destination.as_os_str().as_bytes())?;
     #[cfg(target_os = "macos")]

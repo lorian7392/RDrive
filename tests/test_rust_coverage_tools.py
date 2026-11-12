@@ -52,18 +52,19 @@ class RustCoverageToolsTests(unittest.TestCase):
 
     def test_workflow_inventory_includes_fault_and_all_smb_modes(self):
         jobs = runner.workflows("python", Path("/binary"), "all", self.root, Path("/lib-tests"))
-        self.assertEqual(len(jobs), 20)
+        self.assertEqual(len(jobs), 21)
         by_name = {name: (command, extra) for name, command, extra in jobs}
         self.assertIn("coverage_cli", by_name)
         self.assertEqual(by_name["mcp_startup"][0][-2:], ["--report", str(self.root / "mcp_startup.json")])
         self.assertEqual(by_name["profile_admin"][0][-2:], ["--report", str(self.root / "profile_admin.json")])
         self.assertEqual(by_name["state_directory"][0][-2:], ["--report", str(self.root / "state_directory.json")])
+        self.assertEqual(by_name["checkpoint"][0][-2:], ["--report", str(self.root / "checkpoint.json")])
         self.assertEqual(by_name["smb"][1]["RDRIVE_SMB_TEST_RUNNER"], "/lib-tests")
         self.assertNotIn("RDRIVE_SMB_PROVIDER_ONLY", by_name["smb"][1])
         self.assertEqual(by_name["smb-lifecycle"][1]["RDRIVE_SMB_PROOF_ONLY"], "1")
         self.assertEqual(by_name["smb-smart"][1]["RDRIVE_SMB_SMART"], "1")
         self.assertEqual(runner.workflows("python", Path("/binary"), "none", self.root, Path("/lib-tests")), [])
-        self.assertEqual(len(runner.workflows("python", Path("/binary"), "dav", self.root, Path("/lib-tests"))), 16)
+        self.assertEqual(len(runner.workflows("python", Path("/binary"), "dav", self.root, Path("/lib-tests"))), 17)
 
     def test_library_fixtures_are_isolated_without_filtering_the_full_suite(self):
         library = Path("/current/lib-tests")

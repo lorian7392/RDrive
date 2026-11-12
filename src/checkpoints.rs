@@ -1,5 +1,6 @@
 //! Optional, OS-backed APFS recovery checkpoints. A checkpoint never replays
-//! an old state database and never deletes a system-managed snapshot.
+//! an old state database. Managed file checkpoints have a separate capacity
+//! boundary; native system snapshots remain outside automatic cleanup.
 use crate::state::{self, Store};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -26,18 +27,47 @@ use std::{
 
 const RECORD_VERSION: u32 = 1;
 
+mod automation;
+pub(crate) mod vault;
+pub(crate) use automation::scheduled;
+pub(crate) use automation::due as scheduled_due;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Storage {
+    #[default]
+    SystemSnapshot,
+    ApfsVault,
+}
+fn is_system_snapshot(storage: &Storage) -> bool { *storage == Storage::SystemSnapshot }
+fn disabled(value: &bool) -> bool { !*value }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub enabled: bool,
     /// Local record limit, not a request to purge Time Machine snapshots.
     pub max_records: usize,
+    #[serde(skip_serializing_if="is_system_snapshot")]
+    pub storage: Storage,
+    /// None keeps existing configurations in manual-only mode.
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// Fixed APFS file-vault capacity; unavailable for a shared system volume.
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if="disabled")]
+    pub auto_prune: bool,
 }
 impl Default for Policy {
     fn default() -> Self {
         Self {
             enabled: false,
             max_records: 64,
+            storage: Storage::SystemSnapshot,
+            interval_secs: None,
+            max_bytes: None,
+            auto_prune: false,
         }
     }
 }
@@ -45,6 +75,22 @@ impl Policy {
     pub fn validate(&self) -> Result<()> {
         if self.max_records == 0 || self.max_records > 4096 {
             bail!("checkpoint record limit must be between 1 and 4096");
+        }
+        match self.storage {
+            Storage::SystemSnapshot => {
+                if self.interval_secs.is_some() || self.max_bytes.is_some() || self.auto_prune {
+                    bail!("scheduled creation, byte capacity and automatic cleanup require apfs_vault storage");
+                }
+            }
+            Storage::ApfsVault => {
+                let bytes = self.max_bytes.context("an APFS file vault requires a finite max_bytes capacity")?;
+                if bytes < 256 * 1024 * 1024 || bytes > i64::MAX as u64 || bytes % 512 != 0 {
+                    bail!("checkpoint vault capacity must be at least 256 MiB, fit signed 64 bits, and be a multiple of 512 bytes");
+                }
+            }
+        }
+        if self.interval_secs.is_some_and(|value| !(60..=31_536_000).contains(&value)) {
+            bail!("checkpoint interval must be between 60 and 31536000 seconds");
         }
         Ok(())
     }
@@ -252,7 +298,7 @@ fn records(home: &Path) -> Result<Vec<Record>> {
         let name = name
             .to_str()
             .context("invalid checkpoint record filename")?;
-        if name == "mounts" {
+        if name == "mounts" || name == "vault" {
             private(&entry.path(), true)?;
             continue;
         }
@@ -269,7 +315,22 @@ fn records(home: &Path) -> Result<Vec<Record>> {
 
 /// Capability information never creates a checkpoint or changes Time Machine.
 pub fn status(home: &Path, policy: &Policy) -> Result<Value> {
-    status_with(home, policy, &mut System::default())
+    policy.validate()?;
+    let mut value = if policy.storage == Storage::ApfsVault {
+        let mut value = match vault::status(home, &automation::limits(policy)?) {
+            Ok(value) => value,
+            Err(error) if automation::busy(&error) => json!({"kind":"apfs_file_vault","busy":true,"configured_capacity_bytes":policy.max_bytes,"max_records":policy.max_records,"records":null}),
+            Err(error) => return Err(error),
+        };
+        value["enabled"] = json!(policy.enabled);
+        value["available"] = json!(cfg!(target_os = "macos"));
+        value
+    } else {
+        status_with(home, policy, &mut System::default())?
+    };
+    value["storage"] = json!(policy.storage);
+    value["schedule"] = automation::schedule_status(home, policy)?;
+    Ok(value)
 }
 fn status_with(home: &Path, policy: &Policy, host: &mut dyn Host) -> Result<Value> {
     policy.validate()?;
@@ -287,7 +348,21 @@ fn status_with(home: &Path, policy: &Policy, host: &mut dyn Host) -> Result<Valu
     )
 }
 pub fn list(home: &Path) -> Result<Value> {
-    list_with(home, &mut System::default())
+    let mut value = list_with(home, &mut System::default())?;
+    if let Some(capacity) = vault::existing_capacity(home)? {
+        let managed = vault::list(home, &vault::Limits { max_bytes:capacity, max_records:4096, auto_prune:false })?;
+        merge_rows(&mut value, &managed)?;
+        value["system_managed"] = json!(false);
+    }
+    Ok(value)
+}
+fn merge_rows(value: &mut Value, managed: &Value) -> Result<()> {
+    let rows = value["checkpoints"].as_array_mut().context("checkpoint list missing")?;
+    for row in managed["checkpoints"].as_array().context("vault checkpoint list missing")? {
+        if rows.iter().any(|old| old["id"] == row["id"]) { bail!("ambiguous checkpoint identity across storage backends"); }
+        rows.push(row.clone());
+    }
+    Ok(())
 }
 fn list_with(home: &Path, host: &mut dyn Host) -> Result<Value> {
     let rows = records(home)?;
@@ -331,6 +406,7 @@ fn kind(path: &Path) -> String {
 fn skipped(path: &Path) -> bool {
     let text = path.to_string_lossy();
     text == "checkpoints"
+        || text == "checkpoint-scheduler"
         || text == "service"
         || text == "tmp"
         || text.starts_with("provider/demands-")
@@ -449,6 +525,9 @@ fn home_relative(home: &Path, volume: &Volume) -> Result<PathBuf> {
 /// Caller holds Store and its mutation coordinator until this function returns.
 /// This method also leases retained queues and checkpoints SQLite WALs.
 pub fn create(store: &Store, policy: &Policy, authorize: bool) -> Result<Value> {
+    if policy.storage == Storage::ApfsVault {
+        return automation::manual(store, policy);
+    }
     create_with(store, policy, authorize, &mut System::default())
 }
 fn create_with(
@@ -531,10 +610,30 @@ fn create_with(
 }
 
 pub fn inspect(home: &Path, checkpoint: &str) -> Result<Value> {
+    if managed_id(home, checkpoint)? { return vault::inspect(home, checkpoint, &recovery_limits(home)?) }
     let record = load(home, checkpoint)?;
     Ok(
         json!({"id":record.manifest.id,"created":record.manifest.created,"snapshot":record.snapshot,"state":if record.confirmed{"confirmed"}else{"unconfirmed"},"files":record.manifest.files,"restores_state_database":false}),
     )
+}
+
+fn managed_id(home: &Path, checkpoint: &str) -> Result<bool> {
+    id(checkpoint)?;
+    if record_path(home, checkpoint)?.try_exists()? { return Ok(false); }
+    Ok(automation::pending(home, checkpoint)? || vault::contains(home, checkpoint)?)
+}
+fn recovery_limits(home: &Path) -> Result<vault::Limits> {
+    Ok(vault::Limits {
+        max_bytes:vault::existing_capacity(home)?.unwrap_or(20*1024*1024*1024),
+        max_records:4096,
+        auto_prune:false,
+    })
+}
+pub fn prune(store: &Store, apply: bool) -> Result<Value> {
+    let policy = &store.config.checkpoints;
+    let mut limits = recovery_limits(&store.home)?;
+    limits.max_records = policy.max_records;
+    vault::prune(&store.home, &limits, apply)
 }
 
 fn open_relative(root: &Path, path: &Path) -> Result<File> {
@@ -663,6 +762,7 @@ fn mounted<T>(
 /// Reconcile an uncertain OS command only by verifying the embedded manifest
 /// and every recorded payload in an actual read-only snapshot.
 pub fn reconcile(store: &Store, checkpoint: &str, authorize: bool) -> Result<Value> {
+    if managed_id(&store.home, checkpoint)? { return vault::reconcile(&store.home, checkpoint, &recovery_limits(&store.home)?) }
     reconcile_with(store, checkpoint, authorize, &mut System::default())
 }
 fn reconcile_with(
@@ -705,6 +805,7 @@ fn reconcile_with(
 }
 /// Forget only an owned local record. System-managed snapshots are untouched.
 pub fn forget(store: &Store, checkpoint: &str) -> Result<Value> {
+    if managed_id(&store.home, checkpoint)? { return vault::forget(&store.home, checkpoint, &recovery_limits(&store.home)?) }
     let _lease = lease(&store.home)?;
     id(checkpoint)?;
     let path = root(&store.home).join(checkpoint);
@@ -752,6 +853,7 @@ pub fn export_file(
     destination: &Path,
     authorize: bool,
 ) -> Result<Value> {
+    if managed_id(home, checkpoint)? { return vault::export_file(home, checkpoint, payload, destination, &recovery_limits(home)?) }
     export_with(
         home,
         checkpoint,

@@ -77,6 +77,7 @@ pub enum Command {
         id: String,
         apply: bool,
     },
+    CheckpointPrune { apply: bool },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -410,6 +411,7 @@ pub async fn execute(home: &Path, command: &Command) -> Result<Value> {
                 )
             }
         }
+        Command::CheckpointPrune { apply } => crate::checkpoints::prune(&open()?, *apply),
     }
 }
 

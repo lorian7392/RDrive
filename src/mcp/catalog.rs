@@ -10,6 +10,7 @@ pub enum Kind {
     Local,
     Remote,
     Direction,
+    CheckpointStorage,
     Patterns,
 }
 #[derive(Clone, Copy)]
@@ -64,6 +65,7 @@ impl Tool {
                 }
                 Kind::Patterns => json!({"type":"array","maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}}),
                 Kind::Direction => json!({"type":"string","enum":["push","pull","both"]}),
+                Kind::CheckpointStorage => json!({"type":"string","enum":["system-snapshot","apfs-vault"]}),
                 Kind::Local => {
                     json!({"type":"string","minLength":1,"description":"Absolute local path within a server --local-root. Symlinks and the RDrive state directory are excluded."})
                 }
@@ -138,6 +140,11 @@ impl Tool {
                     {
                         bail!("direction must be push, pull, or both");
                     }
+                    if matches!(field.kind, Kind::CheckpointStorage)
+                        && !["system-snapshot", "apfs-vault"].contains(&text)
+                    {
+                        bail!("checkpoint storage must be system-snapshot or apfs-vault");
+                    }
                     if matches!(field.kind, Kind::Remote) || field.name=="payload" {
                         crate::backend::normalize(text)?;
                     }
@@ -173,6 +180,20 @@ impl Tool {
             if args.get("depth").and_then(Value::as_u64).is_some_and(|n|n>u32::MAX as u64) {bail!("depth exceeds u32 range");}
             for name in ["refresh_seconds","active_refresh_seconds"] {
                 if args.get(name).and_then(Value::as_u64).is_some_and(|n|n==0||n>31_536_000) {bail!("index intervals must be between one second and one year");}
+            }
+        }
+        if self.name == "rdrive_checkpoint_config" {
+            if args.get("manual").and_then(Value::as_bool)==Some(true) && args.contains_key("interval_secs") {
+                bail!("manual and interval_secs are mutually exclusive");
+            }
+            if args.get("interval_secs").and_then(Value::as_u64).is_some_and(|v| !(60..=31_536_000).contains(&v)) {
+                bail!("checkpoint interval must be between 60 and 31536000 seconds");
+            }
+            if args.get("max_records").and_then(Value::as_u64).is_some_and(|v| !(1..=4096).contains(&v)) {
+                bail!("checkpoint record limit must be between 1 and 4096");
+            }
+            if args.get("max_bytes").and_then(Value::as_u64).is_some_and(|v| v < 256*1024*1024 || v%512!=0) {
+                bail!("checkpoint capacity must be at least 256 MiB and a multiple of 512 bytes");
             }
         }
         let yes=|name|args.get(name).and_then(Value::as_bool)==Some(true);
@@ -448,13 +469,19 @@ pub fn catalog() -> Vec<Tool> {
     tool!("history_restore_apply","Apply an explicitly reviewed saved plan. Current replacement contents are preserved first; stale revisions stop.",&["history","restore"],vec![p(),Field::positional("version",String,true),Field{required:true,..Field::option("plan",String,"--plan")},b("apply","--apply")],true);
     tool!("history_prune","Preview retention cleanup by default. Apply preserves prepared/inflight recovery content.",&["history","prune"],vec![p(),b("apply","--apply")],true);
     tool!("history_clear","Preview clearing confirmed unprotected history. Does not clear Smart pending edits or checkpoints.",&["history","clear"],vec![p(),b("apply","--apply")],true);
-    tool!("checkpoint_status","Read optional APFS checkpoint capabilities without creating or mounting a snapshot.",&["checkpoint","status"],vec![],false);
-    tool!("checkpoint_list","List owned local checkpoint records and current OS snapshot availability.",&["checkpoint","list"],vec![],false);
+    tool!("checkpoint_status","Inspect checkpoint policy, schedule and verified vault capacity without creating a checkpoint.",&["checkpoint","status"],vec![],false);
+    tool!("checkpoint_list","List owned file checkpoints and retained native system-snapshot records.",&["checkpoint","list"],vec![],false);
+    tool!("checkpoint_config","Configure checkpoint storage, fixed vault capacity, interval and record limit. Existing native snapshots remain separate.",&["checkpoint","config"],vec![Field::option("storage",CheckpointStorage,"--storage"),n("max_bytes","--max-bytes"),n("max_records","--max-records"),n("interval_secs","--interval-secs"),b("manual","--manual")],true);
+    tool!("checkpoint_enable","Enable the configured checkpoint backend.",&["checkpoint","config","--enabled","true"],vec![],true);
+    tool!("checkpoint_disable","Disable future checkpoint creation while retaining recovery content.",&["checkpoint","config","--enabled","false"],vec![],true);
+    tool!("checkpoint_auto_prune_enable","Allow retention cleanup of this vault's own old file checkpoints; system snapshots remain untouched.",&["checkpoint","config","--auto-prune","true"],vec![],true);
+    tool!("checkpoint_auto_prune_disable","Keep existing vault checkpoints when capacity or record limits block new creation.",&["checkpoint","config","--auto-prune","false"],vec![],true);
+    tool!("checkpoint_prune","Preview or apply retention cleanup inside the owned APFS file vault, preserving the newest confirmed checkpoint.",&["checkpoint","prune"],vec![b("apply","--apply")],true);
     tool!("checkpoint_inspect","Inspect a checkpoint manifest and payload export eligibility. State databases cannot be restored.",&["checkpoint","inspect"],vec![id()],false);
-    tool!("checkpoint_create","Create and verify an enabled local OS checkpoint; authorization and platform failures are explicit.",&["checkpoint","create"],vec![],true);
+    tool!("checkpoint_create","Create and verify a checkpoint with the configured backend; native authorization and platform failures are explicit.",&["checkpoint","create"],vec![],true);
     tool!("checkpoint_export","Export one verified checkpoint payload to a new local path; never restores the state database.",&["checkpoint","export"],vec![id(),Field::positional("payload",String,true),l()],true);
     tool!("checkpoint_reconcile","Verify an actual read-only snapshot after an interrupted creation command.",&["checkpoint","reconcile"],vec![id()],true);
-    tool!("checkpoint_forget","Preview forgetting only an owned local record; macOS snapshots are never deleted.",&["checkpoint","forget"],vec![id(),b("apply","--apply")],true);
+    tool!("checkpoint_forget","Preview removing an owned checkpoint record and unreferenced file-vault content; native macOS snapshots remain untouched.",&["checkpoint","forget"],vec![id(),b("apply","--apply")],true);
     tool!(
         "smart_status",
         "Inspect Smart domains, durable edits and shared cache accounting.",

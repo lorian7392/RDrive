@@ -223,7 +223,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.3`: **137 command entries** (including groups, excluding the root and automatic `help`), **119 executable leaf commands**, and **969 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.3`: **138 command entries** (including groups, excluding the root and automatic `help`), **120 executable leaf commands**, and **981 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -2871,6 +2871,7 @@ Commands:
   export     Export one recorded local payload to a new absolute path
   reconcile  Verify a matching snapshot after an interrupted creation command
   forget     Preview forgetting an owned local record; OS snapshots remain managed by macOS
+  prune      Preview or apply retention cleanup inside the owned file checkpoint vault
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2922,14 +2923,19 @@ Configure optional checkpoints; no snapshot is created by configuration
 Usage: rdrive checkpoint config [OPTIONS]
 
 Options:
-      --enabled <ENABLED>          [possible values: true, false]
-      --home <HOME>                State/config directory (also RDRIVE_HOME)
-      --json                       Compact machine-readable JSON. Errors are JSON on stderr
+      --enabled <ENABLED>              [possible values: true, false]
+      --home <HOME>                    State/config directory (also RDRIVE_HOME)
+      --json                           Compact machine-readable JSON. Errors are JSON on stderr
       --max-records <MAX_RECORDS>
-      --limit <LIMIT>              Aggregate payload bytes/second across all jobs (headers excluded)
-      --progress <PROGRESS>        Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
-      --jobs <JOBS>                Concurrent queue targets. Jobs for the same target retain order [default: 4]
-  -h, --help                       Print help
+      --limit <LIMIT>                  Aggregate payload bytes/second across all jobs (headers excluded)
+      --storage <STORAGE>              [possible values: system-snapshot, apfs-vault]
+      --interval-secs <INTERVAL_SECS>
+      --progress <PROGRESS>            Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>                    Concurrent queue targets. Jobs for the same target retain order [default: 4]
+      --manual
+      --max-bytes <MAX_BYTES>
+      --auto-prune <AUTO_PRUNE>        [possible values: true, false]
+  -h, --help                           Print help
 ```
 
 ### `rdrive checkpoint create`
@@ -3019,6 +3025,23 @@ Usage: rdrive checkpoint forget [OPTIONS] <ID>
 
 Arguments:
   <ID>
+
+Options:
+      --apply
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint prune`
+
+```text
+Preview or apply retention cleanup inside the owned file checkpoint vault
+
+Usage: rdrive checkpoint prune [OPTIONS]
 
 Options:
       --apply

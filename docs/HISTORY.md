@@ -110,36 +110,63 @@ Do not remove history blobs, manifests, SQLite files, or retained Smart snapshot
 
 ## Optional APFS checkpoints
 
-APFS checkpoints capture local RDrive state on a compatible macOS volume. They are optional and disabled by default. They supplement per-file history by retaining local payloads such as offline edits that have not reached the server.
+RDrive supports two checkpoint storage modes. **`apfs-vault`** is a dedicated, fixed-capacity APFS file checkpoint store with unattended scheduling and cleanup. **`system-snapshot`** keeps the earlier, explicitly requested Time Machine volume-snapshot workflow. Automatic vault cleanup never deletes Time Machine snapshots or other applications' data.
 
-RDrive reports whether the state directory is on a supported APFS volume and records the exact volume and snapshot identities. Snapshot creation and read-only recovery may require macOS authorization. A prepared local checkpoint is confirmed only after RDrive observes the new system snapshot and verifies its recorded content.
+### Set up a bounded file checkpoint vault
+
+Configure the shared program settings, create the first checkpoint, then turn on the interval:
 
 ```sh
+rdrive checkpoint config --storage apfs-vault --enabled true --manual \
+  --max-bytes 21474836480 --max-records 48 --auto-prune true
+rdrive checkpoint create
+rdrive checkpoint config --interval-secs 3600
 rdrive checkpoint status
 rdrive checkpoint list
-rdrive checkpoint config --enabled true --max-records 64
-# Authorized OS operations run in your terminal, with the resident service stopped.
-rdrive service stop
-rdrive checkpoint create --authorize
-rdrive service start
-rdrive checkpoint inspect CHECKPOINT_ID
 ```
 
-`--authorize` permits a terminal authorization prompt for the fixed snapshot or read-only mount command. The background service cannot receive a terminal password. Stop the service through `rdrive service stop` before an authorized operation, and start it again with `rdrive service start` afterward, including after a failed operation. Neither command deletes retained edits. An unavailable or unauthorized snapshot is reported explicitly.
+This example reserves **20 GiB** for the vault image and requests a checkpoint every hour, with a retention target of 48 confirmed file checkpoints. Interrupted cleanup can temporarily exceed the record count while staying within the fixed byte capacity. The program creates and mounts its own private APFS image as the current user; the vault does not require a background administrator password. The resident RDrive service must be running for scheduled creation. `--manual` disables periodic creation while retaining the vault and its contents; `--enabled false` disables future creation.
 
-`--max-records` limits local checkpoint records; it does not delete Time Machine snapshots. Inspect a record to identify the exact retained payload before exporting. Checkpoint export requires a new absolute destination:
+The image has a fixed filesystem capacity, including its internal checkpoint data, manifests and filesystem overhead. It cannot grow beyond its configured image size. Small ownership and scheduling records outside the image, ordinary history, caches and live pending edits use additional space. macOS or independent backups may separately retain earlier blocks of the image; the vault limit does not cap an entire physical disk or another backup system. An initialized image's capacity cannot be silently changed by editing a policy: incompatible capacity changes are rejected to preserve the existing store.
+
+These are **APFS file checkpoints**, with verified immutable contents and deduplication, rather than native snapshots of the Mac's entire Data volume. They retain supported local RDrive payloads such as queued uploads, retained Smart edits, cached objects and history blobs. Online-only remote files and materialized CloudStorage files outside the selected payload store are not copied. A checkpoint never rolls back the live synchronization databases or replays old queues.
+
+### Scheduling and automatic cleanup
+
+The next interval starts after a checkpoint completes. Sleep, restarts and missed intervals do not produce a burst of catch-up checkpoints. RDrive persists the planned checkpoint identity before capture and reconciles that identity after interruption, so an uncertain outcome does not authorize a second publication. Active work, unavailable storage and insufficient capacity are reported in status, with bounded retry delays.
+
+With `--auto-prune true`, RDrive reclaims its own oldest eligible file checkpoints when space or record limits require it. The latest verified recovery point remains protected while its replacement is being prepared. A failed new capture must not erase the only verified recovery point. Corrupt, foreign or uncertain records stop cleanup instead of authorizing broader deletion. If the protected checkpoint and the new content cannot fit together, creation stops and retains the existing recovery point and live edits.
+
+Inspect the current usage, schedule and any retained error through `checkpoint status`. Preview or apply ordinary retention cleanup through the program:
 
 ```sh
+rdrive checkpoint prune
+rdrive checkpoint prune --apply
+```
+
+### Inspect and recover a payload
+
+```sh
+rdrive checkpoint inspect CHECKPOINT_ID
 rdrive checkpoint export CHECKPOINT_ID smart/DOMAIN/dirty/PAYLOAD.data \
-  "$HOME/Desktop/recovered-edit.data" --authorize
+  "$HOME/Desktop/recovered-edit.data"
 rdrive history import nas Documents/recovered-edit.txt "$HOME/Desktop/recovered-edit.data"
 ```
 
-Use the imported history entry with the normal restore preview/apply flow. `checkpoint reconcile CHECKPOINT_ID --authorize` can verify a prepared record after an uncertain system command. `checkpoint forget CHECKPOINT_ID` previews local metadata cleanup; add `--apply` to forget that record.
+Export requires a new absolute destination and verifies the recorded size and SHA-256. Use the imported history entry with the normal restore preview/apply flow to submit a new operation against the current remote revision. Checkpoint recovery does not overwrite the state directory. `checkpoint reconcile CHECKPOINT_ID` verifies an interrupted checkpoint. `checkpoint forget CHECKPOINT_ID` previews removal of a selected owned record; add `--apply` to remove it and any unreferenced vault content. Native OS snapshots remain untouched by forgetting a record.
 
-Recovery exports a recorded local payload to a new location and verifies its size and SHA-256. It does **not** replace the live state directory or replay old queues. A recovered file can subsequently be restored through a new guarded operation after reviewing the current remote version.
+### Manual native system snapshots
 
-macOS manages snapshot storage and may remove snapshots. A local record alone does not prove that its snapshot remains available. RDrive reports an unavailable or unconfirmed checkpoint instead of assuming recovery is possible. Forgetting a local record does not delete a system snapshot. There is no whole-volume rollback command or automatic Time Machine snapshot pruning.
+The legacy backend is available through an explicit storage selection. Selecting it resets the vault-only interval, capacity and automatic-cleanup policy; existing vault contents remain available for recovery by checkpoint ID.
+
+```sh
+rdrive checkpoint config --storage system-snapshot --enabled true
+rdrive service stop
+rdrive checkpoint create --authorize
+rdrive service start
+```
+
+`--authorize` permits a terminal authorization prompt for the fixed OS snapshot or read-only mount command. Restart the resident service after the operation, including after a failed command. Native snapshots capture the APFS volume and remain subject to macOS storage management. They do not have the dedicated vault's independent byte limit or unattended cleanup. A local record alone does not prove that its system snapshot still exists; recovery verifies the exact recorded volume, snapshot and embedded manifest before exporting a payload.
 
 ## Existing version and conflict tools
 

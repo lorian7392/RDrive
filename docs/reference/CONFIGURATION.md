@@ -391,19 +391,16 @@ publication must still meet their normal revision conditions. See
 
 ## checkpoints: optional APFS Policy
 
-- `enabled`: a boolean, defaulting to `false`. Enables explicit checkpoint
-  creation on a compatible macOS APFS volume. Changing this setting does not
-  create or mount a snapshot.
-- `max_records`: integer local records, defaulting to `64`, within `1..=4096`.
-  This limit does not request deletion of Time Machine or other system snapshots.
+- `enabled`: boolean, default `false`. Enables creation with the selected backend.
+- `max_records`: integer within `1..=4096`, default `64`. Limits owned checkpoint records. Managed automatic cleanup can remove eligible old file checkpoints; it never deletes native system snapshots.
+- `storage`: `system_snapshot` (default) or `apfs_vault`. The CLI uses `system-snapshot` and `apfs-vault`.
+- `interval_secs`: `null` (manual only, the default), or `60..=31536000` seconds between completed scheduled vault checkpoints. The resident service performs scheduling.
+- `max_bytes`: `null` for legacy system snapshots. The APFS vault requires a fixed finite capacity of at least 256 MiB, fitting a signed 64-bit integer and divisible by 512. The image reserves this capacity, including its internal filesystem overhead. An initialized image rejects incompatible capacity changes. State relocation currently refuses retained vault data because the image and its manifests are bound to their original private state location; the original data remains untouched.
+- `auto_prune`: boolean, default `false`. Enables reclamation of the vault's own eligible old file checkpoints while protecting the latest verified recovery point during replacement.
 
-Use `checkpoint config --enabled true|false --max-records N`. Creation and
-read-only payload recovery may require explicit `--authorize`. Status and list
-operations do not create snapshots. macOS may reclaim a recorded snapshot;
-availability is checked rather than assumed. Recovery exports verified payloads
-to new paths and never restores old queue/database state over the live state.
-Forgetting a local checkpoint record leaves the OS snapshot untouched. See
-[optional APFS checkpoints](../HISTORY.md#optional-apfs-checkpoints).
+Scheduling, byte capacity and automatic cleanup require `storage: apfs_vault`. Old configurations keep their existing manual system-snapshot behavior until explicitly changed through the program. Use `checkpoint config` to select storage and limits, `--manual` to clear the interval, and `checkpoint status` to inspect the actual store and schedule. Small external scheduler/ownership records, ordinary cache/history and independent macOS snapshots are outside the fixed image's capacity.
+
+Recovery exports verified payloads to new paths and never restores old queue/database state over the live state. Legacy system-snapshot creation and export may require `--authorize` in a terminal. See [APFS checkpoints](../HISTORY.md#optional-apfs-checkpoints).
 
 ## Complete credential-free JSON example
 
@@ -495,7 +492,11 @@ manual migration.
   },
   "checkpoints": {
     "enabled": false,
-    "max_records": 64
+    "max_records": 64,
+    "storage": "system_snapshot",
+    "interval_secs": null,
+    "max_bytes": null,
+    "auto_prune": false
   }
 }
 ```

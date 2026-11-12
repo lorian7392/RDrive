@@ -299,12 +299,20 @@ enum HistoryCommand {
 }
 #[derive(Subcommand)]
 enum CheckpointCommand {
-    /// Read local APFS/Time Machine capability and policy without changing snapshots.
+    /// Inspect checkpoint capacity, schedule, recovery status and platform support.
     Status,
     /// List owned checkpoint records and current OS snapshot availability.
     List,
     /// Configure optional checkpoints; no snapshot is created by configuration.
-    Config {#[arg(long)]enabled:Option<bool>,#[arg(long)]max_records:Option<usize>},
+    Config {
+        #[arg(long,help="Enable future creation or disable it while retaining checkpoints")]enabled:Option<bool>,
+        #[arg(long,help="Maximum owned records (1..4096); native OS snapshots are not automatically deleted")]max_records:Option<usize>,
+        #[arg(long,value_enum,help="Dedicated bounded file vault or manual native system snapshots")]storage:Option<CheckpointStorage>,
+        #[arg(long,conflicts_with="manual",help="Seconds after completion until the next vault checkpoint (60..31536000); requires the resident service")]interval_secs:Option<u64>,
+        #[arg(long,help="Disable periodic creation while retaining the store and its history")]manual:bool,
+        #[arg(long,help="Fixed vault image capacity in bytes, reserved at initialization; at least 256 MiB and divisible by 512")]max_bytes:Option<u64>,
+        #[arg(long,help="Permit cleanup of eligible old vault checkpoints, preserving the newest verified recovery point during replacement")]auto_prune:Option<bool>,
+    },
     /// Create and verify a local checkpoint; --authorize may prompt in a terminal.
     Create {#[arg(long)]authorize:bool},
     /// Inspect the recorded file manifest, including payload export eligibility.
@@ -315,7 +323,11 @@ enum CheckpointCommand {
     Reconcile {id:String,#[arg(long)]authorize:bool},
     /// Preview forgetting an owned local record; OS snapshots remain managed by macOS.
     Forget {id:String,#[arg(long)]apply:bool},
+    /// Preview or apply retention cleanup inside the owned file checkpoint vault.
+    Prune {#[arg(long)]apply:bool},
 }
+#[derive(Clone,Copy,ValueEnum)]
+enum CheckpointStorage { SystemSnapshot, ApfsVault }
 #[derive(Subcommand)]
 enum McpCommand {
     /// Print the MCP tool catalog as JSON without starting a server.
@@ -1466,10 +1478,17 @@ async fn history_command(cli:&Cli,home:&Path)->Result<Option<serde_json::Value>>
         Command::Checkpoint{command}=>match command {
             CheckpointCommand::Status=>Action::CheckpointStatus,
             CheckpointCommand::List=>Action::CheckpointList,
-            CheckpointCommand::Config{enabled,max_records}=>{
+            CheckpointCommand::Config{enabled,max_records,storage,interval_secs,manual,max_bytes,auto_prune}=>{
                 let mut policy=rdrive::client_read::config(home)?.checkpoints;
+                let expected=Some(state::key(&serde_json::to_string(&policy)?));
                 if let Some(value)=enabled{policy.enabled=*value;}if let Some(value)=max_records{policy.max_records=*value;}
-                let command=rdrive::profile_admin::Command::new(rdrive::profile_admin::Change::CheckpointPolicy{policy},None)?;
+                if let Some(value)=storage{policy.storage=match value {
+                    CheckpointStorage::SystemSnapshot=>{policy.interval_secs=None;policy.max_bytes=None;policy.auto_prune=false;rdrive::checkpoints::Storage::SystemSnapshot},
+                    CheckpointStorage::ApfsVault=>rdrive::checkpoints::Storage::ApfsVault,
+                };}
+                if let Some(value)=interval_secs{policy.interval_secs=Some(*value);}if *manual{policy.interval_secs=None;}
+                if let Some(value)=max_bytes{policy.max_bytes=Some(*value);}if let Some(value)=auto_prune{policy.auto_prune=*value;}
+                let command=rdrive::profile_admin::Command::new(rdrive::profile_admin::Change::CheckpointPolicy{policy,expected},None)?;
                 return Ok(Some(rdrive::profile_admin::dispatch(home,&command,Duration::from_secs(300)).await?));
             },
             CheckpointCommand::Create{authorize}=>Action::CheckpointCreate{authorize:*authorize},
@@ -1477,6 +1496,7 @@ async fn history_command(cli:&Cli,home:&Path)->Result<Option<serde_json::Value>>
             CheckpointCommand::Export{id,payload,local,authorize}=>Action::CheckpointExport{id:id.clone(),payload:payload.clone(),local:local.clone(),authorize:*authorize},
             CheckpointCommand::Reconcile{id,authorize}=>Action::CheckpointReconcile{id:id.clone(),authorize:*authorize},
             CheckpointCommand::Forget{id,apply}=>Action::CheckpointForget{id:id.clone(),apply:*apply},
+            CheckpointCommand::Prune{apply}=>Action::CheckpointPrune{apply:*apply},
         },
         _=>return Ok(None),
     };
@@ -1968,7 +1988,7 @@ mod cli_contract {
     fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
         let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
         let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(leaves.len(),119,"update the public interface inventory when adding a command");
+        assert_eq!(leaves.len(),120,"update the public interface inventory when adding a command");
         assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
         let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();

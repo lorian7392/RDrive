@@ -181,7 +181,7 @@ fn retained_limits(policy: &Policy, attempt: &schedule::Attempt) -> Result<vault
     previous.auto_prune = false;
     limits(&previous)
 }
-fn busy(error: &anyhow::Error) -> bool {
+pub(super) fn busy(error: &anyhow::Error) -> bool {
     const MESSAGES: &[&str] = &[
         "another rdrive process is using this state directory",
         "another checkpoint operation is active",
@@ -190,7 +190,9 @@ fn busy(error: &anyhow::Error) -> bool {
         "an upload is running; retry checkpoint after it finishes",
         "checkpoint payload is busy; retry after it finishes",
     ];
-    error
+    let inherited_host_lock = error.chain().any(|cause| cause.to_string()=="another APFS vault host operation is still active")
+        && error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind()==std::io::ErrorKind::WouldBlock));
+    inherited_host_lock || error
         .chain()
         .any(|cause| MESSAGES.contains(&cause.to_string().as_str()))
 }

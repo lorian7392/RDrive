@@ -214,7 +214,7 @@ Supported Smart changes, `put` and queued overwrites, explicit deletion, copy/mo
 
 Finder **View File History…** provides paged entries, read-only preview, verified export to a new destination, restore as a copy, and explicitly confirmed file replacement. Replacement plans bind the selected entry and observed current revision; newer changes stop a stale replacement. Directory recovery creates a copy. Shared history settings are configurable through the program.
 
-Optional macOS APFS checkpoints retain local state payloads on compatible volumes. They verify actual system snapshot identities and export selected verified payloads without replaying old queues or replacing the live database. System-managed snapshots may disappear; forgetting a local record does not remove the snapshot. See [file history and recovery](HISTORY.md) for scope, limits, and recovery procedures.
+Optional APFS file checkpoints retain verified local payloads in a dedicated fixed-capacity image, with durable periodic scheduling and cleanup of owned old recovery points. The newest confirmed checkpoint remains protected while its replacement is prepared. The legacy manual backend verifies native system snapshot identities and remains separate from vault capacity and cleanup. Both modes export selected verified payloads without replaying old queues or replacing the live database. See [file history and recovery](HISTORY.md) for scope, limits, and recovery procedures.
 
 ## Remote recovery markers and versions
 

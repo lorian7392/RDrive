@@ -19,7 +19,11 @@ pub enum Change {
     Add { name: String, profile: Profile },
     Remove { name: String },
     HistoryPolicy { profile: Option<String>, policy: crate::history::HistoryPolicy },
-    CheckpointPolicy { policy: crate::checkpoints::Policy },
+    CheckpointPolicy {
+        policy: crate::checkpoints::Policy,
+        #[serde(default,skip_serializing_if="Option::is_none")]
+        expected: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +73,7 @@ impl Command {
             }
         }
         if let Change::HistoryPolicy { policy, .. } = &self.change { policy.validate()?; }
-        if let Change::CheckpointPolicy { policy } = &self.change { policy.validate()?; }
+        if let Change::CheckpointPolicy { policy, .. } = &self.change { policy.validate()?; }
         if let Change::Add { profile, .. } = &self.change {
             if profile.password_env.as_ref().is_some_and(|name| name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
                 bail!("invalid credential environment variable name");
@@ -122,7 +126,17 @@ fn apply_with_save(store: &mut Store, command: &Command, now: i64, save: impl Fn
             candidate.history.validate()?;
             json!({"saved":true,"profile":profile,"policy":policy,"request_id":command.request_id})
         }
-        Change::CheckpointPolicy { policy } => {
+        Change::CheckpointPolicy { policy, expected } => {
+            if let Some(expected) = expected {
+                if state::key(&serde_json::to_string(&store.config.checkpoints)?) != *expected {
+                    bail!("checkpoint settings changed concurrently; rerun this configuration command against the current settings");
+                }
+            }
+            if policy.storage == crate::checkpoints::Storage::ApfsVault
+                && (candidate.checkpoints.storage != policy.storage || candidate.checkpoints.max_bytes != policy.max_bytes)
+            {
+                crate::checkpoints::vault::validate_capacity(&store.home, policy.max_bytes.context("vault capacity missing")?)?;
+            }
             candidate.checkpoints = policy.clone();
             json!({"saved":true,"policy":policy,"request_id":command.request_id})
         }
@@ -430,6 +444,51 @@ mod tests {
         fs::remove_file(&root).unwrap();
         fs::remove_dir(store.home.join("transactions")).unwrap(); assert!(require_removable(&store, "nas").is_err());
         assert!(store.config.profiles.contains_key("nas"));
+    }
+
+    #[test]
+    fn stale_checkpoint_configuration_cannot_reenable_creation_after_another_client_disables_it() {
+        let (_temp, mut store) = store();
+        let change = |policy, expected| Command {
+            request_id:format!("{NOW}:{}",uuid::Uuid::new_v4()),
+            change:Change::CheckpointPolicy{policy,expected},
+        };
+        let mut enabled=store.config.checkpoints.clone();enabled.enabled=true;
+        apply_at(&mut store,&change(enabled.clone(),None),NOW).unwrap();
+        let observed=state::key(&serde_json::to_string(&store.config.checkpoints).unwrap());
+        let mut disabled=enabled.clone();disabled.enabled=false;
+        let disable=change(disabled,Some(observed.clone()));
+        assert_eq!(apply_at(&mut store,&disable,NOW).unwrap()["saved"],true);
+        let before=fs::read(store.home.join("config.json")).unwrap();
+        let mut stale=enabled;stale.max_records=24;
+        let stale=change(stale,Some(observed));
+        assert!(apply_at(&mut store,&stale,NOW).unwrap_err().to_string().contains("changed concurrently"));
+        assert!(!store.config.checkpoints.enabled);
+        assert_eq!(store.config.checkpoints.max_records,64);
+        assert_eq!(fs::read(store.home.join("config.json")).unwrap(),before);
+        assert!(!store.config.profile_admin_receipts.contains_key(&stale.request_id));
+        assert_eq!(apply_at(&mut store,&disable,NOW).unwrap()["saved"],true);
+        let legacy:Change=serde_json::from_value(json!({"action":"checkpoint_policy","policy":{"enabled":false,"max_records":12}})).unwrap();
+        let command=Command{request_id:format!("{NOW}:{}",uuid::Uuid::new_v4()),change:legacy};
+        apply_at(&mut store,&command,NOW).unwrap();
+        assert!(!store.config.checkpoints.enabled);
+        assert_eq!(store.config.checkpoints.max_records,12);
+    }
+
+    #[test]
+    fn legacy_checkpoint_request_fingerprint_replays_its_existing_receipt() {
+        let (_temp,mut store)=store();
+        let old=json!({"action":"checkpoint_policy","policy":{"enabled":true,"max_records":64}});
+        let command=Command{request_id:format!("{NOW}:{}",uuid::Uuid::new_v4()),change:serde_json::from_value(old.clone()).unwrap()};
+        // Struct serialization preserves the pre-upgrade field order.
+        let old_serialized="{\"action\":\"checkpoint_policy\",\"policy\":{\"enabled\":true,\"max_records\":64}}";
+        assert_eq!(serde_json::to_string(&command.change).unwrap(),old_serialized);
+        let fingerprint=state::key(old_serialized);
+        let result=json!({"saved":true,"request_id":command.request_id,"policy":{"enabled":true,"max_records":64}});
+        store.config.profile_admin_receipts.insert(command.request_id.clone(),Receipt{fingerprint,result:result.clone(),expires_at:NOW+RETENTION_SECONDS});
+        store.save_config().unwrap();let before=fs::read(store.home.join("config.json")).unwrap();
+        assert_eq!(apply_at(&mut store,&command,NOW).unwrap(),result);
+        assert_eq!(fs::read(store.home.join("config.json")).unwrap(),before);
     }
 
     #[test]
