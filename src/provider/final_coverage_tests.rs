@@ -326,7 +326,8 @@ async fn in_memory_connection_dispatches_local_and_valid_nonce_requests() {
             &staging,
             &fd,
             token,
-            Arc::new(tokio::sync::Mutex::new(()))
+            Arc::new(tokio::sync::Mutex::new(())),
+            None
         ),
         exchange
     );

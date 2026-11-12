@@ -51,6 +51,11 @@ enum SyncDirection {
 #[derive(Clone,Copy,ValueEnum)]enum ProgressMode{Auto,Off,Json}
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect or relocate the shared connection and synchronization state.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Check for a stable CLI release on GitHub.
     Update {
         /// Install the newer release over the standalone CLI.
@@ -424,6 +429,23 @@ enum ServiceCommand {
     /// Foreground supervisor used by the LaunchAgent. Stop with Ctrl-C.
     Run,
 }
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show the active state directory and shared locator.
+    Show,
+    /// Preview a verified move of all connection and synchronization state.
+    Migrate {
+        /// New private state directory; it must not already contain data.
+        #[arg(long)]
+        to: PathBuf,
+        /// Stop the owned service, migrate verified state and restart it.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Recover an interrupted state migration using its durable journal.
+    Recover,
+}
 #[derive(Subcommand)]enum MetadataCommand {
     Capture{local:PathBuf},
     Apply{local:PathBuf,record:PathBuf,#[arg(long)]journal:Option<PathBuf>},
@@ -456,10 +478,22 @@ enum ProfileCommand {
         /// Explicit Nextcloud v2 uploads URL, e.g. https://host/remote.php/dav/uploads/user/.
         #[arg(long)]
         nextcloud_upload_url: Option<String>,
+        /// Retry a previously submitted configuration request using the same ID.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Maximum seconds to wait for an ongoing background operation.
+        #[arg(long, default_value_t = 300)]
+        wait_timeout: u64,
     },
     List,
     Remove {
         name: String,
+        /// Retry a previously submitted configuration request using the same ID.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Maximum seconds to wait for an ongoing background operation.
+        #[arg(long, default_value_t = 300)]
+        wait_timeout: u64,
     },
 }
 #[derive(Subcommand)]
@@ -623,6 +657,26 @@ async fn read_command(cli: &Cli, home: &Path) -> Result<Option<serde_json::Value
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+fn profile_command(cli: &Cli) -> Result<Option<(rdrive::profile_admin::Command, std::time::Duration)>> {
+    use rdrive::profile_admin::{Change, Command as AdminCommand};
+    let (change, request_id, seconds) = match &cli.command {
+        Command::Profile { command: ProfileCommand::Add { name, protocol, url, username,
+            password_env, keychain_internet, allow_http, allow_unencrypted_smb, timeout,
+            nextcloud_upload_url, request_id, wait_timeout } } => (
+                Change::Add { name: name.clone(), profile: Profile {
+                    protocol: match protocol { Proto::Webdav => Protocol::Webdav, Proto::Smb => Protocol::Smb },
+                    url: url.clone(), username: username.clone(), password_env: password_env.clone(),
+                    keychain_internet: *keychain_internet, allow_http: *allow_http, timeout_secs: *timeout,
+                    smb_encryption: !*allow_unencrypted_smb, nextcloud_upload_url: nextcloud_upload_url.clone(),
+                } }, request_id, *wait_timeout),
+        Command::Profile { command: ProfileCommand::Remove { name, request_id, wait_timeout } } => (
+            Change::Remove { name: name.clone() }, request_id, *wait_timeout),
+        _ => return Ok(None),
+    };
+    if !(1..=3600).contains(&seconds) { bail!("profile wait-timeout must be between 1 and 3600 seconds"); }
+    Ok(Some((AdminCommand::new(change, request_id.clone())?, std::time::Duration::from_secs(seconds))))
 }
 fn sync_options(direction: SyncDirection, apply: bool, delete: bool) -> sync::SyncOptions {
     sync::SyncOptions {
@@ -876,73 +930,13 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             MetadataCommand::Pull{profile:name,remote,local}=>{let b=connect(store,name).await?;let p=path(remote)?;let e=b.stat(&p).await?.context("remote file missing")?;emit(json,&rdrive::metadata_remote::apply(b.as_ref(),&p,&e,local,&Default::default()).await?)?;},
         },
         Command::Notify{..}=>unreachable!(),
-        Command::Profile { command } => {
-            match command {
-                ProfileCommand::Add {
-                    name,
-                    protocol,
-                    url,
-                    username,
-                    password_env,
-                    keychain_internet,
-                    allow_http,
-                    allow_unencrypted_smb,
-                    timeout,
-                    nextcloud_upload_url,
-                } => {
-                    if name.is_empty()
-                        || name.starts_with('-')
-                        || !name
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    {
-                        bail!("profile name must contain letters, numbers, hyphen or underscore");
-                    }
-                    if store.config.profiles.contains_key(name) {
-                        bail!("profile already exists; remove it before replacing its destination");
-                    }
-                    if password_env.as_ref().is_some_and(|s| {
-                        s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    }) {
-                        bail!("invalid credential environment variable name");
-                    }
-                    let p = Profile {
-                        protocol: match protocol {
-                            Proto::Webdav => Protocol::Webdav,
-                            Proto::Smb => Protocol::Smb,
-                        },
-                        url: url.clone(),
-                        username: username.clone(),
-                        password_env: password_env.clone(),
-                        keychain_internet: *keychain_internet,
-                        allow_http: *allow_http,
-                        timeout_secs: *timeout,
-                        smb_encryption: !*allow_unencrypted_smb,
-                        nextcloud_upload_url: nextcloud_upload_url.clone(),
-                    };
-                    config::validate_profile(&p)?;
-                    store.config.profiles.insert(name.clone(), p);
-                    store.save_config()?;
-                    emit(json, &serde_json::json!({"profile":name,"saved":true}))?;
-                }
-                ProfileCommand::List => emit(json, &store.config.profiles)?,
-                ProfileCommand::Remove { name } => {
-                    if store.db.jobs.iter().any(|j| {
-                        j.profile == *name && j.status != "done" && j.status != "cancelled"
-                    }) {
-                        bail!("profile has unfinished uploads; finish or cancel them first");
-                    }
-                    if store.db.cache.values().any(|c| c.profile == *name) {
-                        bail!("profile has cached files; unpin and prune them first");
-                    }
-                    if store.config.profiles.remove(name).is_none() {
-                        bail!("unknown profile");
-                    }
-                    store.save_config()?;
-                    emit(json, &serde_json::json!({"removed":name}))?;
-                }
+        Command::Profile { command } => match command {
+            ProfileCommand::List => emit(json, &store.config.profiles)?,
+            ProfileCommand::Add { .. } | ProfileCommand::Remove { .. } => {
+                let (request, _) = profile_command(cli)?.context("profile configuration request missing")?;
+                emit(json, &rdrive::profile_admin::apply(store, &request)?)?;
             }
-        }
+        },
         Command::Info { .. } | Command::Ls { .. } | Command::Stat { .. } => {
             emit(json, &read_command(cli, &store.home).await?)?;
         }
@@ -1350,7 +1344,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 &serde_json::json!({"discarded":id,"previous_local_retained":rdrive::resume::discard(store,id)?}),
             )?,
         },
-        Command::Mount { .. } | Command::Mounts | Command::Unmount { .. } => unreachable!(),
+        Command::Config { .. } | Command::Mount { .. } | Command::Mounts | Command::Unmount { .. } => unreachable!(),
         Command::History { count } => emit(
             json,
             &store
@@ -1402,8 +1396,23 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
     if let Command::Update { apply } = &cli.command {
         return emit(cli.json, &rdrive::update::run(*apply).await?);
     }
+    if let Command::Config { command } = &cli.command {
+        let standard = rdrive::shared_home::standard_directory();
+        let value = match command {
+            ConfigCommand::Recover => rdrive::state_directory::recover(&standard)?,
+            ConfigCommand::Show => rdrive::state_directory::show(
+                &rdrive::shared_home::resolve(cli.home.as_deref())?, &standard)?,
+            ConfigCommand::Migrate { to, apply } => rdrive::state_directory::migrate(
+                &rdrive::shared_home::resolve(cli.home.as_deref())?, to, &standard, *apply)?,
+        };
+        return emit(cli.json, &value);
+    }
     let home = rdrive::shared_home::resolve(cli.home.as_deref())?;
+    rdrive::state_directory::guard(&home)?;
     if let Some(value) = read_command(cli, &home).await? { return emit(cli.json, &value); }
+    if let Some((request, wait)) = profile_command(cli)? {
+        return emit(cli.json, &rdrive::profile_admin::dispatch(&home, &request, wait).await?);
+    }
     match &cli.command {
         Command::Service {command} => {
             use rdrive::service::{self,ServiceAction};
@@ -1478,9 +1487,7 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
             no_prompt,
             dry_run,
         } => {
-            let store = Store::open(home)?;
-            let p = profile(&store, name)?;
-            drop(store);
+            let p = configured_profile(&rdrive::client_read::config(&home)?, &home, name)?;
             let options = rdrive::mount::MountOptions {
                 read_only: *read_only,
                 no_browse: !*browse,
@@ -1849,7 +1856,7 @@ mod cli_contract {
     fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
         let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
         let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(leaves.len(),101,"update the public interface inventory when adding a command");
+        assert_eq!(leaves.len(),104,"update the public interface inventory when adding a command");
         assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
         let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();
@@ -1867,6 +1874,22 @@ mod cli_contract {
         struct Invalid;
         impl Serialize for Invalid { fn serialize<S:serde::Serializer>(&self,_:S)->std::result::Result<S::Ok,S::Error>{Err(serde::ser::Error::custom("synthetic invalid value"))} }
         assert!(emit_to(true,&Invalid,&mut Vec::new()).is_err()); assert!(emit_to(false,&Invalid,&mut Vec::new()).is_err());
+    }
+    #[test]
+    fn profile_changes_validate_wait_and_retry_identity_before_contacting_a_service() {
+        let id=format!("{}:{}",chrono::Utc::now().timestamp(),uuid::Uuid::new_v4());
+        for wait in ["0","3601"] {
+            let cli=Cli::try_parse_from(["rdrive","profile","remove","nas","--wait-timeout",wait]).unwrap();
+            assert!(profile_command(&cli).unwrap_err().to_string().contains("between 1 and 3600"));
+        }
+        let cli=Cli::try_parse_from(["rdrive","profile","remove","nas","--request-id",&id]).unwrap();
+        let (request,wait)=profile_command(&cli).unwrap().unwrap();
+        assert_eq!(request.request_id,id);assert_eq!(wait,std::time::Duration::from_secs(300));
+        assert!(matches!(request.change,rdrive::profile_admin::Change::Remove{name} if name=="nas"));
+        let cli=Cli::try_parse_from(["rdrive","profile","add","nas","--protocol","smb","--url","smb://example.invalid/share","--request-id","not-an-id"]).unwrap();
+        assert!(profile_command(&cli).is_err());
+        let cli=Cli::try_parse_from(["rdrive","profile","list"]).unwrap();
+        assert!(profile_command(&cli).unwrap().is_none());
     }
     fn mounted(path: &std::path::Path) -> rdrive::mount::MountInfo {
         rdrive::mount::MountInfo { mountpoint:path.into(),source:"synthetic://fixture/share".into(),filesystem:"webdav".into(),read_only:true,no_browse:false,owner:unsafe{libc::geteuid()},fsid:[1,2] }
@@ -1892,6 +1915,7 @@ mod cli_contract {
         internet.username = None;
         store.config.profiles.insert("internet-failure".into(), internet);
         store.save_config().unwrap(); drop(store);
+        let _background_writer = Store::open(home.clone()).unwrap();
         let native=NativeCalls {
             password: |_,name| if name.ends_with("failure"){bail!("synthetic credential lookup failed")}else{Ok("mock credential".into())},
             mount: |profile,path,options,credential| {

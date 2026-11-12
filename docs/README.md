@@ -1,5 +1,9 @@
 # RDrive
 
+> **Personal project under active development**
+>
+> RDrive is developed for personal use and may contain bugs that cause data loss, corruption, overwrites, or unintended deletion. Keep independent backups and test with disposable files before use. **Use at your own risk. No guarantees are provided for data safety, integrity, availability, or recovery.**
+
 RDrive is a Rust command-line client for **WebDAV and SMB** on macOS. It combines remote file operations, recoverable transfers, offline caching, and guarded synchronization. An optional native companion adds a Finder view with system placeholders and on-demand downloads.
 
 Start with the CLI. Add Smart Synchronization or a managed snapshot repository when your workflow needs it.

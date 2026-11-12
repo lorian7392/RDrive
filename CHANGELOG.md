@@ -2,6 +2,14 @@
 
 Changes are organized from source history and versioned validation records. Dates identify the recorded changes or checks; they do not imply that a signed distribution was published. Historical test counts and deployment observations remain in their original reports and do not establish current coverage or installation status.
 
+## Unreleased
+
+- Add state-directory inspection, verified migration, and journal-based recovery through `rdrive config`, including shared locator and managed service updates.
+- Add profile changes through a private same-user broker bound to the running provider's state directory, with a standalone path when no broker is active.
+- Save profile changes and replay receipts atomically; add bounded waits, same-request retries within 24 hours, and retained-data checks before profile removal.
+- Let read-only background scans yield to profile administration while uploads keep their existing receipt and recovery boundaries.
+- Read native-mount connection configuration without acquiring the background writer lock.
+
 ## 0.8.3 — 2026-11-11
 
 - Let the CLI reference an existing private Finder state through a shared-home locator, with explicit path overrides retaining precedence.

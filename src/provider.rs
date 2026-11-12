@@ -11,6 +11,7 @@ mod index_scheduler;
 mod namespace;
 mod resolution;
 mod transfers;
+mod admin;
 pub use resolution::{refresh_stale_smart_directory, resolve_smart, smart_repair_status, repair_stale_smart_directory};
 #[async_trait::async_trait]
 trait Connector: Send + Sync {
@@ -709,14 +710,19 @@ fn finish_scan(attempts:&mut BTreeMap<String,ScanAttempt>,id:&str,success:bool){
 }
 type IndexBackends=BTreeMap<String,(String,Arc<dyn Backend>)>;
 async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBackends)->Result<()> {
+    background_once_prioritized(home,staging,fd,backends,None).await
+}
+async fn background_once_prioritized(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBackends,priority:Option<&admin::Priority>)->Result<()> {
     use crate::smart::MutationState;
     let configured=domains(home)?;
     backends.retain(|id,_|configured.iter().any(|d|d.smart&&d.id==*id));
     for d in configured.into_iter().filter(|d|d.smart) {
+        if priority.is_some_and(admin::Priority::requested) { return Ok(()); }
         let store=Store::open(home.to_path_buf())?;update_overlay(&store,&d)?;if crate::smart::control(&store)?.paused {continue;}
         let mut queue=crate::smart::Queue::open(&store,&d.id,&journal_binding(&store.config,&d)?)?;
         let pending=queue.list().into_iter().find(|m|matches!(m.state,MutationState::Pending|MutationState::Interrupted));drop(store);
         if let Some(mutation)=pending {let _=replay(home,staging,fd,&d,&mut queue,&mutation,crate::transfer::global().scoped(format!("smart:{}:{}",mutation.id,uuid::Uuid::new_v4())),true).await;}drop(queue);
+        if priority.is_some_and(admin::Priority::requested) { return Ok(()); }
         let store=Store::open(home.to_path_buf())?;update_overlay(&store,&d)?;
         let profile=store.config.profiles.get(&d.profile).context("domain profile missing")?.clone();let mut j=checked_journal(home,&store.config,&d)?;
         let timeout=std::time::Duration::from_secs(profile.timeout_secs.max(5));
@@ -732,13 +738,14 @@ async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBa
             if !forced&&last>0&&now.saturating_sub(last)<(ttl*1000) as i64{continue;}
             if j.directory_attempts.get("root").is_some_and(|a|a.next_try>now){continue;}
             begin_scan(&mut j.directory_attempts,"root");save_journal(&store,&d.id,&j)?;
-            let result=tokio::time::timeout(timeout,async {
+            let result=admin::read_phase(priority,timeout,async {
                 let b=background_backend(backends,&d,&profile,&binding).await?;
                 refresh(&store,b.as_ref(),&d,&mut j).await?;
                 j.directory_scans.insert("root".into(),chrono::Utc::now().timestamp_millis());
                 Ok::<_,anyhow::Error>(())
             }).await;
-            let success=matches!(result,Ok(Ok(())));
+            if matches!(result,admin::ReadPhase::Deferred) { backends.remove(&d.id); return Ok(()); }
+            let success=matches!(result,admin::ReadPhase::Finished(Ok(())));
             if !success{backends.remove(&d.id);}
             finish_scan(&mut j.directory_attempts,"root",success);
             if success {let completed=index_scheduler::completed_manual_demands(&j,&demands,true);j.completed_demands.extend(completed);}
@@ -749,10 +756,12 @@ async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBa
         let metadata=next_metadata(&store,&d,&j,&demands)?;
         if directory.is_none()&&metadata.is_none(){continue;}
         if let Some(id)=&directory{begin_scan(&mut j.directory_attempts,id);j.directory_turn=j.directory_turn.saturating_add(1);save_journal(&store,&d.id,&j)?;}
-        let connected=tokio::time::timeout(timeout,background_backend(backends,&d,&profile,&binding)).await;
-        let b=match connected {Ok(Ok(b))=>b,_=>{if let Some(id)=&directory{finish_scan(&mut j.directory_attempts,id,false);save_journal(&store,&d.id,&j)?;}continue;}};
+        let connected=admin::read_phase(priority,timeout,background_backend(backends,&d,&profile,&binding)).await;
+        let b=match connected {admin::ReadPhase::Finished(Ok(b))=>b,admin::ReadPhase::Deferred=>{backends.remove(&d.id);return Ok(());},_=>{if let Some(id)=&directory{finish_scan(&mut j.directory_attempts,id,false);save_journal(&store,&d.id,&j)?;}continue;}};
         if let Some(id)=&directory {
-            let success=matches!(tokio::time::timeout(timeout,refresh_directory(&store,b.as_ref(),&d,&mut j,id)).await,Ok(Ok(())));
+            let result=admin::read_phase(priority,timeout,refresh_directory(&store,b.as_ref(),&d,&mut j,id)).await;
+            if matches!(result,admin::ReadPhase::Deferred) { backends.remove(&d.id); return Ok(()); }
+            let success=matches!(result,admin::ReadPhase::Finished(Ok(())));
             if !success{backends.remove(&d.id);}
             finish_scan(&mut j.directory_attempts,id,success);
             if success {let completed=index_scheduler::completed_manual_demands(&j,&demands,false);j.completed_demands.extend(completed);}
@@ -760,9 +769,12 @@ async fn background_once(home:&Path,staging:&Path,fd:&File,backends:&mut IndexBa
         }
         // Namespace is already durably published before optional sidecar work.
         // At most one requested/known binding is enriched per pass.
+        if priority.is_some_and(admin::Priority::requested) { return Ok(()); }
         if let Some(id)=next_metadata(&store,&d,&j,&demands)?{
             begin_scan(&mut j.metadata_attempts,&id);save_journal(&store,&d.id,&j)?;
-            let success=matches!(tokio::time::timeout(timeout,enrich_metadata(&store,b.as_ref(),&d,&mut j,&id)).await,Ok(Ok(())));
+            let result=admin::read_phase(priority,timeout,enrich_metadata(&store,b.as_ref(),&d,&mut j,&id)).await;
+            if matches!(result,admin::ReadPhase::Deferred) { backends.remove(&d.id); return Ok(()); }
+            let success=matches!(result,admin::ReadPhase::Finished(Ok(())));
             finish_scan(&mut j.metadata_attempts,&id,success);save_journal(&store,&d.id,&j)?;
         }
     }Ok(())
@@ -1047,12 +1059,16 @@ fn success(payload:Value)->Value{let mut value=payload.as_object().cloned().unwr
 fn private(path:&Path)->Result<PathBuf>{use std::os::unix::fs::{DirBuilderExt,MetadataExt};let mut builder=fs::DirBuilder::new();builder.recursive(true).mode(0o700);builder.create(path)?;let meta=fs::symlink_metadata(path)?;if meta.file_type().is_symlink()||!meta.is_dir()||meta.uid()!=unsafe{libc::geteuid()}||meta.mode()&0o077!=0{bail!("bridge directories must be real, private, owned directories");}Ok(path.canonicalize()?)}
 pub async fn serve(home:PathBuf,socket:PathBuf,staging:PathBuf,development_tcp:bool)->Result<()> {
     use std::os::unix::{fs::{FileTypeExt,OpenOptionsExt,PermissionsExt},io::AsRawFd};
-    let home=private(&home)?;let staging=private(&staging)?;let parent=private(socket.parent().context("socket needs a private parent")?)?;
+    let home=private(&home)?;
+    let registration=Arc::new(crate::profile_admin::Registration::acquire(&home)?);
+    let administration=Arc::new(admin::Service{registration,priority:Arc::new(admin::Priority::default())});
+    let staging=private(&staging)?;let parent=private(socket.parent().context("socket needs a private parent")?)?;
     let socket=parent.join(socket.file_name().context("socket requires filename")?);
     let lock=fs::OpenOptions::new().create(true).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(parent.join("bridge.lock"))?;
     if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{bail!("provider bridge already running");}
     if let Ok(meta)=fs::symlink_metadata(&socket){if !meta.file_type().is_socket(){bail!("refusing to replace a non-socket bridge path");}fs::remove_file(&socket)?;}
     let staging_fd=Arc::new(open_staging(&staging)?);let listener=UnixListener::bind(&socket)?;fs::set_permissions(&socket,fs::Permissions::from_mode(0o600))?;
+    administration.registration.publish(&socket)?;
     let endpoint=parent.join("bridge-endpoint.json");
     let tcp=if development_tcp{Some(TcpListener::bind(("127.0.0.1",0)).await?)}else{None};
     let token=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
@@ -1062,19 +1078,32 @@ pub async fn serve(home:PathBuf,socket:PathBuf,staging:PathBuf,development_tcp:b
     let mut smart_tick=tokio::time::interval(std::time::Duration::from_millis(500));
     loop{tokio::select!{
         _=tokio::signal::ctrl_c()=>break,
-        _=smart_tick.tick()=>{let home=home.clone();let staging=staging.clone();let fd=staging_fd.clone();let coordinator=coordinator.clone();let backends=backends.clone();tokio::spawn(async move{if let Ok(_guard)=coordinator.try_lock(){let mut backends=backends.lock().await;let _=background_once(&home,&staging,fd.as_ref(),&mut backends).await;}});},
-        accepted=listener.accept()=>{let (stream,_)=accepted?;if stream.peer_cred()?.uid()!=unsafe{libc::geteuid()}{continue;}let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let coordinator=coordinator.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),None,coordinator).await;});}
-        accepted=async{if let Some(listener)=&tcp{listener.accept().await}else{std::future::pending().await}}=>{let (stream,address)=accepted?;if !address.ip().is_loopback(){continue;}let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let token=token.clone();let coordinator=coordinator.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),Some(&token),coordinator).await;});}
+        _=smart_tick.tick()=>{let home=home.clone();let staging=staging.clone();let fd=staging_fd.clone();let coordinator=coordinator.clone();let backends=backends.clone();let administration=administration.clone();tokio::spawn(async move{if let Ok(_guard)=coordinator.try_lock(){let mut backends=backends.lock().await;let _=background_once_prioritized(&home,&staging,fd.as_ref(),&mut backends,Some(administration.priority.as_ref())).await;}});},
+        accepted=listener.accept()=>{let (stream,_)=accepted?;
+            // A client may disconnect before credentials can be inspected.
+            // Reject that connection without terminating the shared service.
+            let Ok(peer)=stream.peer_cred() else {continue;};
+            if peer.uid()!=unsafe{libc::geteuid()}{continue;}
+            let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let coordinator=coordinator.clone();let administration=administration.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),None,coordinator,Some(administration)).await;});}
+        accepted=async{if let Some(listener)=&tcp{listener.accept().await}else{std::future::pending().await}}=>{let (stream,address)=accepted?;if !address.ip().is_loopback(){continue;}let home=home.clone();let staging=staging.clone();let staging_fd=staging_fd.clone();let token=token.clone();let coordinator=coordinator.clone();tokio::spawn(async move{let _=connection(stream,&home,&staging,staging_fd.as_ref(),Some(&token),coordinator,None).await;});}
     }}
     if development_tcp{let _=fs::remove_file(endpoint);}
     fs::remove_file(socket)?;drop(lock);Ok(())
 }
-async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S,home:&Path,staging:&Path,staging_fd:&File,token:Option<&str>,coordinator:Arc<tokio::sync::Mutex<()>>)->Result<()> {
+async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S,home:&Path,staging:&Path,staging_fd:&File,token:Option<&str>,coordinator:Arc<tokio::sync::Mutex<()>>,administration:Option<Arc<admin::Service>>)->Result<()> {
     let (read,mut write)=tokio::io::split(stream);let mut reader=BufReader::new(read);let mut bytes=Vec::new();
     let mut limited=(&mut reader).take(1024*1024);
     let count=tokio::time::timeout(std::time::Duration::from_secs(30),limited.read_until(b'\n',&mut bytes)).await??;drop(limited);
     if count==0||bytes.last()!=Some(&b'\n'){bail!("invalid or oversized provider request");}
-    let req:Request=match serde_json::from_slice(&bytes){Ok(req)=>req,Err(e)=>{let msg=error(e.into());write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());}};
+    let envelope:Value=match serde_json::from_slice(&bytes){Ok(req)=>req,Err(e)=>{let msg=error(e.into());write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());}};
+    if envelope.get("op").and_then(Value::as_str)==Some("profile_admin") {
+        if let Some(service)=administration.as_ref().filter(|_|token.is_none()) {
+            return admin::handle(&mut reader,&mut write,&bytes,service,coordinator.as_ref()).await;
+        }
+        let msg=error(anyhow::anyhow!("unsupported: profile administration requires the local Unix bridge"));
+        write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());
+    }
+    let req:Request=match serde_json::from_value(envelope){Ok(req)=>req,Err(e)=>{let msg=error(e.into());write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());}};
     if let Some(expected)=token {
         let supplied=req.auth_token.as_deref().unwrap_or("");
         let difference=supplied.bytes().zip(expected.bytes()).fold(0u8,|acc,(a,b)|acc|(a^b));

@@ -23,6 +23,11 @@ pub enum ServiceAction {
     Uninstall,
 }
 
+/// Inspect the validated, owned installation without starting or stopping it.
+pub fn options(home: &Path) -> Result<Option<ServiceOptions>> {
+    native::options(home)
+}
+
 pub fn install(options: &ServiceOptions, dry_run: bool) -> Result<Value> {
     ensure_macos()?;
     #[cfg(unix)]
@@ -403,6 +408,12 @@ mod native {
             bail!("service installation paths changed; existing state was preserved");
         }
         Ok(installation)
+    }
+    pub(super) fn options(home: &Path) -> Result<Option<ServiceOptions>> {
+        if !exists(&install_path(home)?)? { return Ok(None); }
+        let installation = load(home)?;
+        ensure_plist(&installation)?;
+        Ok(Some(installation.options))
     }
     fn ready(installation: &Installation) -> Result<()> {
         if planned(&installation.options, true)? != *installation {
@@ -1099,6 +1110,15 @@ mod native {
                 launch_agents_dir: Some(root.join("agents")),
             };
             (temporary, options)
+        }
+        #[test]
+        fn validated_options_preserve_the_owned_installation_and_reject_altered_plists() {
+            let (_temporary,options)=fixture();let control=Fake::default();
+            assert!(super::options(&options.home).unwrap().is_none());
+            install(&options,false,&control).unwrap();
+            assert_eq!(crate::service::options(&options.home).unwrap(),Some(options.clone()));
+            let saved=load(&options.home).unwrap();fs::write(&saved.plist,b"altered").unwrap();
+            assert!(crate::service::options(&options.home).is_err());
         }
         struct MockArtifacts {
             bundle: Option<String>,

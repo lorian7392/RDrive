@@ -32,9 +32,13 @@ pub fn config(home: &Path) -> Result<Config> {
     let path = home.join("config.json");
     match fs::symlink_metadata(&path) {
         Ok(metadata) => private_metadata(&metadata, false, owner)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::state_directory::guard(home)?;
+            return Ok(Config::default());
+        }
         Err(error) => return Err(error).context("unable to inspect read-only configuration"),
     }
+    crate::state_directory::guard(home)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

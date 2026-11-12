@@ -185,6 +185,7 @@ pub struct Store {
 }
 impl Store {
     pub fn open(home: PathBuf) -> Result<Self> {
+        crate::state_directory::guard(&home)?;
         let is_new = !home.exists();
         fs::create_dir_all(&home)?;
         if fs::symlink_metadata(&home)?.file_type().is_symlink() {

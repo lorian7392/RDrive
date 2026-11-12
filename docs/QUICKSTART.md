@@ -22,6 +22,10 @@ export RDRIVE_PASSWORD
 The input is hidden. Do not put password literals into commands, URLs, or scripts. The variable exists in this terminal and its children; it is not a Keychain entry and is not automatically available to a LaunchAgent or another MCP client.
 
 A profile records the variable name and reads its value when connecting. Enter the correct password for each account, or use a separate variable for each profile.
+An already running background service does not receive a variable exported
+later in this terminal. Profile changes send the variable name or Keychain
+reference, without copying its secret value. Use Keychain for a connection
+that must also work in the background.
 
 ### Add WebDAV
 
@@ -51,6 +55,26 @@ rdrive ls nas
 `share` is the share name; `folder` is an optional subtree. SMB transport encryption is required by default. `--allow-unencrypted-smb` is an explicit compatibility-test option, not an automatic fallback. SMB1, Kerberos/SSO, DFS, and service discovery are not provided.
 
 Profile names accept letters, digits, `-`, and `_`. Existing names cannot be overwritten. `--timeout 300` changes the default 120-second timeout when adding a profile. To change a profile, read the [removal restrictions](reference/CONFIGURATION.md) first; do not delete state files directly.
+
+`profile add` and `profile remove` also work while a matching provider bridge
+is running: the CLI uses its private broker for the same user and state
+directory. Without an active broker, it applies the change directly under the
+state lock. Both use the existing configuration. Adding a profile does not
+automatically add or register a Finder domain.
+
+`rdrive config show` reports the shared state location. To move the complete
+configuration, indexes, caches, and retained edits through the program, follow
+[state directory migration](STATE_DIRECTORY.md). Preview with
+`rdrive config migrate --to PATH`; add `--apply` to execute it and update the
+managed service.
+
+These commands wait up to 300 seconds by default; `--wait-timeout` accepts
+`1..3600` seconds. If a reply is lost or the wait expires, repeat the original
+operation with the exact reported `--request-id '<unix_seconds>:<UUID>'` and
+the same arguments within 24 hours. The saved receipt returns the original
+result. Invalid, expired, or differently reused IDs are rejected. See
+[safe retries](reference/CONFIGURATION.md#profile-administration-and-safe-retries)
+before issuing a new request after an uncertain outcome.
 
 ### Use macOS Keychain
 
@@ -85,7 +109,11 @@ rdrive ls pan123
 without taking the background service's writer lock. `ls` still reads the
 remote server and reports a connection error if it cannot reach that server.
 These commands do not substitute Finder's cached directory view for a remote
-result. Mutating commands retain their existing locking and recovery rules.
+result. Native `mount` also reads the connection configuration without taking
+that writer lock; macOS still handles the mount itself. File mutations retain
+their locking and recovery rules. Background read-only scans may yield to
+profile administration, while uploads finish through their existing receipt
+and recovery paths.
 
 ## Browse and transfer files
 

@@ -40,6 +40,9 @@ fn is_false(value: &bool) -> bool { !*value }
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
+    /// A profile change and its replay receipt share one atomic config write.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profile_admin_receipts: BTreeMap<String, crate::profile_admin::Receipt>,
     #[serde(default)]
     pub cache: CachePolicy,
     #[serde(default)]

@@ -86,7 +86,8 @@ def workflows(python, binary, group, output, library):
             ("coverage_cli", None), ("cache_directory", "--report"),
             ("mcp", "--report"), ("index", "--output"),
             ("search", "--report"), ("policy", "--output"),
-            ("service", "--output"),
+            ("service", "--output"), ("profile_admin", "--report"),
+            ("state_directory", "--report"),
         ]:
             command = [python, str(ROOT / "tests" / (name + "_workflows.py")), str(binary)]
             if flag:

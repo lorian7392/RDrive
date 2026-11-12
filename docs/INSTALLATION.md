@@ -90,6 +90,13 @@ or password values. `--home` and `RDRIVE_HOME` override this reference. See the
 [configuration reference](reference/CONFIGURATION.md#state-directory-and-configuration-persistence)
 for its format and validation.
 
+With matching CLI and provider builds, `profile add` and `profile remove` use
+the running bridge's private same-user broker for this state directory, or
+apply directly when no broker is active. They share the original configuration
+and credential references. See [profile administration and safe retries](reference/CONFIGURATION.md#profile-administration-and-safe-retries)
+for wait limits, durable request IDs, and removal restrictions. Adding a
+profile does not automatically register a Finder domain.
+
 The terminal may use a symbolic link to the companion App's
 `Contents/Resources/rdrive` executable so an App upgrade updates both clients.
 When using that arrangement, update the App as a whole; the standalone
@@ -140,6 +147,11 @@ Follow [macOS integration](MACOS_INTEGRATION.md) for enablement and registration
 6. Inspect profiles, jobs, and domains through read-only commands before resuming background work.
 
 SQLite migration preserves the old JSON as history. Do not run older writers against upgraded state. Downgrade compatibility is not generally guaranteed: replacing a binary does not undo a database migration or a remote operation.
+Profile administration also stores durable replay receipts in
+`config.json`. Older writers may discard that field when saving configuration,
+and older bridges do not provide the new administration broker. Stop old
+processes before switching builds and keep the CLI and provider bridge on the
+same version; do not downgrade a shared state directory to retry a request.
 
 ## Disable or uninstall
 

@@ -30,3 +30,5 @@ pub mod cache_directory;
 pub mod update;
 pub mod client_read;
 pub mod shared_home;
+pub mod profile_admin;
+pub mod state_directory;

@@ -68,6 +68,10 @@ entry's inherited option with the same name. Do not use it to set transfer speed
 These requirements come from runtime validation. The help blocks below also
 list every positional argument and option.
 
+- `config show` reports the active state and shared locator. `config migrate
+  --to PATH` previews a state migration; `--apply` performs the verified move
+  and updates the managed service. `config recover` uses the migration journal
+  independently of shared-home resolution. See [state migration](../STATE_DIRECTORY.md).
 - `profile add` requires `--protocol` and `--url`; the protocol is `webdav|smb`.
   Connection names contain only ASCII letters, digits, `-`, and `_`, cannot be
   empty, and cannot start with `-`. `--timeout` defaults to `120` and must be
@@ -78,6 +82,19 @@ list every positional argument and option.
   macOS Internet Keychain item for the URL host and username; it cannot be
   combined with `--password-env`. See [Configuration](CONFIGURATION.md) for
   credential handling.
+- `profile add` and `profile remove` use a private same-user, state-bound Unix
+  broker when the provider bridge is active, or apply directly under the state
+  lock otherwise. `--wait-timeout` defaults to `300` seconds and accepts
+  `1..3600`. A timeout or lost reply leaves the outcome unconfirmed: repeat the
+  original operation with its exact reported `--request-id
+  '<unix_seconds>:<UUID>'` and unchanged arguments within 24 hours. Invalid,
+  expired, or differently reused IDs are rejected. The change and replay
+  receipt share one atomic write; at most 1024 unexpired receipts are retained.
+  Removal protects queued uploads, cached content, domains, retained transfers,
+  and unfinished transactions. Adding a profile does not register a Finder
+  domain. Credential references are shared without copying secrets; terminal
+  environment values are not sent to an already running bridge. See
+  [safe retries](CONFIGURATION.md#profile-administration-and-safe-retries).
 - `get`, `cache get`, `repo get`, and `smart export` preserve existing local
   files by default; `put`, `cp`, and `mv` preserve existing remote destinations.
   Replacement requires the applicable `--overwrite` option. `put --queue` only
@@ -206,7 +223,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.3`: **116 command entries** (including groups, excluding the root and automatic `help`), **101 executable leaf commands**, and **823 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.3`: **120 command entries** (including groups, excluding the root and automatic `help`), **104 executable leaf commands**, and **853 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -216,6 +233,7 @@ WebDAV and SMB files, offline cache, durable uploads, and conservative sync
 Usage: rdrive [OPTIONS] <COMMAND>
 
 Commands:
+  config     Inspect or relocate the shared connection and synchronization state
   update     Check for a stable CLI release on GitHub
   conflict   Inspect and repair ordinary two-way sync conflicts
   mcp        Expose existing operations to AI clients over MCP standard input/output
@@ -264,6 +282,78 @@ Options:
       --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
   -h, --help                 Print help
   -V, --version              Print version
+```
+
+### `rdrive config`
+
+```text
+Inspect or relocate the shared connection and synchronization state
+
+Usage: rdrive config [OPTIONS] <COMMAND>
+
+Commands:
+  show     Show the active state directory and shared locator
+  migrate  Preview a verified move of all connection and synchronization state
+  recover  Recover an interrupted state migration using its durable journal
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive config show`
+
+```text
+Show the active state directory and shared locator
+
+Usage: rdrive config show [OPTIONS]
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive config migrate`
+
+```text
+Preview a verified move of all connection and synchronization state
+
+Usage: rdrive config migrate [OPTIONS] --to <TO>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --to <TO>              New private state directory; it must not already contain data
+      --apply                Stop the owned service, migrate verified state and restart it
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive config recover`
+
+```text
+Recover an interrupted state migration using its durable journal
+
+Usage: rdrive config recover [OPTIONS]
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
 ```
 
 ### `rdrive update`
@@ -466,6 +556,10 @@ Options:
           [default: 120]
       --nextcloud-upload-url <NEXTCLOUD_UPLOAD_URL>
           Explicit Nextcloud v2 uploads URL, e.g. https://host/remote.php/dav/uploads/user/
+      --request-id <REQUEST_ID>
+          Retry a previously submitted configuration request using the same ID
+      --wait-timeout <WAIT_TIMEOUT>
+          Maximum seconds to wait for an ongoing background operation [default: 300]
   -h, --help
           Print help
 ```
@@ -493,12 +587,14 @@ Arguments:
   <NAME>
 
 Options:
-      --home <HOME>          State/config directory (also RDRIVE_HOME)
-      --json                 Compact machine-readable JSON. Errors are JSON on stderr
-      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
-      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
-      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
-  -h, --help                 Print help
+      --home <HOME>                  State/config directory (also RDRIVE_HOME)
+      --request-id <REQUEST_ID>      Retry a previously submitted configuration request using the same ID
+      --json                         Compact machine-readable JSON. Errors are JSON on stderr
+      --wait-timeout <WAIT_TIMEOUT>  Maximum seconds to wait for an ongoing background operation [default: 300]
+      --limit <LIMIT>                Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>          Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>                  Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                         Print help
 ```
 
 ### `rdrive info`

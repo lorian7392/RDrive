@@ -92,6 +92,10 @@ entry's inherited option with the same name. Do not use it to set transfer speed
 These requirements come from runtime validation. The help blocks below also
 list every positional argument and option.
 
+- `config show` reports the active state and shared locator. `config migrate
+  --to PATH` previews a state migration; `--apply` performs the verified move
+  and updates the managed service. `config recover` uses the migration journal
+  independently of shared-home resolution. See [state migration](../STATE_DIRECTORY.md).
 - `profile add` requires `--protocol` and `--url`; the protocol is `webdav|smb`.
   Connection names contain only ASCII letters, digits, `-`, and `_`, cannot be
   empty, and cannot start with `-`. `--timeout` defaults to `120` and must be
@@ -102,6 +106,19 @@ list every positional argument and option.
   macOS Internet Keychain item for the URL host and username; it cannot be
   combined with `--password-env`. See [Configuration](CONFIGURATION.md) for
   credential handling.
+- `profile add` and `profile remove` use a private same-user, state-bound Unix
+  broker when the provider bridge is active, or apply directly under the state
+  lock otherwise. `--wait-timeout` defaults to `300` seconds and accepts
+  `1..3600`. A timeout or lost reply leaves the outcome unconfirmed: repeat the
+  original operation with its exact reported `--request-id
+  '<unix_seconds>:<UUID>'` and unchanged arguments within 24 hours. Invalid,
+  expired, or differently reused IDs are rejected. The change and replay
+  receipt share one atomic write; at most 1024 unexpired receipts are retained.
+  Removal protects queued uploads, cached content, domains, retained transfers,
+  and unfinished transactions. Adding a profile does not register a Finder
+  domain. Credential references are shared without copying secrets; terminal
+  environment values are not sent to an already running bridge. See
+  [safe retries](CONFIGURATION.md#profile-administration-and-safe-retries).
 - `get`, `cache get`, `repo get`, and `smart export` preserve existing local
   files by default; `put`, `cp`, and `mv` preserve existing remote destinations.
   Replacement requires the applicable `--overwrite` option. `put --queue` only

@@ -27,8 +27,16 @@ referenced state. Do not replace the state directory with a symbolic link.
 `--home` does not change the shell's
 `HOME`. Configuration is stored as UTF-8 JSON without comments in `config.json`
 inside that directory. A missing file uses all defaults. An existing JSON file
-must contain a `profiles` object; the other four top-level objects may be omitted
+must contain a `profiles` object; the other top-level objects may be omitted
 and then receive their defaults.
+
+Use `rdrive config show` to inspect the active state and service. To relocate
+the complete state, use `rdrive config migrate --to PATH`, review the preview,
+then repeat with `--apply`. The program preserves retained contents, updates
+the shared locator and managed service, and keeps a recovery copy. Use
+`rdrive config recover` after an interrupted migration. See
+[state directory migration](../STATE_DIRECTORY.md); moving `config.json` alone
+does not relocate a connection safely.
 
 Prefer the `profile`, `cache`, `index`, `filter`, and `policy` commands for saving
 configuration. Before editing manually, stop RDrive processes using the same
@@ -43,6 +51,11 @@ copying it alone cannot restore queues, offline edits, or synchronization baseli
 
 - `profiles`: an object mapping connection names to `Profile`; an empty
   configuration uses `{}`. Required in an existing configuration file.
+- `profile_admin_receipts`: internal replay receipts for profile changes,
+  defaulting to `{}` and omitted when empty. RDrive maintains this field; do not
+  edit or delete it to retry a command. Each receipt records an argument
+  fingerprint, the original result, and its expiration time, without credential
+  values. See [profile administration](#profile-administration-and-safe-retries).
 - `cache`: `CachePolicy`, defaulting to `{"max_bytes":null,"directory":null}`.
 - `index`: `IndexPolicy`; full metadata prefetch is enabled by default, with
   refresh intervals of `300` / `30` seconds.
@@ -100,6 +113,50 @@ uploads and handle its cache. Changing an account or server does not make old
 cache, domains, or upload receipts belong to the new account: internal bindings
 verify their identity.
 
+## Profile administration and safe retries
+
+`profile add` and `profile remove` can use the same state directory as a running
+provider bridge. When that bridge is active, the CLI submits the change through
+its private Unix-socket administration broker. The broker verifies the same
+user, canonical state directory, and running instance before applying it. When
+no broker is active, the CLI obtains the state writer lock and applies the
+same operation directly. Both paths update the original `config.json`; they do
+not create another profile store or copy a Keychain secret.
+
+Administration runs between durable background synchronization phases. A
+read-only background scan may yield to a pending profile change; uploads and
+other remote mutations finish through their existing receipt and recovery
+paths. `--wait-timeout SECONDS` defaults to `300` and accepts `1..3600`. It bounds
+the CLI's wait, not the duration of a remote upload. A timeout or lost reply can
+leave the outcome unconfirmed; it does not establish that the change failed.
+
+Every change has a request ID, generated automatically unless `--request-id`
+is supplied. Successful results include `request_id`; failures also identify
+the ID needed for a retry. Repeat the complete original operation with
+`--request-id '<unix_seconds>:<UUID>'`, substituting that exact reported ID and
+keeping the profile name and all add options unchanged. Within 24 hours of its
+timestamp, the same ID and arguments return the original committed result,
+including after a restart. Reusing an ID with different arguments is rejected.
+An ID must use a canonical Unix-seconds timestamp and lowercase UUID, must not
+be more than 30 seconds in the future, and must not be expired. Invalid or
+expired IDs are rejected; inspect `profile list` before issuing a new request
+when the old outcome is uncertain.
+
+The profile change and its receipt are saved in one atomic configuration
+write. Up to 1024 unexpired receipts are retained. Once that limit is reached,
+new requests are rejected until receipts expire; retrying an existing request
+still returns its result. Expired receipts are pruned when a new change is
+saved. Do not clear receipts to bypass the limit or retry an expired ID.
+
+Removal refuses profiles with unfinished upload jobs, any cached files,
+configured Finder domains, retained download transfers, or open/prepared
+repository transactions. Finish or cancel uploads, unpin and prune cache,
+unregister and remove domains, and recover or explicitly discard retained work
+through the appropriate commands first. Invalid or unrecognized retained
+Smart state also blocks removal so that recovery data is preserved. Adding a
+profile only saves connection configuration; it does not automatically add or
+register a Finder domain.
+
 ## Authentication and environment variables
 
 Password lookup for Rust file operations follows this order:
@@ -120,6 +177,10 @@ There is no password command-line argument, and passwords are not written to
 connection configuration. `profile list` displays usernames and variable names.
 A background LaunchAgent does not inherit passwords temporarily exported in the
 current terminal; use Keychain for persistent background connections.
+The same applies to an already running provider bridge: profile administration
+sends only the environment-variable name or Keychain reference, not the secret
+value or the terminal's environment. Adding a profile does not make a newly
+exported variable available to that bridge.
 `service status` reports whether a variable exists in the checking process,
 never its value.
 
@@ -318,6 +379,7 @@ manual migration.
       "nextcloud_upload_url": null
     }
   },
+  "profile_admin_receipts": {},
   "cache": {
     "max_bytes": null,
     "directory": null
@@ -359,7 +421,8 @@ manual migration.
 ```
 
 The smallest empty configuration is `{"profiles":{}}`; the other objects use
-the defaults above.
+the defaults above. The empty `profile_admin_receipts` object is included here
+for completeness; RDrive omits it when saving an empty receipt set.
 
 ## Domains, resident services, and session options
 

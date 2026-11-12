@@ -5,6 +5,10 @@
 [![Documentation](https://github.com/lorian7392/RDrive/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/lorian7392/RDrive/actions/workflows/docs.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> **Personal project under active development**
+>
+> RDrive is developed for personal use and may contain bugs that cause data loss, corruption, overwrites, or unintended deletion. Keep independent backups and test with disposable files before use. **Use at your own risk. No guarantees are provided for data safety, integrity, availability, or recovery.**
+
 **A WebDAV and SMB file and synchronization client for macOS, built with Rust.**
 
 RDrive combines resumable transfers, offline caching, revision-protected synchronization, and recoverable file operations in a standalone command-line tool. An optional macOS companion adds Finder placeholders, on-demand downloads, and offline editing through File Provider. Managed repositories provide complete multi-file snapshot publication for cooperating clients.
@@ -24,7 +28,7 @@ RDrive combines resumable transfers, offline caching, revision-protected synchro
 - Publish managed-repository transactions with concurrent-writer protection and uncertain-commit recovery.
 - Connect AI clients through a read-only-by-default MCP server and three companion Skills.
 
-See the [feature guide](docs/FEATURES.md) for protocol differences, guarantees, and limits.
+See the [feature guide](docs/FEATURES.md) for protocol differences, protections, and limits.
 
 ## Install from source
 
@@ -100,7 +104,7 @@ rdrive sync dav ./work work --apply
 
 Continue with the [quick start](docs/QUICKSTART.md) or [troubleshooting guide](docs/TROUBLESHOOTING.md).
 
-## Guarantees and limits
+## Behavior and limitations
 
 Ordinary file operations and directory synchronization use multiple requests and do not form cross-file transactions. Managed repositories provide complete snapshot visibility to cooperating clients. Overwrite protection depends on correct server revision conditions or protected SMB handles. Versions and recovery copies on the same server do not replace independent backups.
 

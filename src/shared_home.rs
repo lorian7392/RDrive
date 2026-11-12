@@ -24,9 +24,14 @@ struct SharedHome {
 /// consults the private reference; resolving a home never initializes state.
 pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
     let environment = std::env::var_os("RDRIVE_HOME");
-    let standard = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-        .join("Library/Application Support/rdrive");
+    let standard = standard_directory();
     resolve_with(explicit, environment.as_deref(), &standard, unsafe { libc::geteuid() })
+}
+
+/// Shared connection locator and state-migration control directory.
+pub fn standard_directory() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join("Library/Application Support/rdrive")
 }
 
 fn private_directory(path: &Path, owner: u32) -> Result<()> {
