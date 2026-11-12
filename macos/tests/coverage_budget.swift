@@ -42,6 +42,14 @@ final class BudgetPeer {
         paths = NativePaths(group: group)
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else { throw budgetFailure }
+        // Teardown can reject queued connections before accept configures
+        // them; protect the listening socket as well as each accepted socket.
+        var one: Int32 = 1
+        guard setsockopt(listener, SOL_SOCKET, SO_NOSIGPIPE, &one,
+                         socklen_t(MemoryLayout.size(ofValue: one))) == 0 else {
+            Darwin.close(listener)
+            throw budgetFailure
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -56,6 +64,12 @@ final class BudgetPeer {
     }
     func mutate(_ body: (BudgetPeer) -> Void) { lock.lock(); body(self); lock.unlock() }
     func inspect<T>(_ body: (BudgetPeer) -> T) -> T { lock.lock(); defer { lock.unlock() }; return body(self) }
+    func listenerSuppressesSIGPIPE() throws -> Bool {
+        var value: Int32 = 0
+        var size = socklen_t(MemoryLayout.size(ofValue: value))
+        guard getsockopt(listener, SOL_SOCKET, SO_NOSIGPIPE, &value, &size) == 0 else { throw budgetFailure }
+        return value == 1
+    }
     func stop() {
         lock.lock(); stopped = true; let gate = fetchGate; lock.unlock()
         gate?.signal()
@@ -460,6 +474,7 @@ enum BudgetCoverageTests {
     }
     private static func testWatcherDomainIsolation(_ paths: NativePaths) throws {
         let peer = try BudgetPeer(root: paths.group); defer { peer.stop() }
+        try expect(try peer.listenerSuppressesSIGPIPE(), "Queued watcher cancellation requires SIGPIPE suppression on the listener itself")
         let healthy = BudgetManager(peer.paths.group)
         let system = BudgetSystem(nil)
         system.registered = ["broken", "healthy"].map {
