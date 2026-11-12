@@ -243,7 +243,9 @@ enum ProviderCoverageTests {
         let system=ProviderTestSystem(manager)
         let domain=NSFileProviderDomain(identifier:NSFileProviderDomainIdentifier("budget-domain"),displayName:"Synthetic budget")
         let item:[String:Any]=["id":"smart","parent_id":"root","name":"smart.txt","kind":"file","size":16,"content_version":"c","metadata_version":"m","pinned":false,"capabilities":["read"],"smart":true,"has_unsynced_changes":false]
-        peer.mutate{$0.items["smart"]=item;$0.fetchDelay=0.06}
+        let fetchGate=DispatchSemaphore(value:0)
+        defer{fetchGate.signal()}
+        peer.mutate{$0.items["smart"]=item;$0.fetchGate=fetchGate}
         let provider=RDriveProvider(domain:domain,bridge:bridge,manager:manager,startBackground:false,heartbeatInterval:0.01,budgetFactory:{NativeMaterializationBudget(bridge:$0,domain:$1,system:system,timeout:0.1)})
         defer{provider.invalidate()}
         let state=peer.paths.group.appendingPathComponent("native-budget.json")
@@ -252,25 +254,60 @@ enum ProviderCoverageTests {
             return raw["reservations"] as? [String:[String:Any]] ?? [:]
         }
         func releaseAll() {NativeMaterializationBudget(bridge:bridge,domain:"budget-domain",system:system).release(Array(reservations().keys))}
+        func observedRenewal(_ before:[String:[String:Any]],by deadline:DispatchTime)->Bool {
+            guard peer.budgetRenewed.wait(timeout:deadline) == .success else{return false}
+            while DispatchTime.now() < deadline {
+                let current=reservations()
+                if before.count==1,current.count==1,let (key,previous)=before.first,
+                   let updated=current[key],updated["delivered"] as? Bool==false,
+                   let oldExpiry=previous["expires"] as? Double,let newExpiry=updated["expires"] as? Double,
+                   newExpiry>oldExpiry,peer.inspect({$0.ledger["budget-domain"]?["reserved"]})==16 {return true}
+                Thread.sleep(forTimeInterval:0.002)
+            }
+            return false
+        }
         let success=DispatchSemaphore(value:0);var delivered:URL?;var error:Error?
         _=provider.fetchContents(for:providerID("smart"),version:nil,request:NSFileProviderRequest()){delivered=$0;error=$2;success.signal()}
-        try wait(success)
+        try wait(peer.fetchStarted)
+        let beforeRenewal=reservations()
+        try expect(observedRenewal(beforeRenewal,by:.now()+5),"Admission heartbeat did not publish and durably extend the undelivered reservation while fetch was gated")
+        try expect(success.wait(timeout:.now()) == .timedOut,"Smart fetch completed before its content gate was released")
+        fetchGate.signal()
+        try wait(success);try wait(peer.fetchFinished)
+        peer.mutate{$0.fetchGate=nil}
         try expect(error==nil && delivered != nil && Data(contentsOf:delivered!)==Data("provider-content".utf8),"Smart callback did not deliver actual admitted bytes")
         try expect(reservations().count==1 && reservations().values.first?["delivered"] as? Bool==true,"Smart callback did not retain its delivered admission receipt")
-        try expect(peer.inspect{$0.calls.filter{$0["op"] as? String=="cache_budget"}.count}>3,"Admission heartbeat was not renewed during the delayed real fetch")
         try FileManager.default.removeItem(at:delivered!);releaseAll()
         try expect(reservations().isEmpty,"Discarded delivered lease was not released")
-        peer.mutate{$0.fetchFailure=true;$0.fetchDelay=0}
+        // Negative control: the same probe rejects a provider whose heartbeat
+        // cannot fire within the observation window; delivery stays gated.
+        let disabledGate=DispatchSemaphore(value:0)
+        defer{disabledGate.signal()}
+        peer.mutate{$0.fetchGate=disabledGate}
+        while peer.budgetRenewed.wait(timeout:.now()) == .success {}
+        while peer.fetchStarted.wait(timeout:.now()) == .success {}
+        let disabledProvider=RDriveProvider(domain:domain,bridge:bridge,manager:manager,startBackground:false,heartbeatInterval:3600,budgetFactory:{NativeMaterializationBudget(bridge:$0,domain:$1,system:system,timeout:0.1)})
+        defer{disabledProvider.invalidate()}
+        let disabledDone=DispatchSemaphore(value:0);var disabledDelivery:URL?;var disabledError:Error?
+        _=disabledProvider.fetchContents(for:providerID("smart"),version:nil,request:NSFileProviderRequest()){disabledDelivery=$0;disabledError=$2;disabledDone.signal()}
+        try wait(peer.fetchStarted)
+        try expect(!observedRenewal(reservations(),by:.now()+0.1),"Heartbeat probe accepted a provider with renewals disabled")
+        try expect(disabledDone.wait(timeout:.now()) == .timedOut,"Negative-control content escaped its gate")
+        disabledGate.signal();try wait(disabledDone);try wait(peer.fetchFinished)
+        try expect(disabledError==nil && disabledDelivery != nil,"Negative-control fetch failed after its gate was released")
+        try FileManager.default.removeItem(at:disabledDelivery!);releaseAll()
+        disabledProvider.invalidate()
+        peer.mutate{$0.fetchFailure=true;$0.fetchGate=nil}
         let failed=DispatchSemaphore(value:0)
         _=provider.fetchContents(for:providerID("smart"),version:nil,request:NSFileProviderRequest()){_,_,failure in error=failure;failed.signal()}
-        try wait(failed)
+        try wait(failed);try wait(peer.fetchFinished)
         try expect(error != nil && reservations().isEmpty,"Failed Smart fetch retained a download admission")
         peer.mutate{$0.fetchFailure=false;$0.limit=1}
         let rejected=DispatchSemaphore(value:0)
         _=provider.fetchContents(for:providerID("smart"),version:nil,request:NSFileProviderRequest()){_,_,failure in error=failure;rejected.signal()}
         try wait(rejected)
         try expect((error as NSError?)?.code==NSFileProviderError.insufficientQuota.rawValue && peer.inspect{$0.calls.contains{$0["op"] as? String=="native_error"}},"Quota rejection did not preserve a visible provider error")
-        peer.mutate{$0.limit=1024;$0.fetchDelay=0.6}
+        peer.mutate{$0.limit=1024;$0.fetchWaitForCancellation=true}
         while peer.fetchStarted.wait(timeout:.now()) == .success {}
         let cancellingProvider=RDriveProvider(domain:domain,bridge:bridge,manager:manager,startBackground:false,heartbeatInterval:0.2,budgetFactory:{NativeMaterializationBudget(bridge:$0,domain:$1,system:system,timeout:0.1)})
         defer{cancellingProvider.invalidate()}
@@ -279,11 +316,11 @@ enum ProviderCoverageTests {
         try wait(peer.fetchStarted)
         try expect(!reservations().isEmpty,"Smart content request began without its durable admission")
         try FileManager.default.setAttributes([.posixPermissions:0o644],ofItemAtPath:state.path)
-        try wait(cancelled)
+        try wait(cancelled);try wait(peer.fetchFinished)
         try expect((error as NSError?)?.code==NSUserCancelledError,"Lost admission heartbeat did not cancel delivery: \(String(describing:error))")
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:state.path)
         releaseAll()
-        peer.mutate{$0.fetchDelay=0}
+        peer.mutate{$0.fetchWaitForCancellation=false}
         let before=peer.inspect{$0.calls.count}
         let background=RDriveProvider(domain:domain,bridge:bridge,manager:manager,backgroundInterval:0.01,budgetFactory:{NativeMaterializationBudget(bridge:$0,domain:$1,system:system,timeout:0.1)})
         var callbacks=0

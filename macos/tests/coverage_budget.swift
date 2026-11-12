@@ -27,6 +27,12 @@ final class BudgetPeer {
     var rejectReservation = false
     var extraUsed: UInt64 = 0
     let fetchStarted = DispatchSemaphore(value: 0)
+    let fetchFinished = DispatchSemaphore(value: 0)
+    let budgetRenewed = DispatchSemaphore(value: 0)
+    private let fetchWorkers = DispatchGroup()
+    private var activeFetches = 0
+    var fetchGate: DispatchSemaphore?
+    var fetchWaitForCancellation = false
     var fetchFailure = false
     var fetchDelay: TimeInterval = 0
 
@@ -51,9 +57,11 @@ final class BudgetPeer {
     func mutate(_ body: (BudgetPeer) -> Void) { lock.lock(); body(self); lock.unlock() }
     func inspect<T>(_ body: (BudgetPeer) -> T) -> T { lock.lock(); defer { lock.unlock() }; return body(self) }
     func stop() {
-        lock.lock(); stopped = true; lock.unlock()
+        lock.lock(); stopped = true; let gate = fetchGate; lock.unlock()
+        gate?.signal()
         _ = Darwin.shutdown(listener, SHUT_RDWR); Darwin.close(listener)
         _ = done.wait(timeout: .now() + 2)
+        _ = fetchWorkers.wait(timeout: .now() + 2)
     }
     private func reply(_ request: [String: Any]) -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
@@ -65,7 +73,6 @@ final class BudgetPeer {
             if let id = request["id"] as? String, let item = items[id] { return ["ok": true, "item": item] }
             return ["ok": false, "error": ["code": "no_such_item"]]
         case "fetch":
-            if fetchDelay > 0 { Thread.sleep(forTimeInterval: fetchDelay) }
             if fetchFailure { return ["ok": false, "error": ["code": "server_unreachable"]] }
             let transfers=paths.transfers
             try! FileManager.default.createDirectory(at:transfers,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
@@ -99,6 +106,7 @@ final class BudgetPeer {
                     return ["ok": false, "error": ["code": "insufficient_quota"]]
                 }
                 ledger[domain] = ["used": used.uint64Value, "reserved": reserved]
+                if activeFetches > 0 && reserved > 0 { budgetRenewed.signal() }
             }
             let used = ledger.values.reduce(extraUsed) { $0 + ($1["used"] ?? 0) }
             let reserved = ledger.values.reduce(UInt64(0)) { $0 + ($1["reserved"] ?? 0) }
@@ -115,7 +123,8 @@ final class BudgetPeer {
             if closed { return }
             let fd = Darwin.accept(listener, nil, nil)
             if fd < 0 { return }
-            defer { Darwin.close(fd) }
+            var ownedDescriptor = fd
+            defer { if ownedDescriptor >= 0 { Darwin.close(ownedDescriptor) } }
             var one: Int32 = 1
             _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
             var raw = Data(); var buffer = [UInt8](repeating: 0, count: 65536)
@@ -125,7 +134,35 @@ final class BudgetPeer {
                 raw.append(contentsOf: buffer.prefix(count))
             }
             guard let newline = raw.firstIndex(of: 10), let request = try? JSONSerialization.jsonObject(with: raw.prefix(upTo: newline)) as? [String: Any] else { continue }
-            if request["op"] as? String == "fetch" { fetchStarted.signal() }
+            if request["op"] as? String == "fetch" {
+                let (gate, delay, waitForCancellation) = inspect { ($0.fetchGate, $0.fetchDelay, $0.fetchWaitForCancellation) }
+                mutate { $0.activeFetches += 1 }
+                fetchStarted.signal()
+                ownedDescriptor = -1
+                fetchWorkers.enter()
+                // A held content response must not block independent lease
+                // renewals or keep the fixture's shared-state lock occupied.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    defer {
+                        Darwin.close(fd)
+                        self.mutate { $0.activeFetches -= 1 }
+                        self.fetchFinished.signal()
+                        self.fetchWorkers.leave()
+                    }
+                    if waitForCancellation {
+                        var byte: UInt8 = 0
+                        while Darwin.read(fd, &byte, 1) > 0 { }
+                        return
+                    }
+                    if let gate = gate, gate.wait(timeout: .now() + 10) != .success {
+                        self.send(["ok": false, "error": ["code": "server_unreachable", "message": "Synthetic fetch gate timed out"]], to: fd)
+                        return
+                    }
+                    if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+                    self.send(self.reply(request), to: fd)
+                }
+                continue
+            }
             if ["watcher_snapshot", "changes"].contains(request["op"] as? String ?? ""),
                inspect({ $0.blockedCatalogDomain }) == request["domain"] as? String {
                 mutate { $0.calls.append(request) }; catalogStarted.signal()
@@ -134,14 +171,17 @@ final class BudgetPeer {
                 while Darwin.read(fd, &buffer, buffer.count) > 0 { }
                 continue
             }
-            guard var payload = try? JSONSerialization.data(withJSONObject: reply(request)) else { continue }
-            payload.append(10)
-            payload.withUnsafeBytes { bytes in
-                var offset = 0
-                while offset < bytes.count {
-                    let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                    if count <= 0 { break }; offset += count
-                }
+            send(reply(request), to: fd)
+        }
+    }
+    private func send(_ response: [String: Any], to fd: Int32) {
+        guard var payload = try? JSONSerialization.data(withJSONObject: response) else { return }
+        payload.append(10)
+        payload.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count <= 0 { break }; offset += count
             }
         }
     }
