@@ -551,7 +551,7 @@ fn bounded_runner_preserves_exit_codes_stdin_and_reaps_timed_out_descendants() {
     .is_err());
     assert!(nonblocking(-1).is_err());
     assert!(statistics(Path::new("/no-such-rdrive-vault")).is_err());
-    assert!(statistics(Path::new("/private/tmp")).is_ok());
+    assert!(statistics(&std::env::temp_dir()).is_ok());
     let mut v = vec![];
     assert!(!drain(&mut ErrorReader(std::io::ErrorKind::WouldBlock), &mut v).unwrap());
     assert!(!drain(&mut ErrorReader(std::io::ErrorKind::Interrupted), &mut v).unwrap());
