@@ -2863,7 +2863,7 @@ Optional verified local APFS checkpoints; never rolls back the state database
 Usage: rdrive checkpoint [OPTIONS] <COMMAND>
 
 Commands:
-  status     Read local APFS/Time Machine capability and policy without changing snapshots
+  status     Inspect checkpoint capacity, schedule, recovery status and platform support
   list       List owned checkpoint records and current OS snapshot availability
   config     Configure optional checkpoints; no snapshot is created by configuration
   create     Create and verify a local checkpoint; --authorize may prompt in a terminal
@@ -2886,7 +2886,7 @@ Options:
 ### `rdrive checkpoint status`
 
 ```text
-Read local APFS/Time Machine capability and policy without changing snapshots
+Inspect checkpoint capacity, schedule, recovery status and platform support
 
 Usage: rdrive checkpoint status [OPTIONS]
 
@@ -2923,18 +2923,18 @@ Configure optional checkpoints; no snapshot is created by configuration
 Usage: rdrive checkpoint config [OPTIONS]
 
 Options:
-      --enabled <ENABLED>              [possible values: true, false]
+      --enabled <ENABLED>              Enable future creation or disable it while retaining checkpoints [possible values: true, false]
       --home <HOME>                    State/config directory (also RDRIVE_HOME)
       --json                           Compact machine-readable JSON. Errors are JSON on stderr
-      --max-records <MAX_RECORDS>
+      --max-records <MAX_RECORDS>      Maximum owned records (1..4096); native OS snapshots are not automatically deleted
       --limit <LIMIT>                  Aggregate payload bytes/second across all jobs (headers excluded)
-      --storage <STORAGE>              [possible values: system-snapshot, apfs-vault]
-      --interval-secs <INTERVAL_SECS>
+      --storage <STORAGE>              Dedicated bounded file vault or manual native system snapshots [possible values: system-snapshot, apfs-vault]
+      --interval-secs <INTERVAL_SECS>  Seconds after completion until the next vault checkpoint (60..31536000); requires the resident service
       --progress <PROGRESS>            Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
       --jobs <JOBS>                    Concurrent queue targets. Jobs for the same target retain order [default: 4]
-      --manual
-      --max-bytes <MAX_BYTES>
-      --auto-prune <AUTO_PRUNE>        [possible values: true, false]
+      --manual                         Disable periodic creation while retaining the store and its history
+      --max-bytes <MAX_BYTES>          Fixed vault image capacity in bytes, reserved at initialization; at least 256 MiB and divisible by 512
+      --auto-prune <AUTO_PRUNE>        Permit cleanup of eligible old vault checkpoints, preserving the newest verified recovery point during replacement [possible values: true, false]
   -h, --help                           Print help
 ```
 

@@ -1239,7 +1239,7 @@ Access: **Requires --allow-write**.
 
 ## `rdrive_checkpoint_status`
 
-Read optional APFS checkpoint capabilities without creating or mounting a snapshot.
+Inspect checkpoint policy, schedule and verified vault capacity without creating a checkpoint.
 
 Access: **Available in the default read-only mode**.
 
@@ -1254,7 +1254,7 @@ Access: **Available in the default read-only mode**.
 
 ## `rdrive_checkpoint_list`
 
-List owned local checkpoint records and current OS snapshot availability.
+List owned file checkpoints and retained native system-snapshot records.
 
 Access: **Available in the default read-only mode**.
 
@@ -1413,7 +1413,7 @@ Access: **Available in the default read-only mode**.
 
 ## `rdrive_checkpoint_create`
 
-Create and verify an enabled local OS checkpoint; authorization and platform failures are explicit.
+Create and verify a checkpoint with the configured backend; native authorization and platform failures are explicit.
 
 Access: **Requires --allow-write**.
 
