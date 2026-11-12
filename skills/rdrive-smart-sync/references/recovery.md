@@ -30,3 +30,13 @@ Start with the clean-cache usage, pinned usage, and retained-edit totals. Unpin 
 ## Missing Finder items or status
 
 Check the existing domain identity, native registration, bridge, and notification helper separately. A live native mount does not prove a Smart domain is connected. Initial directory listings do not recursively scan the entire account. Failed or unvisited listings must not be treated as authoritative empty subtrees. Diagnose without deleting domain state, remote files, or recovery snapshots.
+
+## File history and local checkpoints
+
+`rdrive_history` is the completion-event log; it does not contain recoverable file bytes. Inspect `rdrive_history_status` and `rdrive_history_files` for account-bound retained contents. Automatic history is opt-in and uses a budget independent of clean-cache eviction. Pending Smart snapshots and prepared before-images remain protected during history cleanup.
+
+Prefer exporting (`rdrive_history_export`) or restoring a separate copy. `rdrive_history_restore_prepare` saves a plan for a copy or explicit replacement; review the returned destination and message, then use `rdrive_history_restore_apply` with the same profile, version and plan and `apply:true`. A plan fixes its mode and destination. Changed remote content/metadata or overlapping pending edits stop replacement; never reprepare repeatedly to chase another writer. The current replacement version is retained first. An uncertain publication requires inspecting its destination and retained decision, not an unconditional retry.
+
+Finder's **View File History…** exposes the same entries, policy, preview, export and two-stage restore. History starts when enabled; online-only remote bytes and edits made outside RDrive are not reconstructed retroactively. Legacy remote `versions` and managed-repository snapshots are separate formats.
+
+Optional `rdrive_checkpoint_status/list/inspect` read APFS capability and owned checkpoint records. Creation and read-only recovery can require authorization; the background broker has no terminal and cannot read a sudo password. Checkpoint export permits only recorded local payloads to a new destination. Import verified recovered payloads using `rdrive_history_import`, then preview a new guarded restore. Never replace the live database or old queues with snapshot copies. macOS can expire system snapshots; a record is not proof its snapshot exists. Forgetting a record does not delete an OS snapshot.

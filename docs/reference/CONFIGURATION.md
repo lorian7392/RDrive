@@ -1,7 +1,7 @@
 # Complete configuration reference
 
 This reference follows the actual serialized fields and defaults in
-`src/config.rs`, `src/filtering.rs`, and `src/policies.rs`. See the [complete CLI
+`src/config.rs`, `src/filtering.rs`, `src/policies.rs`, `src/history.rs`, and `src/checkpoints.rs`. See the [complete CLI
 reference](CLI.md) for command arguments, [Quickstart](../QUICKSTART.md) for
 workflows, and [Features](../FEATURES.md) for recovery and protocol boundaries.
 
@@ -38,7 +38,7 @@ the shared locator and managed service, and keeps a recovery copy. Use
 [state directory migration](../STATE_DIRECTORY.md); moving `config.json` alone
 does not relocate a connection safely.
 
-Prefer the `profile`, `cache`, `index`, `filter`, and `policy` commands for saving
+Prefer the `profile`, `cache`, `index`, `filter`, `policy`, `history config`, and `checkpoint config` commands for saving
 configuration. Before editing manually, stop RDrive processes using the same
 state directory, preserve the original file, and keep the directory private,
 owned by the current user, with mode `0700`. A lock prevents ordinary concurrent
@@ -63,6 +63,11 @@ copying it alone cannot restore queues, offline edits, or synchronization baseli
   are excluded by default, with no custom include/exclude patterns.
 - `policies`: automatic versioning and conflict handling; automatic versioning
   is off and conflicts stop synchronization by default.
+- `history`: `HistoryConfig`, containing a default local history policy and
+  connection overrides. Capture is disabled by default; limits default to 20
+  versions, 30 days, and 5 GiB when enabled.
+- `checkpoints`: optional APFS checkpoint `Policy`, disabled by default with a
+  maximum of 64 local records. This is separate from resumable transfer checkpoints.
 
 The following sections describe these objects. Transfer rate limits, job
 concurrency, and MCP local roots are not `config.json` fields.
@@ -149,7 +154,7 @@ still returns its result. Expired receipts are pruned when a new change is
 saved. Do not clear receipts to bypass the limit or retry an expired ID.
 
 Removal refuses profiles with unfinished upload jobs, any cached files,
-configured Finder domains, retained download transfers, or open/prepared
+configured Finder domains, retained file history, retained download transfers, or open/prepared
 repository transactions. Finish or cancel uploads, unpin and prune cache,
 unregister and remove domains, and recover or explicitly discard retained work
 through the appropriate commands first. Invalid or unrecognized retained
@@ -345,6 +350,61 @@ is an individual conflict decision that preserves the local recovery snapshot;
 it is **not** an allowed persistent automatic policy. Policies apply to Smart
 content conflicts, not automatic overwriting in ordinary `sync`.
 
+## history: HistoryConfig and HistoryPolicy
+
+`history` controls local, account-bound file history. It does not change the
+older server-side `policies.versions` format or the completion-event log.
+
+- `default`: a `HistoryPolicy` used when a connection has no override.
+- `profiles`: a map of connection names to complete `HistoryPolicy` overrides,
+  defaulting to `{}`. An override replaces the default policy as a whole.
+
+Every history policy has four fields:
+
+- `enabled`: a boolean, defaulting to `false`. When true, supported destructive
+  operations preserve verified before-images before publication. Turning it off
+  stops future automatic capture without silently clearing existing content.
+- `keep`: integer versions per item, defaulting to `20`, within `1..=100000`.
+- `max_age_days`: integer days, defaulting to `30`, within `1..=36500`.
+- `max_bytes`: a positive unsigned byte limit or `null`, defaulting to
+  `5368709120` (5 GiB). `null` means unlimited; zero is rejected. This budget is
+  independent of the clean-cache limit. Prepared or unresolved recovery entries
+  stay protected, so actual disk use can temporarily exceed the retention target.
+
+Use `history config --profile NAME` for a connection override, or omit
+`--profile` for the default policy. `--enabled true|false`, `--keep`,
+`--max-age-days`, and `--max-bytes` set the corresponding fields. `--unlimited`
+sets `max_bytes` to `null` and conflicts with `--max-bytes`. Finder's history
+settings update the same connection override through the authenticated broker.
+There is no second Finder-only history configuration.
+
+Automatic local capture covers supported Smart mutations, immediate and queued
+`put` overwrites, `rm`, and guarded `cp`/`mv` overwrite destinations. Explicit
+legacy version restores force preservation of the current target before
+replacement. Ordinary `sync`/`watch` retain remote before-images before guarded
+file overwrites and propagated remote file deletions. Local synchronization
+recovery keeps its existing local `.rdrive-versions` behavior. Ordinary sync
+does not propagate directory deletion. Raw native mounts and writes from other
+clients are outside this automatic local history path. Metadata and remote
+publication must still meet their normal revision conditions. See
+[file history and recovery](../HISTORY.md).
+
+## checkpoints: optional APFS Policy
+
+- `enabled`: a boolean, defaulting to `false`. Enables explicit checkpoint
+  creation on a compatible macOS APFS volume. Changing this setting does not
+  create or mount a snapshot.
+- `max_records`: integer local records, defaulting to `64`, within `1..=4096`.
+  This limit does not request deletion of Time Machine or other system snapshots.
+
+Use `checkpoint config --enabled true|false --max-records N`. Creation and
+read-only payload recovery may require explicit `--authorize`. Status and list
+operations do not create snapshots. macOS may reclaim a recorded snapshot;
+availability is checked rather than assumed. Recovery exports verified payloads
+to new paths and never restores old queue/database state over the live state.
+Forgetting a local checkpoint record leaves the OS snapshot untouched. See
+[optional APFS checkpoints](../HISTORY.md#optional-apfs-checkpoints).
+
 ## Complete credential-free JSON example
 
 This parseable `config.json` example includes every default field, WebDAV and
@@ -416,6 +476,26 @@ manual migration.
         "conflicts": null
       }
     }
+  },
+  "history": {
+    "default": {
+      "enabled": false,
+      "keep": 20,
+      "max_age_days": 30,
+      "max_bytes": 5368709120
+    },
+    "profiles": {
+      "dav": {
+        "enabled": true,
+        "keep": 20,
+        "max_age_days": 30,
+        "max_bytes": 5368709120
+      }
+    }
+  },
+  "checkpoints": {
+    "enabled": false,
+    "max_records": 64
   }
 }
 ```

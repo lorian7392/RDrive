@@ -410,6 +410,7 @@ enum NativeTests {
         try ProviderCoverageTests.run(paths, bridge)
         try BudgetCoverageTests.run(paths, bridge)
         try UICoverageTests.run(paths, bridge)
+        try HistoryCoverageTests.run(paths, bridge)
         try CompanionCoverageTests.run(paths, bridge)
         var raw: [String: Any] = ["id": "stable-uuid", "parent_id": "root", "name": "notes.txt", "kind": "file", "size": 19,
             "modified": "2026-11-09T12:00:00.123Z", "content_version": "content-A", "metadata_version": "meta-A", "pinned": true,

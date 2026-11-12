@@ -55,6 +55,8 @@ fn read_config(mut file: impl Read) -> Result<Config> {
     config.index.validate()?;
     config.filters.validate()?;
     config.policies.validate()?;
+    config.history.validate()?;
+    config.checkpoints.validate()?;
     for profile in config.profiles.values() { config::validate_profile(profile)?; }
     Ok(config)
 }

@@ -206,6 +206,16 @@ Read recovery authenticates under the same identity/encryption policy, tries dur
 
 Client restart uses application download checkpoints; protocol durable tokens are not persisted. These features do not provide persistent CA handles, transparent failover, retained durable state after server restart, or power-loss guarantees. Diagnostics distinguish requests, grants, reconnect, verified reopen, and authentication failures. See [SMB lifecycle](SMB_LIFECYCLE.md).
 
+## Local file history and Finder recovery
+
+Optional per-connection history preserves verified before-images before supported replacements and deletions, independently of clean-cache eviction. Retained files and directory trees are account-bound, and recorded item identities and aliases preserve supported rename continuity. Prepared entries remain protected until publication is durably confirmed. Defaults are 20 versions, 30 days, and 5 GiB when enabled; existing configurations default to disabled.
+
+Supported Smart changes, `put` and queued overwrites, explicit deletion, copy/move overwrite destinations, and guarded remote file overwrites/deletions from ordinary `sync`/`watch` use this history. Local synchronization recovery keeps its existing local `.rdrive-versions` behavior.
+
+Finder **View File History…** provides paged entries, read-only preview, verified export to a new destination, restore as a copy, and explicitly confirmed file replacement. Replacement plans bind the selected entry and observed current revision; newer changes stop a stale replacement. Directory recovery creates a copy. Shared history settings are configurable through the program.
+
+Optional macOS APFS checkpoints retain local state payloads on compatible volumes. They verify actual system snapshot identities and export selected verified payloads without replaying old queues or replacing the live database. System-managed snapshots may disappear; forgetting a local record does not remove the snapshot. See [file history and recovery](HISTORY.md) for scope, limits, and recovery procedures.
+
 ## Remote recovery markers and versions
 
 Protected SMB overwrite can retain `.rdrive-backup-<UUID>` and `.rdrive-recovery-<UUID>.json`, with a completion marker after publication. Sync excludes them and `.rdrive-upload-*` / `.rdrive-copy-*`.

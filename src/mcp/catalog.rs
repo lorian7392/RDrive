@@ -138,7 +138,7 @@ impl Tool {
                     {
                         bail!("direction must be push, pull, or both");
                     }
-                    if matches!(field.kind, Kind::Remote) {
+                    if matches!(field.kind, Kind::Remote) || field.name=="payload" {
                         crate::backend::normalize(text)?;
                     }
                     if field.name == "profile"
@@ -183,6 +183,7 @@ impl Tool {
         if let Some(strategy)=args.get("conflicts").and_then(Value::as_str) {if !["stop","keep-both","replace"].contains(&strategy){bail!("invalid conflict strategy");}}
         if let Some(kind)=args.get("kind").and_then(Value::as_str) {if !["file","directory"].contains(&kind){bail!("kind must be file or directory");}}
         if args.get("page_size").and_then(Value::as_u64).is_some_and(|n|n==0||n>1000){bail!("page_size must be 1..1000");}
+        if args.get("max_age_days").and_then(Value::as_u64).is_some_and(|n|n==0||n>36500){bail!("max_age_days must be 1..36500");}
         Ok(())
     }
     pub fn argv(&self, arguments: &Value) -> Vec<String> {
@@ -436,6 +437,24 @@ pub fn catalog() -> Vec<Tool> {
         vec![n("limit", "--limit")],
         false
     );
+    tool!("history_files","List account-bound retained file versions, with confirmation state and pagination.",&["history","files"],vec![p(),Field::positional("remote",Remote,false),Field::option("item_id",String,"--item-id"),n("offset","--offset"),n("page_size","--page-size")],false);
+    tool!("history_status","Inspect local history policy, retained bytes and prepared recovery versions.",&["history","status"],vec![p()],false);
+    tool!("history_export","Export a checksum-verified history version to a new local path, never overwriting existing data.",&["history","export"],vec![p(),Field::positional("version",String,true),l()],true);
+    tool!("history_import","Import verified local recovery content as a new account-bound history entry.",&["history","import"],vec![p(),r(),l(),Field::option("request_id",String,"--request-id")],true);
+    tool!("history_config","Set retention limits for global or per-profile history. Enable/disable uses explicit separate tools.",&["history","config"],vec![Field::option("profile",String,"--profile"),n("keep","--keep"),n("max_age_days","--max-age-days"),n("max_bytes","--max-bytes"),b("unlimited","--unlimited")],true);
+    tool!("history_enable","Enable local before-images for guarded destructive operations.",&["history","config","--enabled","true"],vec![Field::option("profile",String,"--profile")],true);
+    tool!("history_disable","Disable future automatic captures; retained history is preserved.",&["history","config","--enabled","false"],vec![Field::option("profile",String,"--profile")],true);
+    tool!("history_restore_prepare","Preview restoring a new copy (default) or a guarded replacement. Does not write remote files.",&["history","restore"],vec![p(),Field::positional("version",String,true),Field::option("to",Remote,"--to"),b("replace","--replace")],true);
+    tool!("history_restore_apply","Apply an explicitly reviewed saved plan. Current replacement contents are preserved first; stale revisions stop.",&["history","restore"],vec![p(),Field::positional("version",String,true),Field{required:true,..Field::option("plan",String,"--plan")},b("apply","--apply")],true);
+    tool!("history_prune","Preview retention cleanup by default. Apply preserves prepared/inflight recovery content.",&["history","prune"],vec![p(),b("apply","--apply")],true);
+    tool!("history_clear","Preview clearing confirmed unprotected history. Does not clear Smart pending edits or checkpoints.",&["history","clear"],vec![p(),b("apply","--apply")],true);
+    tool!("checkpoint_status","Read optional APFS checkpoint capabilities without creating or mounting a snapshot.",&["checkpoint","status"],vec![],false);
+    tool!("checkpoint_list","List owned local checkpoint records and current OS snapshot availability.",&["checkpoint","list"],vec![],false);
+    tool!("checkpoint_inspect","Inspect a checkpoint manifest and payload export eligibility. State databases cannot be restored.",&["checkpoint","inspect"],vec![id()],false);
+    tool!("checkpoint_create","Create and verify an enabled local OS checkpoint; authorization and platform failures are explicit.",&["checkpoint","create"],vec![],true);
+    tool!("checkpoint_export","Export one verified checkpoint payload to a new local path; never restores the state database.",&["checkpoint","export"],vec![id(),Field::positional("payload",String,true),l()],true);
+    tool!("checkpoint_reconcile","Verify an actual read-only snapshot after an interrupted creation command.",&["checkpoint","reconcile"],vec![id()],true);
+    tool!("checkpoint_forget","Preview forgetting only an owned local record; macOS snapshots are never deleted.",&["checkpoint","forget"],vec![id(),b("apply","--apply")],true);
     tool!(
         "smart_status",
         "Inspect Smart domains, durable edits and shared cache accounting.",

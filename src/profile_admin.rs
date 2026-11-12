@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::Read, os::unix::fs::{MetadataExt, OpenOptionsExt}, path::Path};
 
 mod transport;
-pub use transport::{dispatch, Registration, MAX_REQUEST_BYTES};
+pub use transport::{dispatch, dispatch_history, Registration, MAX_REQUEST_BYTES};
 
 const RETENTION_SECONDS: i64 = 24 * 60 * 60;
 const MAX_FUTURE_SECONDS: i64 = 30;
@@ -18,6 +18,8 @@ const MAX_REFERENCE_BYTES: u64 = 64 * 1024 * 1024;
 pub enum Change {
     Add { name: String, profile: Profile },
     Remove { name: String },
+    HistoryPolicy { profile: Option<String>, policy: crate::history::HistoryPolicy },
+    CheckpointPolicy { policy: crate::checkpoints::Policy },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,10 +58,18 @@ impl Command {
         }
         let expires_at = created.checked_add(RETENTION_SECONDS).context("invalid profile request expiration")?;
         if expires_at <= now { bail!("profile request expired; inspect the saved profiles before issuing a new request"); }
-        let name = match &self.change { Change::Add { name, .. } | Change::Remove { name } => name };
-        if name.is_empty() || name.starts_with('-') || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            bail!("profile name must contain letters, numbers, hyphen or underscore");
+        let name = match &self.change {
+            Change::Add { name, .. } | Change::Remove { name } => Some(name),
+            Change::HistoryPolicy { profile, .. } => profile.as_ref(),
+            Change::CheckpointPolicy { .. } => None,
+        };
+        if let Some(name) = name {
+            if name.is_empty() || name.starts_with('-') || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                bail!("profile name must contain letters, numbers, hyphen or underscore");
+            }
         }
+        if let Change::HistoryPolicy { policy, .. } = &self.change { policy.validate()?; }
+        if let Change::CheckpointPolicy { policy } = &self.change { policy.validate()?; }
         if let Change::Add { profile, .. } = &self.change {
             if profile.password_env.as_ref().is_some_and(|name| name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
                 bail!("invalid credential environment variable name");
@@ -99,7 +109,22 @@ fn apply_with_save(store: &mut Store, command: &Command, now: i64, save: impl Fn
             if !candidate.profiles.contains_key(name) { bail!("unknown profile"); }
             require_removable(store, name)?;
             candidate.profiles.remove(name);
+            candidate.history.profiles.remove(name);
             json!({"removed": name, "request_id": command.request_id})
+        }
+        Change::HistoryPolicy { profile, policy } => {
+            if let Some(name) = profile {
+                if !candidate.profiles.contains_key(name) { bail!("unknown profile"); }
+                candidate.history.profiles.insert(name.clone(), policy.clone());
+            } else {
+                candidate.history.default = policy.clone();
+            }
+            candidate.history.validate()?;
+            json!({"saved":true,"profile":profile,"policy":policy,"request_id":command.request_id})
+        }
+        Change::CheckpointPolicy { policy } => {
+            candidate.checkpoints = policy.clone();
+            json!({"saved":true,"policy":policy,"request_id":command.request_id})
         }
     };
     candidate.profile_admin_receipts.insert(command.request_id.clone(), Receipt { fingerprint, result: result.clone(), expires_at });
@@ -133,6 +158,9 @@ fn read_reference<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 struct Reference { profile: String, phase: String }
 
 fn require_removable(store: &Store, name: &str) -> Result<()> {
+    if !crate::history::list(&store.home,&store.config,name,None,None)?.is_empty() {
+        bail!("profile has retained file history; export or explicitly clear it before removing the connection");
+    }
     if store.db.jobs.iter().any(|job| job.profile == name && !["done", "cancelled"].contains(&job.status.as_str())) {
         bail!("profile has unfinished uploads; finish or cancel them first");
     }
@@ -413,4 +441,19 @@ mod tests {
         let command = Command::new(Change::Add { name: "current".into(), profile: profile() }, None).unwrap();
         assert_eq!(apply(&mut store, &command).unwrap()["saved"], true);
     }
+    #[test]
+    fn retained_history_requires_explicit_cleanup_and_prepared_versions_remain_protected() {
+        let (temp,mut store)=store();apply_at(&mut store,&add("nas"),NOW).unwrap();
+        let source=temp.path().join("before-image");fs::write(&source,b"retained bytes").unwrap();
+        let version=crate::history::capture_import(&store,"nas","file",&source,"history-admin-removal").unwrap();
+        assert!(require_removable(&store,"nas").unwrap_err().to_string().contains("retained file history"));
+        let db=rusqlite::Connection::open(store.home.join("history/history.sqlite3")).unwrap();
+        let manifest:String=db.query_row("SELECT archive FROM entries WHERE id=?1",[&version.id],|row|row.get(0)).unwrap();let mut manifest:Value=serde_json::from_str(&manifest).unwrap();manifest["public"]["state"]=json!("prepared");
+        db.execute("UPDATE entries SET state='prepared',archive=?1 WHERE id=?2",rusqlite::params![serde_json::to_string(&manifest).unwrap(),version.id]).unwrap();
+        assert_eq!(crate::history::clear(&store,"nas",true).unwrap()["protected_prepared"],1);
+        assert!(apply_at(&mut store,&remove("nas"),NOW+1).unwrap_err().to_string().contains("retained file history"));
+        crate::history::confirm(&store,"nas",&version.id,None).unwrap();assert_eq!(crate::history::clear(&store,"nas",true).unwrap()["removed"],1);drop(db);
+        assert_eq!(apply_at(&mut store,&remove("nas"),NOW+2).unwrap()["removed"],"nas");
+    }
+
 }

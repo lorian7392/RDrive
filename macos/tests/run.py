@@ -23,7 +23,7 @@ PRODUCTION_SOURCES = [
     "Shared/Bridge.swift", "Shared/TagData.swift", "Shared/NativeBudget.swift",
     "FileProvider/ProviderItem.swift", "FileProvider/Enumerator.swift", "FileProvider/Provider.swift",
     "Companion/DomainWatcher.swift", "Companion/main.swift", "FinderSync/FinderSync.swift",
-    "FileProviderUI/StatusViewController.swift",
+    "FileProviderUI/StatusViewController.swift", "FileProviderUI/HistoryViewController.swift",
 ]
 TESTED_SOURCES = [source for source in PRODUCTION_SOURCES if source != "Companion/main.swift"]
 
@@ -82,7 +82,7 @@ def export_coverage(output, binary, objects, profiles, tested_sources, safe_cont
     count = sum(value["count"] for value in lines)
     covered = sum(value["covered"] for value in lines)
     summary = {
-        "scope": "All ten first-party native Swift production sources; tests are excluded",
+        "scope": "All first-party native Swift production sources; tests are excluded",
         "production_sources": len(PRODUCTION_SOURCES),
         "instrumented_sources": len(PRODUCTION_SOURCES) - len(missing),
         "not_instrumented": missing,
@@ -104,7 +104,7 @@ def export_coverage(output, binary, objects, profiles, tested_sources, safe_cont
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--coverage", action="store_true", help="Collect actual LLVM coverage with all ten production Swift files in scope")
+    parser.add_argument("--coverage", action="store_true", help="Collect actual LLVM coverage with all production Swift files in scope")
     parser.add_argument("--output-dir", type=Path, default=ROOT.parent / "target/native-tests", help="Isolated build/report directory (default: target/native-tests)")
     options = parser.parse_args()
     output = options.output_dir.resolve()

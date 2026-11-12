@@ -116,6 +116,18 @@ pub async fn run_with_metadata(
     options: &SyncOptions,
     metadata: bool,
 ) -> Result<SyncReport> {
+    run_with_context(backend,local,remote,baseline_path,options,metadata,None).await
+}
+
+/// Opt in to account-bound before-images for remote overwrite/deletion. Existing
+/// local backup and conflict-plan safeguards remain part of the same engine.
+pub async fn run_with_history(store:&crate::state::Store,backend:&dyn Backend,profile:&str,local:&Path,remote:&str,baseline_path:&Path,options:&SyncOptions,metadata:bool)->Result<SyncReport> {
+    run_with_context(backend,local,remote,baseline_path,options,metadata,Some((store,profile))).await
+}
+async fn run_with_context(
+    backend:&dyn Backend,local:&Path,remote:&str,baseline_path:&Path,options:&SyncOptions,metadata:bool,
+    history:Option<(&crate::state::Store,&str)>,
+)->Result<SyncReport> {
     let root = LocalRoot::open(local)?;
     let remote = normalize(remote)?;
     if internal(&remote) {
@@ -341,6 +353,10 @@ pub async fn run_with_metadata(
                 let expected_local = p.local.as_ref().context("upload has no source")?;
                 let stage = root.stage()?;
                 root.snapshot(path, expected_local, &stage.path)?;
+                let request=crate::state::key(&serde_json::to_string(&("sync-upload",baseline_path,&p.action,&p.local,&p.remote))?);
+                if let (Some((store,profile)),Some(expected))=(history,p.remote.as_ref()) {
+                    crate::history::capture(store,backend,profile,&remote_file,None,"overwrite",&request,expected,false).await?;
+                }
                 let condition = match p.remote {
                     Some(e) => WriteCondition::Match(e),
                     None => WriteCondition::CreateNew,
@@ -363,6 +379,7 @@ pub async fn run_with_metadata(
                 {
                     bail!("uploaded revision could not be confirmed: {path}");
                 }
+                if let Some((store,profile))=history {crate::history::confirm_request(store,profile,&request,None)?;let _=crate::history::prune(store,profile,true);}
                 confirmed.insert(
                     path.clone(),
                     Pair {
@@ -447,7 +464,10 @@ pub async fn run_with_metadata(
             }
             ActionKind::DeleteRemote => {
                 let old = p.remote.as_ref().context("delete has no remote source")?;
-                delete_remote_file(backend, &remote_file, old).await?;
+                if let Some((store,profile))=history.filter(|(store,profile)|store.config.history.effective(profile).enabled) {
+                    let request=crate::state::key(&serde_json::to_string(&("sync-delete",baseline_path,&remote_file,old))?);
+                    crate::history::recycle_checked(store,backend,profile,&remote_file,false,&request,Some(old)).await?;
+                }else{delete_remote_file(backend, &remote_file, old).await?;}
                 if backend.stat(&remote_file).await?.is_some() {
                     bail!("remote delete was not confirmed: {path}");
                 }
@@ -560,12 +580,15 @@ fn internal(path: &str) -> bool {
                 p.strip_prefix(*prefix)
                     .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
             })
+            || p.strip_prefix(".rdrive-trash-").is_some_and(|id|uuid::Uuid::parse_str(id).is_ok()||history_identity(id))
+            || p.strip_prefix(".rdrive-history-restore-").is_some_and(history_identity)
             || recovery_name(p)
             || p.strip_prefix(".rdrive-recovery-done-")
                 .and_then(|id| id.strip_suffix(".json"))
                 .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
     })
 }
+fn history_identity(value:&str)->bool {value.len()==64&&value.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))}
 fn recovery_name(name: &str) -> bool {
     name.strip_prefix(".rdrive-recovery-")
         .and_then(|id| id.strip_suffix(".json"))
@@ -3702,5 +3725,14 @@ mod tests {
         assert!(!local.join("file").exists());
         assert!(!baseline.exists());
         assert_eq!(backend.bytes("file"), b"remote");
+    }
+}
+
+#[cfg(test)]
+mod history_names_tests {
+    use super::*;
+    #[test]
+    fn recovery_objects_are_reserved_only_for_valid_owned_identifiers(){
+        let hash="a".repeat(64);assert!(internal(&format!("folder/.rdrive-trash-{hash}/file")));assert!(internal(&format!(".rdrive-history-restore-{hash}")));assert!(internal(&format!(".rdrive-trash-{}",uuid::Uuid::new_v4())));assert!(!internal(".rdrive-trash-user-file"));assert!(!internal(".rdrive-history-restore-user-file"));assert!(!history_identity(&"A".repeat(64)));assert!(history_identity(&"0".repeat(64)));
     }
 }

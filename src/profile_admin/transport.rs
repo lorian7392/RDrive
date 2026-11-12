@@ -637,3 +637,99 @@ mod tests {
         drop(listener);
     }
 }
+
+/// Use the same private, home/instance-bound transport for explicit history
+/// decisions. Lost replies never fall back to a second remote mutation.
+pub async fn dispatch_history(home:&Path,command:&crate::history_control::Command,wait:Duration)->Result<Value>{
+    if let Some(value)=crate::history_control::read(home,command)? {return Ok(value);}
+    let home=home_directory(home)?;let deadline=Instant::now().checked_add(wait).context("history timeout is too large")?;
+    loop {
+        if let Some(_registration)=try_registration(home.clone())? {
+            parse_descriptor(&home)?;
+            loop {match crate::history_control::execute(&home,command).await {
+                Err(e) if e.to_string().contains("another rdrive process is using this state directory")=>pause(deadline).await?,
+                result=>return result,
+            }}
+        }
+        if let Some(endpoint)=descriptor(&home)? {
+            let result=tokio::time::timeout_at(deadline,async {
+                let stream=UnixStream::connect(&endpoint.socket).await?;peer(stream.peer_cred()?.uid(),uid())?;
+                let request_id=uuid::Uuid::new_v4().to_string();
+                let request=json!({"v":1,"op":"history_cli","home":endpoint.home,"instance_id":endpoint.instance_id,"request_id":request_id,"command":command});
+                let mut request=serde_json::to_vec(&request)?;request.push(b'\n');if request.len()>MAX_REQUEST_BYTES{bail!("history request exceeds 64 KiB");}
+                let (read,mut write)=stream.into_split();write.write_all(&request).await?;
+                let mut bytes=Vec::new();let mut reader=BufReader::new(read).take(8*1024*1024+1);reader.read_until(b'\n',&mut bytes).await?;
+                if bytes.len()>8*1024*1024||bytes.last()!=Some(&b'\n'){bail!("invalid or oversized history reply; inspect the saved decision before retrying");}
+                reply(&bytes,&endpoint,&request_id)
+            }).await.context("history request timed out; its saved decision is retained")?;
+            return result;
+        }
+        pause(deadline).await.context("history administration is waiting for the background service")?;
+    }
+}
+impl Registration {
+    pub fn parse_history(&self,bytes:&[u8])->Result<(String,crate::history_control::Command)>{
+        #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+        struct Request {v:u32,op:String,home:PathBuf,instance_id:String,request_id:String,command:crate::history_control::Command}
+        if bytes.len()>MAX_REQUEST_BYTES {bail!("history request exceeds 64 KiB");}
+        let req:Request=serde_json::from_slice(bytes)?;
+        if req.v!=1||req.op!="history_cli"||req.home!=self.home||req.instance_id!=self.instance_id||uuid::Uuid::parse_str(&req.request_id)?.to_string()!=req.request_id{bail!("history request does not match this home and service instance");}
+        Ok((req.request_id,req.command))
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::history_control::Command as History;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+    fn fixture()->(tempfile::TempDir,PathBuf,PathBuf){let temp=tempfile::Builder::new().prefix("rdh-").tempdir_in("/private/tmp").unwrap();let home=home_directory(&temp.path().join("home")).unwrap();let ipc=home_directory(&temp.path().join("ipc")).unwrap();(temp,home,ipc.join("bridge.sock"))}
+    fn command()->History{History::Clear{profile:"missing".into(),apply:false}}
+    #[test]
+    fn history_envelope_binds_home_instance_id_and_request_identity(){
+        let (_temp,home,_socket)=fixture();let r=Registration::acquire(&home).unwrap();let value=json!({"v":1,"op":"history_cli","home":r.home(),"instance_id":r.instance_id(),"request_id":uuid::Uuid::new_v4().to_string(),"command":command()});assert!(r.parse_history(&serde_json::to_vec(&value).unwrap()).is_ok());
+        for (field,wrong) in [("v",json!(2)),("op",json!("other")),("home",json!("/tmp/other")),("instance_id",json!("other")),("request_id",json!("invalid"))]{let mut bad=value.clone();bad[field]=wrong;assert!(r.parse_history(&serde_json::to_vec(&bad).unwrap()).is_err());}
+        assert!(r.parse_history(&vec![b' ';MAX_REQUEST_BYTES+1]).is_err());
+    }
+    #[tokio::test]
+    async fn history_dispatch_uses_validated_live_endpoint_and_never_replays_lost_replies(){
+        let (_temp,home,socket)=fixture();let store=Store::open(home.clone()).unwrap();store.save_config().unwrap();drop(store);
+        let registration=Registration::acquire(&home).unwrap();let listener=UnixListener::bind(&socket).unwrap();fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).unwrap();registration.publish(&socket).unwrap();
+        let server=tokio::spawn(async move{for mode in 0..3 {let (mut stream,_)=listener.accept().await.unwrap();let mut bytes=Vec::new();{let mut reader=BufReader::new(&mut stream);reader.read_until(b'\n',&mut bytes).await.unwrap();}let (id,_)=registration.parse_history(&bytes).unwrap();match mode{0=>{let value=registration.reply(&id,&Ok(json!({"served":true})));stream.write_all(format!("{value}\n").as_bytes()).await.unwrap();},1=>{stream.write_all(b"invalid\n").await.unwrap();},_=>{stream.write_all(b"unfinished").await.unwrap();}}}});
+        assert_eq!(dispatch_history(&home,&command(),Duration::from_secs(1)).await.unwrap()["served"],true);
+        assert!(dispatch_history(&home,&command(),Duration::from_secs(1)).await.is_err());
+        assert!(dispatch_history(&home,&command(),Duration::from_secs(1)).await.unwrap_err().to_string().contains("reply"));server.await.unwrap();
+        // A local failure reports the actual command, not a phantom remote success.
+        assert!(dispatch_history(&home,&command(),Duration::from_secs(1)).await.unwrap_err().to_string().contains("profile"));
+        // An endpoint being republished is bounded by the original wait budget.
+        let _registration=Registration::acquire(&home).unwrap();assert!(dispatch_history(&home,&command(),Duration::from_millis(5)).await.is_err());
+    }
+    #[tokio::test]
+    async fn read_queries_do_not_need_an_administration_or_store_lease(){
+        let (_temp,home,_socket)=fixture();let mut store=Store::open(home.clone()).unwrap();store.config.profiles.insert("p".into(),crate::config::Profile{protocol:crate::config::Protocol::Webdav,url:"https://example.invalid/".into(),username:None,password_env:None,keychain_internet:false,allow_http:false,timeout_secs:1,smb_encryption:true,nextcloud_upload_url:None});store.save_config().unwrap();let _registration=Registration::acquire(&home).unwrap();let value=dispatch_history(&home,&History::Status{profile:"p".into()},Duration::from_millis(1)).await.unwrap();assert_eq!(value["entries"],0);
+    }
+    fn profile(home:&Path){let mut store=Store::open(home.to_path_buf()).unwrap();store.config.profiles.insert("p".into(),crate::config::Profile{protocol:crate::config::Protocol::Webdav,url:"https://example.invalid/".into(),username:None,password_env:Some("UNREAD_HISTORY_TRANSPORT_TEST".into()),keychain_internet:false,allow_http:false,timeout_secs:1,smb_encryption:true,nextcloud_upload_url:None});store.save_config().unwrap();}
+    #[tokio::test]
+    async fn local_history_dispatch_waits_for_store_and_never_turns_timeout_into_success(){
+        let (_temp,home,_socket)=fixture();profile(&home);let store=Store::open(home.clone()).unwrap();let waiting=home.clone();let task=tokio::spawn(async move{dispatch_history(&waiting,&History::Clear{profile:"p".into(),apply:false},Duration::from_secs(2)).await});tokio::time::sleep(Duration::from_millis(45)).await;assert!(!task.is_finished());drop(store);assert_eq!(task.await.unwrap().unwrap()["apply"],false);
+        let _store=Store::open(home.clone()).unwrap();assert!(dispatch_history(&home,&History::Clear{profile:"p".into(),apply:false},Duration::from_millis(5)).await.unwrap_err().to_string().contains("timed out"));assert!(dispatch_history(&home,&command(),Duration::MAX).await.unwrap_err().to_string().contains("too large"));
+    }
+    #[tokio::test]
+    async fn live_history_outbound_size_and_reply_deadlines_remain_bounded(){
+        let (_temp,home,socket)=fixture();profile(&home);let registration=Registration::acquire(&home).unwrap();let listener=UnixListener::bind(&socket).unwrap();fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).unwrap();registration.publish(&socket).unwrap();
+        let huge=History::Clear{profile:"x".repeat(MAX_REQUEST_BYTES),apply:false};assert!(dispatch_history(&home,&huge,Duration::from_secs(1)).await.unwrap_err().to_string().contains("64 KiB"));let (first,_)=listener.accept().await.unwrap();drop(first);
+        let server=tokio::spawn(async move{let (mut stream,_)=listener.accept().await.unwrap();let mut bytes=vec![];BufReader::new(&mut stream).read_until(b'\n',&mut bytes).await.unwrap();tokio::time::sleep(Duration::from_millis(100)).await;drop(stream);drop(registration);});assert!(dispatch_history(&home,&command(),Duration::from_millis(20)).await.unwrap_err().to_string().contains("saved decision is retained"));server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn oversized_history_reply_and_mismatched_receipt_are_not_replayed_locally(){
+        let (temp,home,socket)=fixture();profile(&home);let store=Store::open(home.clone()).unwrap();let source=temp.path().join("retained");fs::write(&source,b"preserved history").unwrap();crate::history::capture_import(&store,"p","file",&source,"retained").unwrap();drop(store);let registration=Registration::acquire(&home).unwrap();let listener=UnixListener::bind(&socket).unwrap();fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).unwrap();registration.publish(&socket).unwrap();
+        let server=tokio::spawn(async move{for mode in 0..2{let (mut stream,_)=listener.accept().await.unwrap();let mut bytes=vec![];BufReader::new(&mut stream).read_until(b'\n',&mut bytes).await.unwrap();let (id,_)=registration.parse_history(&bytes).unwrap();if mode==0{let _=stream.write_all(&vec![b'x';8*1024*1024+1]).await;}else{let mut value=registration.reply(&id,&Ok(json!({"wrong":true})));value["request_id"]=json!(uuid::Uuid::new_v4().to_string());stream.write_all(format!("{value}\n").as_bytes()).await.unwrap();}}});
+        assert!(dispatch_history(&home,&History::Clear{profile:"p".into(),apply:true},Duration::from_secs(2)).await.unwrap_err().to_string().contains("oversized"));assert!(dispatch_history(&home,&command(),Duration::from_secs(1)).await.unwrap_err().to_string().contains("does not match"));server.await.unwrap();let config=crate::client_read::config(&home).unwrap();assert_eq!(crate::history::list(&home,&config,"p",None,None).unwrap().len(),1);
+    }
+    #[test]
+    fn history_wire_rejects_unknown_fields_noncanonical_uuid_and_bad_json(){
+        let (_temp,home,_socket)=fixture();let r=Registration::acquire(&home).unwrap();let mut value=json!({"v":1,"op":"history_cli","home":r.home(),"instance_id":r.instance_id(),"request_id":"154108C8-1CBB-4FAE-81F4-C6C53161F2AE","command":command()});assert!(r.parse_history(&serde_json::to_vec(&value).unwrap()).unwrap_err().to_string().contains("does not match"));value["request_id"]=json!(uuid::Uuid::new_v4().to_string());value["extra"]=json!(true);assert!(r.parse_history(&serde_json::to_vec(&value).unwrap()).is_err());assert!(r.parse_history(b"not json").is_err());
+    }
+
+}

@@ -41,6 +41,7 @@ See [features and limitations](FEATURES.md) for protocol differences, overwrite 
 
 ## Find an answer
 
+- **History and recovery:** [retained file versions, Finder recovery, and optional APFS checkpoints](HISTORY.md).
 - **File availability:** [cache limits, clearing, and migration](CACHE_MANAGEMENT.md); [Smart operations and recovery](SMART_OPERATIONS.md).
 - **Browsing and discovery:** [SQLite indexing and incremental refresh](DIRECTORY_INDEXING.md), including local index search.
 - **Native integration:** [macOS companion and extensions](MACOS_INTEGRATION.md); [SMB notifications and handle recovery](SMB_LIFECYCLE.md).

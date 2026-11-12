@@ -80,7 +80,7 @@ def main():
     namespace_policy = namespace_policy_supported(flags)
     if namespace_policy:
         flags += ["-D", "RDRIVE_HAS_NAMESPACE_POLICY"]
-    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "26", "CFBundleShortVersionString": "0.8.3",
+    base = {"CFBundleDevelopmentRegion": "en", "CFBundleVersion": "27", "CFBundleShortVersionString": "0.8.3",
             "LSMinimumSystemVersion": "13.0", "RDriveAppGroup": app_group}
     if development_root:
         base.pop("RDriveAppGroup")
@@ -109,7 +109,7 @@ def main():
         ("RDriveProvider", "io.rdrive.native.provider", "RDriveProvider", "com.apple.fileprovider-nonui",
          [ROOT / "FileProvider/ProviderItem.swift", ROOT / "FileProvider/Enumerator.swift", ROOT / "FileProvider/Provider.swift"]),
         ("RDriveStatus", "io.rdrive.native.status", "RDriveStatusViewController", "com.apple.fileprovider-actionsui",
-         [ROOT / "FileProviderUI/StatusViewController.swift"]),
+         [ROOT / "FileProviderUI/StatusViewController.swift", ROOT / "FileProviderUI/HistoryViewController.swift"]),
     ]:
         bundle = app / ("Contents/PlugIns/" + name + ".appex")
         executable = bundle / ("Contents/MacOS/" + name)
@@ -149,14 +149,18 @@ def main():
                 "NSExtensionFileProviderActionIdentifier": "rdrive.repair", "NSExtensionFileProviderActionName": "Repair Sync Issue…",
                 "NSExtensionFileProviderActionActivationRule": "fileproviderItems.@count == 1 AND "
                 "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdriveSmart == YES AND $item.userInfo.rdriveState IN {'conflict', 'blocked', 'queued', 'error'} "
-                "AND $item.contentType.identifier == 'public.folder').@count == 1"}]
+                "AND $item.contentType.identifier == 'public.folder').@count == 1"}, {
+                "NSExtensionFileProviderActionIdentifier": "rdrive.history", "NSExtensionFileProviderActionName": "View File History…",
+                "NSExtensionFileProviderActionActivationRule": "fileproviderItems.@count == 1 AND "
+                "SUBQUERY(fileproviderItems, $item, $item.userInfo.rdriveSmart == YES).@count == 1"}]
         plist(bundle / "Contents/Info.plist", dict(base, CFBundleIdentifier=identifier, CFBundleName=name,
             CFBundleExecutable=name, CFBundlePackageType="XPC!", NSExtension=extension))
         run(*flags, "-module-name", name, "-application-extension", "-parse-as-library", *shared, *sources,
             "-framework", "Foundation", "-framework", "AppKit", "-framework", "FinderSync", "-framework", "FileProvider",
             "-framework", "UniformTypeIdentifiers", "-framework", "FileProviderUI", "-Xlinker", "-e", "-Xlinker", "_NSExtensionMain", "-o", executable)
         extension_entitlements = output / (name + ".entitlements")
-        plist(extension_entitlements, dict(entitlements, **{"com.apple.security.app-sandbox": True, "com.apple.security.network.client": True}))
+        plist(extension_entitlements, dict(entitlements, **{"com.apple.security.app-sandbox": True, "com.apple.security.network.client": True,
+              **({"com.apple.security.files.user-selected.read-write": True} if framework == "com.apple.fileprovider-actionsui" else {})}))
         run("codesign", "--force", "--sign", options.identity, "--entitlements", extension_entitlements, bundle)
     run("codesign", "--force", "--sign", options.identity, resources / "rdrive")
     run("codesign", "--force", "--sign", options.identity, "--entitlements", host_entitlements, app)
@@ -166,7 +170,7 @@ def main():
         shutil.rmtree(final_app)
     app.rename(final_app)
     build_root.rmdir()
-    report = {"app": str(final_app), "version": "0.8.3", "bundle_build": "26", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
+    report = {"app": str(final_app), "version": "0.8.3", "bundle_build": "27", "sdk": sdk, "architecture": architecture, "identity": options.identity, "team_id": options.team_id,
               "app_group": None if development_root else app_group, "development_ipc_root": str(development_root) if development_root else None,
               "distribution_ready": options.identity != "-" and development_root is None, "installed": False, "activated": False,
               "signing_status": "ad-hoc review build; no Developer Team identity" if options.identity == "-" else "signed with requested identity"}

@@ -41,7 +41,7 @@ Corresponding MCP tools are `rdrive_download`, `rdrive_upload`, `rdrive_queue_li
 
 For interrupted uploads, inspect queue records before submitting the same content again. For download checkpoints, use `rdrive_transfers` or `rdrive transfers list`. Read [transfer and mount details](references/transfers-and-mounts.md) when continuing interrupted work, retrying an uncertain overwrite, or mounting storage.
 
-`rdrive_url` / `rdrive url` returns a location URL; it does not create a public sharing link. File versions use `rdrive_versions_list`, `rdrive_versions_save`, `rdrive_versions_restore`, and `rdrive_versions_prune`; pruning is a plan unless apply is explicitly selected. Version storage is on the same remote server, not an independent backup.
+`rdrive_url` / `rdrive url` returns a location URL; it does not create a public sharing link. File versions use `rdrive_versions_list`, `rdrive_versions_save`, `rdrive_versions_restore`, and `rdrive_versions_prune`; pruning is a plan unless apply is explicitly selected. Version storage is on the same remote server, not an independent backup. Account-bound local file history is separate: `rdrive_history_status/files` inspect retained contents; `rdrive_history_export` saves a verified new local copy. Use the Smart recovery workflow for previewed restore plans and optional local APFS payload recovery.
 
 ## Credentials and results
 

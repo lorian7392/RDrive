@@ -213,6 +213,18 @@ async fn run_job_with_event(store: &mut Store, backend: &dyn Backend, id: &str, 
             store.db.jobs[index].version_prepared = true;
             store.save()?;
         }
+        if store.config.history.effective(&job.profile).enabled {
+            if let Some(current)=backend.stat(&job.remote).await? {
+                match store.db.jobs[index].condition() {
+                    WriteCondition::CreateNew=>(),
+                    WriteCondition::Match(ref expected) if !expected.same_revision(&current)=>bail!("version_conflict: queued upload source changed before history capture"),
+                    _=>{crate::history::capture(store,backend,&job.profile,&job.remote,None,"overwrite",&job.id,&current,false).await?;store.db.jobs[index].expected=Some(current);store.save()?;}
+                }
+            }else if store.db.jobs[index].overwrite&&store.db.jobs[index].expected.is_none(){
+                // An absent target must stay absent until the checked publish.
+                store.db.jobs[index].overwrite=false;store.save()?;
+            }
+        }
         let condition = store.db.jobs[index].condition();
         if job.resume {
             let checkpoint = store
@@ -231,6 +243,8 @@ async fn run_job_with_event(store: &mut Store, backend: &dyn Backend, id: &str, 
         Ok(entry) => {
             store.db.jobs[index].status = "done".into();
             store.save()?;
+            crate::history::confirm_request(store,&job.profile,&job.id,None)?;
+            let _=crate::history::prune(store,&job.profile,true);
             fs::remove_file(source)?;
             event(store,
                 "upload",
@@ -539,17 +553,13 @@ pub async fn restore(
         if state::fingerprint(&temp)? != version.sha256 {
             bail!("version content checksum mismatch; destination was preserved");
         }
-        backend
-            .upload(
-                &temp,
-                &version.path,
-                if overwrite {
-                    WriteCondition::Any
-                } else {
-                    WriteCondition::CreateNew
-                },
-            )
-            .await
+        let condition=if overwrite {
+            if let Some(current)=backend.stat(&version.path).await? {
+                archive_expected_at(&store.home,backend,&version.path,&current,&format!("restore-{}",uuid::Uuid::new_v4())).await?;
+                WriteCondition::Match(current)
+            }else{WriteCondition::CreateNew}
+        }else{WriteCondition::CreateNew};
+        backend.upload(&temp,&version.path,condition).await
     }
     .await;
     let _ = fs::remove_file(temp);

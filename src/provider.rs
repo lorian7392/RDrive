@@ -13,6 +13,8 @@ mod resolution;
 mod transfers;
 mod admin;
 mod background_index;
+mod history;
+pub(crate) fn history_replacement_guard(home:&Path,config:&config::Config,profile:&str,target:&str)->Result<()>{history::replacement_guard(home,config,profile,target)}
 pub use resolution::{refresh_stale_smart_directory, resolve_smart, smart_repair_status, repair_stale_smart_directory};
 #[async_trait::async_trait]
 trait Connector: Send + Sync {
@@ -50,6 +52,12 @@ pub struct Request {
     pub v:u32,pub op:String,#[serde(default)]pub domain:String,#[serde(default)]pub id:Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_id: Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub version_id:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub plan_id:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub mode:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub offset:Option<usize>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub page_size:Option<usize>,
+    #[serde(default,skip_serializing_if="Option::is_none")]pub history_policy:Option<crate::history::HistoryPolicy>,
     #[serde(default)]pub request_id:Option<String>,#[serde(default)]pub parent_id:Option<String>,#[serde(default)]pub name:Option<String>,
     #[serde(default)]pub kind:Option<String>,#[serde(default)]pub content_path:Option<PathBuf>,#[serde(default)]pub tag_data_hex:Option<String>,
     #[serde(default)]pub extended_attributes:Option<BTreeMap<String,String>>,
@@ -591,7 +599,7 @@ fn chained_request(store:&Store,d:&Domain,queue:&crate::smart::Queue,mutation:&c
     let mut req:Request=if let Some(plan)=&mutation.resolution{serde_json::from_value(plan.request.clone())?}else if let Some(saved)=j.smart_replays.get(&mutation.id){saved.clone()}else{serde_json::from_value(mutation.request.clone())?};
     let key=if req.op=="create"{format!("create:{}",req.client_item_id.as_deref().context("create identity missing")?)}else{req.request_id.clone().context("request identity missing")?};
     let key=format!("{}:{key}",state::key(&d.id));
-    if let Some(response)=j.requests.get(&key).and_then(|p|p.response.clone()){return Ok((req,Some(response)));}
+    if let Some(response)=j.requests.get(&key).and_then(|p|p.response.clone()){if !d.repository{crate::history::confirm_request(store,&d.profile,&key,None)?;}return Ok((req,Some(response)));}
     if mutation.resolution.is_some(){j.smart_replays.insert(mutation.id.clone(),req.clone());save_journal(store,&d.id,&j)?;return Ok((req,None));}
     if j.smart_replays.contains_key(&mutation.id){return Ok((req,None));}
     let previous=queue.list().into_iter().filter(|m|m.sequence<mutation.sequence&&m.state==crate::smart::MutationState::Done).collect::<Vec<_>>();
@@ -663,6 +671,7 @@ async fn replay(home:&Path,staging:&Path,fd:&File,d:&Domain,queue:&mut crate::sm
 }
 pub async fn process(home:&Path,staging:&Path,fd:&File,req:Request,context:crate::transfer::TransferContext)->Result<Value> {
     if req.v!=1{bail!("unsupported bridge protocol version");}
+    if ["history_list","history_export","history_config","history_restore_prepare","history_restore"].contains(&req.op.as_str()){return history::process(home,staging,&req).await;}
     if ["domains","status","resolve","cache_budget"].contains(&req.op.as_str()){return quick(home,&req);}
     if req.op=="transfer_status"{return transfers::status(home,&req.domain);}
     if req.op == "smart_repair_status" {
@@ -966,7 +975,7 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
     }
     let metadata_fingerprint=metadata.as_ref().map(|m|m.fingerprint()).transpose()?;
     let fingerprint=state::key(&serde_json::to_string(&(&req.op,&req.domain,&req.id,&req.parent_id,&req.name,&req.kind,&req.base_content_version,&req.base_metadata_version,&req.tag_data_hex,&req.extended_attributes,&metadata_fingerprint,req.recursive))?);
-    if let Some(p)=j.requests.get(&key){if p.fingerprint!=fingerprint{bail!("version_conflict: replayed request differs");}if let Some(response)=&p.response{return Ok(response.clone());}}
+    if let Some(p)=j.requests.get(&key){if p.fingerprint!=fingerprint{bail!("version_conflict: replayed request differs");}if let Some(response)=&p.response{if !d.repository{crate::history::confirm_request(&store,&d.profile,&key,None)?;}return Ok(response.clone());}}
     // A successful delete removes the very item needed by normal dispatch.
     // Reconcile its saved immutable transaction before looking up that item;
     // never issue another delete against a replacement at the old pathname.
@@ -982,8 +991,9 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
     }
     if !d.repository&&req.op=="delete"&&!j.items.contains_key(id) {
         if let Some(pending)=j.requests.get(&key) {
-            if let (Some(path),Some(_expected))=(&pending.deletion_path,&pending.deletion_expected) {
+            if let (Some(path),Some(expected))=(&pending.deletion_path,&pending.deletion_expected) {
                 if j.items.values().any(|r|r.path==*path)||b.stat_metadata(&remote(&d,path)?).await?.is_some(){bail!("version_conflict: a replacement occupies the deleted item's path; it was preserved");}
+                if store.config.history.effective(&d.profile).enabled{crate::history::recycle_checked(&store,b.as_ref(),&d.profile,&remote(&d,path)?,false,&key,Some(expected)).await?;}
                 let response=json!({});j.requests.get_mut(&key).unwrap().response=Some(response.clone());save_journal(&store,&d.id,&j)?;return Ok(response);
             }
         }
@@ -1016,7 +1026,7 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
         if let (Some(activity),Some(metadata),Some(source))=(activity,metadata.as_ref(),source.as_ref()) {activity.bind(repository::object_path(&d.remote,&metadata.content_sha256)?,fs::metadata(source)?.len());}
         let committed=repository::commit(&store,b.as_ref(),&tx_id).await?;if req.op!="delete"{let entry=committed.commit.entries.get(&target).context("committed item missing")?;response_id=Some(entry.id.clone());committed_target=Some(serde_json::to_value(entry)?);}
     }else {
-        if req.op=="delete" {let record=existing.as_ref().unwrap();if record.item.kind=="directory"{bail!("unsupported: directory deletion requires recoverable namespace mode");}let path=remote(&d,&record.path)?;let observed=b.stat_metadata(&path).await?.context("no_such_item")?;if !record.entry.as_ref().is_some_and(|cached|cached.same_revision(&observed)){bail!("version_conflict: delete source metadata changed");}let expected=if let Some(strong)=&record.strong{strong.clone()}else{b.stat(&path).await?.context("no_such_item")?};j.requests.get_mut(&key).unwrap().deletion_expected=Some(expected.clone());save_journal(&store,&d.id,&j)?;b.remove_checked(&path,&expected).await?;}
+        if req.op=="delete" {let record=existing.as_ref().unwrap();if record.item.kind=="directory"{bail!("unsupported: directory deletion requires recoverable namespace mode");}let path=remote(&d,&record.path)?;let observed=b.stat_metadata(&path).await?.context("no_such_item")?;if !record.entry.as_ref().is_some_and(|cached|cached.same_revision(&observed)){bail!("version_conflict: delete source metadata changed");}let expected=if let Some(strong)=&record.strong{strong.clone()}else{b.stat(&path).await?.context("no_such_item")?};j.requests.get_mut(&key).unwrap().deletion_expected=Some(expected.clone());save_journal(&store,&d.id,&j)?;if store.config.history.effective(&d.profile).enabled {crate::history::recycle_checked(&store,b.as_ref(),&d.profile,&path,false,&key,Some(&expected)).await?;}else{b.remove_checked(&path,&expected).await?;}}
         else if req.op=="create"&&req.kind.as_deref()==Some("directory"){if j.items.values().any(|r|r.path==target){bail!("version_conflict: directory already exists");}b.mkdir(&remote(&d,&target)?).await?;}
         else {
             let dest=remote(&d,&target)?;
@@ -1027,7 +1037,7 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
             let entry=if let Some(confirmed)=confirmed {let observed=b.stat(&dest).await?.context("version_conflict: confirmed content disappeared")?;if !observed.same_revision(&confirmed){bail!("version_conflict: target changed after confirmed upload");}observed}
             else if let Some(source)=&source {
                 let condition=if let Some(record)=&existing{WriteCondition::Match(record.strong.clone().context("unsupported: fetch this file before editing to establish its content guard")?)}else{WriteCondition::CreateNew};
-                if let WriteCondition::Match(expected)=&condition{if j.requests.get(&key).and_then(|p|p.version.as_ref()).is_none(){let archived=if let Some(planned)=resolution::planned_version(&store,&d,&req)?{if planned.path!=dest||!planned.original.same_revision(expected){bail!("version_conflict: saved replacement version does not match the guarded target");}Some(planned)}else{crate::policies::prepare_version(&store,b.as_ref(),&d.profile,&dest,expected,&key,false).await?};j.requests.get_mut(&key).unwrap().version=archived;save_journal(&store,&d.id,&j)?;}}
+                if let WriteCondition::Match(expected)=&condition{crate::history::capture(&store,b.as_ref(),&d.profile,&dest,Some(id),"overwrite",&key,expected,false).await?;if j.requests.get(&key).and_then(|p|p.version.as_ref()).is_none(){let archived=if let Some(planned)=resolution::planned_version(&store,&d,&req)?{if planned.path!=dest||!planned.original.same_revision(expected){bail!("version_conflict: saved replacement version does not match the guarded target");}Some(planned)}else{crate::policies::prepare_version(&store,b.as_ref(),&d.profile,&dest,expected,&key,false).await?};j.requests.get_mut(&key).unwrap().version=archived;save_journal(&store,&d.id,&j)?;}}
                 if let Some(activity)=activity {activity.bind(dest.clone(),fs::metadata(source)?.len());}
                 b.upload(source,&dest,condition).await?
             }else if directory_no_op {
@@ -1035,6 +1045,7 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
                 // or publish. Keep its checked metadata identity for replay.
                 existing.as_ref().unwrap().entry.clone().context("no_such_item: directory metadata missing")?
             }else{existing.as_ref().expect("content-free modifications always have an existing item").strong.clone().context("unsupported: fetch this file before editing metadata")?};
+            if source.is_none()&&!directory_no_op&&(req.tag_data_hex.is_some()||req.extended_attributes.is_some()){crate::history::capture(&store,b.as_ref(),&d.profile,&dest,Some(id),"overwrite",&key,&entry,false).await?;}
             j.requests.get_mut(&key).unwrap().confirmed=Some(entry.clone());save_journal(&store,&d.id,&j)?;
             if metadata.is_none()&&source.is_none()&&(req.tag_data_hex.is_some()||req.extended_attributes.is_some()) {
                 if let Some(saved)=j.requests.get(&key).and_then(|pending|pending.metadata.clone()) {
@@ -1088,7 +1099,7 @@ async fn online_process_inner_with(home:&Path,staging:&Path,staging_fd:&File,req
     }
     let response=if req.op=="delete"{json!({})}else{let record=j.items.get_mut(response_id.as_deref().context("created item not enumerated")?).context("updated item missing")?;if req.op=="create"{record.client_id=req.client_item_id.clone();}let mut item=record.item.clone();if d.smart{item.has_unsynced_changes=false;item.native_materialized=false;item.sync_state=Some(if item.pinned{"pinned"}else{"online"}.into());item.sync_message=None;let base=metadata_version(&record.path,&item.tag_data_hex,&item.extended_attributes,item.pinned);item.metadata_version=format!("{base}:{}",&state::key(&serde_json::to_string(&(&item.sync_state,&item.sync_message,false,false))?)[..32]);}json!({"item":item})};
     j.requests.get_mut(&key).unwrap().response=Some(response.clone());save_journal(&store,&d.id,&j)?;
-    if !d.repository{if let Some(version)=j.requests.get(&key).and_then(|p|p.version.as_ref()){if let Err(error)=crate::policies::finish_version(&store,b.as_ref(),&d.profile,&remote(&d,&target)?,version).await{eprintln!("version retention deferred: {error:#}");}}}Ok(response)
+    if !d.repository{crate::history::confirm_request(&store,&d.profile,&key,None)?;let _=crate::history::prune(&store,&d.profile,true);if let Some(version)=j.requests.get(&key).and_then(|p|p.version.as_ref()){if let Err(error)=crate::policies::finish_version(&store,b.as_ref(),&d.profile,&remote(&d,&target)?,version).await{eprintln!("version retention deferred: {error:#}");}}}Ok(response)
 }
 fn error(error:anyhow::Error)->Value {let text=format!("{error:#}");let code=if text.contains("excluded_by_filter:")||crate::filtering::exclusion_path(&text).is_some(){"excluded_by_filter"}else if text.contains("cache capacity")||text.contains("cache budget")||text.contains("insufficient_quota"){"insufficient_quota"}else if text.contains("version_conflict")||text.contains("revision")||text.contains("conflict"){"version_conflict"}else if text.contains("sync_anchor_expired"){"sync_anchor_expired"}else if text.contains("no_such_item")||text.contains("missing"){"no_such_item"}else if text.contains("credential")||text.contains("authentication")||text.contains("password"){"not_authenticated"}else if text.contains("unsupported"){"unsupported"}else{"server_unreachable"};json!({"ok":false,"error":{"code":code,"message":text}})}
 fn success(payload:Value)->Value{let mut value=payload.as_object().cloned().unwrap_or_default();value.insert("ok".into(),Value::Bool(true));Value::Object(value)}
@@ -1136,6 +1147,10 @@ async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S
     let count=tokio::time::timeout(std::time::Duration::from_secs(30),limited.read_until(b'\n',&mut bytes)).await??;drop(limited);
     if count==0||bytes.last()!=Some(&b'\n'){bail!("invalid or oversized provider request");}
     let envelope:Value=match serde_json::from_slice(&bytes){Ok(req)=>req,Err(e)=>{let msg=error(e.into());write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());}};
+    if envelope.get("op").and_then(Value::as_str)==Some("history_cli") {
+        if let Some(service)=administration.as_ref().filter(|_|token.is_none()){return history::cli(&mut reader,&mut write,&bytes,service,coordinator.as_ref()).await;}
+        let msg=error(anyhow::anyhow!("history administration requires the local Unix bridge"));write.write_all(format!("{msg}\n").as_bytes()).await?;return Ok(());
+    }
     if envelope.get("op").and_then(Value::as_str)==Some("profile_admin") {
         if let Some(service)=administration.as_ref().filter(|_|token.is_none()) {
             return admin::handle(&mut reader,&mut write,&bytes,service,coordinator.as_ref()).await;
@@ -1152,7 +1167,7 @@ async fn connection<S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin>(stream:S
     let label=req.request_id.clone().unwrap_or_else(||uuid::Uuid::new_v4().to_string());let ctx=crate::transfer::global().scoped(label.clone());
     // File Provider issues concurrent callbacks. Queue private-state operations
     // asynchronously instead of making our own requests fail Store's file lock.
-    let operation=async{let _guard=if ["domains","status","resolve","cache_budget","refresh_index","smart_repair_status","transfer_status"].contains(&req.op.as_str())||is_smart_catalog(home,&req){None}else{Some(coordinator.lock().await)};process(home,staging,staging_fd,req,ctx.clone()).await};tokio::pin!(operation);let mut tick=tokio::time::interval(std::time::Duration::from_millis(250));let mut closed=[0u8;1];
+    let operation=async{let _guard=if ["domains","status","resolve","cache_budget","refresh_index","smart_repair_status","transfer_status","history_list"].contains(&req.op.as_str())||is_smart_catalog(home,&req){None}else{Some(coordinator.lock().await)};process(home,staging,staging_fd,req,ctx.clone()).await};tokio::pin!(operation);let mut tick=tokio::time::interval(std::time::Duration::from_millis(250));let mut closed=[0u8;1];
     let result=loop{tokio::select!{
         result=&mut operation=>break result,
         read=reader.read(&mut closed)=>{let _=read;return Ok(());},

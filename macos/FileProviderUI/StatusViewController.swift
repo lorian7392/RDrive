@@ -34,6 +34,7 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
     private let repairButton = NSButton(title: "Repair Sync Issue", target: nil, action: nil)
     private var operation: SocketOperation?
     private var repairSelection: (domain: String, id: String, mutation: String)?
+    private(set) var historyController: RDriveHistoryViewController?
     var integration: NativeStatusIntegration = .live
 
     override func loadView() {
@@ -63,9 +64,44 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         _ = view
         operation?.cancel()
         operation = nil
+        closeHistory()
         repairSelection = nil
         repairButton.isHidden = true
         repairButton.isEnabled = true
+        if actionIdentifier == "rdrive.history" {
+            guard let domain = integration.domain(self), itemIdentifiers.count == 1 else {
+                details.stringValue = "Select one RDrive file or folder to view its history."
+                return
+            }
+            let current = SocketOperation(); operation = current
+            let integration = self.integration
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let canonical = try self.canonicalIdentifier(itemIdentifiers[0], domain: domain)
+                    let bridge = try integration.makeBridge()
+                    DispatchQueue.main.async {
+                        guard self.operation === current else { return }
+                        self.operation = nil
+                        let history = RDriveHistoryViewController()
+                        history.integration = NativeHistoryIntegration(request: { try integration.request(bridge, $0, $1) },
+                            transfers: bridge.paths.transfers, complete: { [weak owner = self] in owner?.finish() })
+                        for child in self.view.subviews { child.isHidden = true }
+                        self.addChild(history); self.view.addSubview(history.view)
+                        history.view.translatesAutoresizingMaskIntoConstraints = false
+                        NSLayoutConstraint.activate([history.view.leadingAnchor.constraint(equalTo: self.view.leadingAnchor), history.view.trailingAnchor.constraint(equalTo: self.view.trailingAnchor), history.view.topAnchor.constraint(equalTo: self.view.topAnchor), history.view.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)])
+                        self.historyController = history
+                        self.preferredContentSize = history.preferredContentSize
+                        history.prepare(domain: domain.rawValue, id: wireID(canonical))
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        guard self.operation === current else { return }
+                        self.details.stringValue = "History unavailable: " + nativeHistoryError(error)
+                    }
+                }
+            }
+            return
+        }
         guard ["rdrive.status", "rdrive.repair"].contains(actionIdentifier), let domain = integration.domain(self),
               !itemIdentifiers.isEmpty, itemIdentifiers.count <= 128 else {
             details.stringValue = "Select RDrive files to view their sync status."
@@ -202,6 +238,7 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
         _ = view
         operation?.cancel()
         operation = nil
+        closeHistory()
         repairSelection = nil
         repairButton.isHidden = true
         details.stringValue = (error as NSError).localizedDescription
@@ -209,7 +246,13 @@ final class RDriveStatusViewController: FPUIActionExtensionViewController {
 
     @objc func finish() {
         operation?.cancel(); operation = nil
+        historyController?.cancel()
         integration.complete(self)
+    }
+    private func closeHistory() {
+        historyController?.cancel(); historyController?.view.removeFromSuperview(); historyController?.removeFromParent(); historyController = nil
+        for child in view.subviews { child.isHidden = false }
+        preferredContentSize = NSSize(width: 480, height: 380)
     }
     deinit { operation?.cancel() }
 }

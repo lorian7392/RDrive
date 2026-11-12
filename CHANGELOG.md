@@ -4,6 +4,11 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Add account-bound local file history with immutable verified contents and selected metadata, rename continuity, protected retention, and a budget separate from clean-cache eviction.
+- Preserve before-images for enabled Smart/queued uploads, explicit destructive file operations, and guarded remote synchronization; recycle supported deletions without losing retained content.
+- Add Finder file history with pagination, preview, verified export, restore-copy defaults, and explicit revision-bound replacement plans that preserve the current version and pending edits.
+- Add shared CLI/MCP history controls and optional verified APFS checkpoints, payload-only recovery, and interrupted-creation reconciliation. Never roll back the live state database or delete system-managed snapshots.
+
 - Pin Tokio 1.52.1 to fix the upstream blocking-task hang that could stall MCP standard-input/output initialization.
 
 - Complete unchanged-directory callbacks without requiring a file content guard; offer conservative offline repair for legacy metadata-guard failures from Finder's Needs attention state while preserving real metadata edits and retained contents.

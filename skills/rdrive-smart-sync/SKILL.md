@@ -41,7 +41,7 @@ The byte budget covers clean CLI cache, reported File Provider clean downloads, 
 
 `cache get` is an offline read of an existing verified cached copy, not proof it is the latest server version. Finder's Keep Offline and Allow Automatic Removal affect File Provider policies; CLI cache pinning is not a substitute for setting those native policies. Allow Automatic Removal does not promise immediate eviction.
 
-For conflicts, paused work, retry, export, and cleanup, read [retained edit recovery](references/recovery.md).
+For conflicts, paused work, file history, APFS payload recovery, retry, export, and cleanup, read [retained edit recovery](references/recovery.md).
 
 ## Ordinary folder synchronization
 

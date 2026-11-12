@@ -86,6 +86,7 @@ nav:
       - State directory and migration: STATE_DIRECTORY.md
       - Mounting network volumes: MOUNT.md
       - Sync conflicts and recovery: CONFLICTS.md
+      - File history and APFS recovery: HISTORY.md
       - Smart Synchronization: SMART_SYNCHRONIZATION.md
       - Smart operations and management: SMART_OPERATIONS.md
       - Cache management: CACHE_MANAGEMENT.md

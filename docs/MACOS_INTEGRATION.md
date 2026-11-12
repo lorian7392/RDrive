@@ -183,6 +183,13 @@ An item blocked by filtering is labeled **Excluded by sync rules**. A stale-fold
 repair explains the selected rule. An existing temporary file under a folder does not
 block an unrelated metadata update to that folder; moving or deleting the folder
 still checks the affected descendants.
+For one Smart file or folder, **View File History…** opens retained versions,
+including deleted descendants when a folder is selected. It offers read-only
+preview, verified export to a new destination, restore as a copy, and explicitly
+confirmed file replacement guarded by the observed current revision. The same
+window configures shared retention settings. See [file history and recovery](HISTORY.md)
+for recovery steps and optional APFS checkpoints.
+
 The separate Finder Sync menu also includes Download Now and Remove Download.
 The historical system runs in the repository archive observed that menu in an
 ordinary mapped synthetic folder and observed the File Provider pinned badge

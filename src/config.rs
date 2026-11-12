@@ -51,6 +51,12 @@ pub struct Config {
     pub filters: crate::filtering::FilterConfig,
     #[serde(default)]
     pub policies: crate::policies::PolicyConfig,
+    /// Durable recovery content has a budget separate from the clean cache.
+    #[serde(default)]
+    pub history: crate::history::HistoryConfig,
+    /// Optional operating-system checkpoints; never required for ordinary history.
+    #[serde(default)]
+    pub checkpoints: crate::checkpoints::Policy,
 }
 
 /// Background namespace metadata only; this does not pin or download content.

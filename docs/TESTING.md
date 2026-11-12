@@ -74,6 +74,8 @@ python3 tests/mcp_workflows.py target/debug/rdrive --report target/validation/mc
 python3 tests/mcp_startup_workflows.py target/debug/rdrive --report target/validation/mcp-startup.json
 python3 tests/index_workflows.py target/debug/rdrive --output target/validation/index.json
 python3 tests/search_workflows.py target/debug/rdrive --report target/validation/search.json
+RDRIVE_HISTORY_REPORT=target/validation/history.json \
+  python3 tests/history_workflows.py target/debug/rdrive
 python3 tests/policy_workflows.py target/debug/rdrive --output target/validation/policy.json
 python3 tests/service_workflows.py target/debug/rdrive --output target/validation/service.json
 ```
@@ -105,15 +107,16 @@ not convert it into a pass.
 - Downloads/checkpoints, immutable upload snapshots, progress, limits, and concurrency: `src/resume.rs`, `src/operations.rs`, `src/transfer.rs`, `src/scheduler.rs`, plus CLI/advanced/SMB workflows.
 - Cache budgets, pins, active readers, clearing, and directory migration: `tests/cache.rs`, `tests/cache_directory_workflows.py`, and `src/cache*.rs`.
 - Ordinary synchronization and metadata: `src/sync.rs`, `src/metadata*.rs`, and CLI/advanced/SMB workflows.
+- Account-bound file history, recycle/restore receipts, retention and APFS boundaries: `src/history.rs`, `src/history_control.rs`, `src/checkpoints.rs`, `tests/history_workflows.py`, and native history tests. The workflow reads APFS capability/status without creating or mounting snapshots; Rust host mocks exercise privileged boundaries.
 - Managed transactions and lost responses: `src/repository.rs` and advanced workflows, including competing writers and post-publication SIGKILL.
 - Smart queues, namespace changes, and conflict decisions: `tests/smart.rs`, `src/provider/`, and Smart/namespace/policy/receipts workflows.
 - SQLite, incremental discovery, and search: `src/provider/index*.rs` and index/search workflows.
 - MCP: `src/mcp.rs`, `src/mcp/catalog.rs`, `tests/mcp_catalog_contract.rs`, and stdio workflows covering permissions, scopes, protocol, and cancellation.
 - Mounts and services: the fake system in `tests/mount.rs` and service workflows. Real-system acceptance is separate.
 - Swift: `macos/tests/NativeTests.swift` and `coverage_*.swift`, using real SDK data objects with injectable bridge, manager, notification, and UI boundaries.
-- CLI contracts: `cli_contract` in `src/main.rs` traverses the actual Clap tree and checks all 97 leaf commands, 727 parameter declarations including positional/inherited arguments, enum values, numeric types, and conflicts. It currently generates 1,034 accepted-value cases and saves the inventory to `target/validation/cli-parameter-cases.json`.
-- MCP field contracts: `tests/mcp_catalog_contract.rs` checks all 81 tools and 186 fields, schemas, valid/invalid input, positional/flag mapping, and real CLI help parsing: 394 valid and 2,392 invalid cases. Help parsing performs no storage operation and creates no state directory.
-- Parameter documentation: `tests/test_documentation.py` checks help trees, configuration, and native parameters. The generated reference's 788 option declarations also include help/version and command groups, so its count differs from the production argument contract. Contracts do not cover every semantic combination; module tests and protocol workflows verify behavior.
+- CLI contracts: `cli_contract` in `src/main.rs` traverses the actual Clap tree and checks all 119 leaf commands, 890 parameter declarations including positional/inherited arguments, enum values, numeric types, and conflicts. It currently generates 1,269 accepted-value cases and saves the inventory to `target/validation/cli-parameter-cases.json`.
+- MCP field contracts: `tests/mcp_catalog_contract.rs` checks all 99 tools and 225 fields, schemas, valid/invalid input, positional/flag mapping, and real CLI help parsing: 469 valid and 2,903 invalid cases. Help parsing performs no storage operation and creates no state directory.
+- Parameter documentation: `tests/test_documentation.py` checks help trees, configuration, and native parameters. The generated reference also includes help/version options and command groups, so its declaration count differs from the production argument contract. Contracts do not cover every semantic combination; module tests and protocol workflows verify behavior.
 
 Run these contracts independently:
 

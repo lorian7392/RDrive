@@ -32,6 +32,7 @@ fn values(tool: &Tool, field: &Field, local: &Path) -> Vec<Value> {
             "depth" => vec![json!(0), json!(1), json!(u32::MAX)],
             "refresh_seconds" | "active_refresh_seconds" => vec![json!(1), json!(31_536_000)],
             "page_size" => vec![json!(1), json!(1000)],
+            "max_age_days" => vec![json!(1), json!(30), json!(36500)],
             _ => vec![json!(0), json!(1), json!(9_007_199_254_740_991_u64)],
         },
         Kind::Remote => vec![

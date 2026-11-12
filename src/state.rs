@@ -236,6 +236,8 @@ impl Store {
         config.index.validate()?;
         config.filters.validate()?;
         config.policies.validate()?;
+        config.history.validate()?;
+        config.checkpoints.validate()?;
         for p in config.profiles.values() {
             crate::config::validate_profile(p)?;
         }

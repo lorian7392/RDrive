@@ -270,9 +270,51 @@ enum Command {
     History {
         // Clap shares this public name with the inherited transfer flag. Keep
         // its id and numeric type identical to avoid duplicate flags/downcasts.
-        #[arg(id = "limit", long = "limit", default_value_t = 20)]
-        count: u64,
+        #[arg(id = "limit", long = "limit")]
+        count: Option<u64>,
+        #[command(subcommand)]
+        command: Option<HistoryCommand>,
     },
+    /// Optional verified local APFS checkpoints; never rolls back the state database.
+    Checkpoint { #[command(subcommand)] command:CheckpointCommand },
+}
+#[derive(Subcommand)]
+enum HistoryCommand {
+    /// List retained file versions, including their preparation/confirmation state.
+    Files {profile:String,remote:Option<String>,#[arg(long)]item_id:Option<String>,#[arg(long,default_value_t=0)]offset:usize,#[arg(long,default_value_t=100)]page_size:usize},
+    /// Show history policy, retained bytes and prepared entries.
+    Status {profile:String},
+    /// Set global policy or a connection override without stopping Finder.
+    Config {#[arg(long)]profile:Option<String>,#[arg(long)]enabled:Option<bool>,#[arg(long)]keep:Option<usize>,#[arg(long)]max_age_days:Option<u32>,#[arg(long,conflicts_with="unlimited")]max_bytes:Option<u64>,#[arg(long)]unlimited:bool},
+    /// Export a verified local copy without replacing the destination.
+    Export {profile:String,version:String,local:PathBuf},
+    /// Preview a new copy or guarded replacement; apply only the saved plan.
+    Restore {profile:String,version:String,#[arg(long="to",conflicts_with="plan")]target:Option<String>,#[arg(long,conflicts_with="plan")]replace:bool,#[arg(long)]plan:Option<String>,#[arg(long,requires="plan")]apply:bool},
+    /// Preview retention cleanup; prepared entries and restore decisions stay protected.
+    Prune {profile:String,#[arg(long)]apply:bool},
+    /// Preview removal of confirmed, unprotected history only.
+    Clear {profile:String,#[arg(long)]apply:bool},
+    /// Import verified recovered local content as a new history version.
+    Import {profile:String,remote:String,local:PathBuf,#[arg(long)]request_id:Option<String>},
+}
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// Read local APFS/Time Machine capability and policy without changing snapshots.
+    Status,
+    /// List owned checkpoint records and current OS snapshot availability.
+    List,
+    /// Configure optional checkpoints; no snapshot is created by configuration.
+    Config {#[arg(long)]enabled:Option<bool>,#[arg(long)]max_records:Option<usize>},
+    /// Create and verify a local checkpoint; --authorize may prompt in a terminal.
+    Create {#[arg(long)]authorize:bool},
+    /// Inspect the recorded file manifest, including payload export eligibility.
+    Inspect {id:String},
+    /// Export one recorded local payload to a new absolute path.
+    Export {id:String,payload:PathBuf,local:PathBuf,#[arg(long)]authorize:bool},
+    /// Verify a matching snapshot after an interrupted creation command.
+    Reconcile {id:String,#[arg(long)]authorize:bool},
+    /// Preview forgetting an owned local record; OS snapshots remain managed by macOS.
+    Forget {id:String,#[arg(long)]apply:bool},
 }
 #[derive(Subcommand)]
 enum McpCommand {
@@ -731,7 +773,9 @@ async fn do_sync(
 ) -> Result<()> {
     let backend = connect(store, name).await?;
     let (local, remote, baseline) = sync_roots(store, name, local, remote)?;
-    let report = sync::run_with_metadata(backend.as_ref(), &local, &remote, &baseline, &options, metadata).await?;
+    let report = if store.config.history.effective(name).enabled {
+        sync::run_with_history(store,backend.as_ref(),name,&local,&remote,&baseline,&options,metadata).await?
+    } else {sync::run_with_metadata(backend.as_ref(), &local, &remote, &baseline, &options, metadata).await?};
     if metadata&&report.conflicts.is_empty(){
         let meta=rdrive::metadata_remote::sync(backend.as_ref(),&local,&remote,&baseline.with_extension("metadata.json"),&rdrive::metadata_remote::SyncOptions{apply:options.apply,direction:options.direction}).await?;
         emit(json,&serde_json::json!({"content":report,"metadata":meta}))?;
@@ -749,7 +793,7 @@ async fn do_sync(
 async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
     let json = cli.json;
     match &cli.command {
-        Command::Mcp { .. } | Command::Service { .. } | Command::Update { .. } => unreachable!(),
+        Command::Mcp { .. } | Command::Service { .. } | Command::Update { .. } | Command::History {command:Some(_),..} | Command::Checkpoint {..} => unreachable!(),
         Command::Conflict { command } => match command {
             ConflictCommand::List { profile, local, remote } => {
                 let (local, remote, baseline) = sync_roots(store, profile, local, remote)?;
@@ -1036,11 +1080,29 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             let b = connect(store, name).await?;
             let from = path(from)?;
             let to = path(to)?;
-            let op = if matches!(&cli.command, Command::Mv { .. }) {
-                b.rename(&from, &to, *overwrite).await?;
+            let moving=matches!(&cli.command,Command::Mv{..});
+            let captured=if *overwrite&&store.config.history.effective(name).enabled {
+                if from==to{bail!("history overwrite source and destination must differ");}
+                if let Some(current)=b.stat(&to).await?{
+                    if current.is_dir {bail!("restore or replace directories as a separate copy");}
+                    let request=uuid::Uuid::new_v4().to_string();
+                    rdrive::history::capture(store,b.as_ref(),name,&to,None,"overwrite",&request,&current,false).await?;
+                    let temporary=store.home.join("tmp").join(format!("history-copy-{}",uuid::Uuid::new_v4()));
+                    let result=async{let source=ops::verified_download(b.as_ref(),&from,&temporary).await?;b.upload(&temporary,&to,backend::WriteCondition::Match(current)).await?;rdrive::history::confirm_request(store,name,&request,None)?;if moving{rdrive::history::recycle_checked(store,b.as_ref(),name,&from,false,&format!("{request}:source"),Some(&source)).await?;}Ok::<_,anyhow::Error>(())}.await;
+                    let _=std::fs::remove_file(temporary);result?;true
+                }else{false}
+            }else{false};
+            let replace_unconditionally=*overwrite&&!store.config.history.effective(name).enabled;
+            let op = if moving {
+                if !captured {
+                b.rename(&from, &to, replace_unconditionally).await?;
+                }
+                rdrive::history::renamed(store,name,&from,&to)?;
                 "move"
             } else {
-                b.copy(&from, &to, *overwrite).await?;
+                if !captured {
+                b.copy(&from, &to, replace_unconditionally).await?;
+                }
                 "copy"
             };
             store.event(op, name, &from, &to)?;
@@ -1059,9 +1121,12 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                 bail!("cannot delete the remote root");
             }
             let b = connect(store, name).await?;
-            b.remove(&remote, *recursive).await?;
+            let result=if store.config.history.effective(name).enabled {
+                let request=uuid::Uuid::new_v4().to_string();
+                rdrive::history::recycle(store,b.as_ref(),name,&remote,*recursive,&request).await?
+            } else { b.remove(&remote, *recursive).await?;serde_json::json!({"deleted":remote}) };
             store.event("delete", name, &remote, "explicit remote deletion")?;
-            emit(json, &serde_json::json!({"deleted":remote}))?;
+            emit(json, &result)?;
         }
         Command::Url {
             profile: name,
@@ -1283,7 +1348,10 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                     .iter()
                     .find(|v| v.id == *id)
                     .context("version not found")?;
+                let request=uuid::Uuid::new_v4().to_string();
+                if *overwrite {if let Some(current)=b.stat(&remote).await?{rdrive::history::capture(store,b.as_ref(),name,&remote,None,"restore",&request,&current,true).await?;}}
                 ops::restore(store, b.as_ref(), version, *overwrite).await?;
+                rdrive::history::confirm_request(store,name,&request,None)?;
                 store.event("restore", name, &remote, id)?;
                 emit(json, &serde_json::json!({"restored":id,"path":remote}))?;
             }
@@ -1345,14 +1413,14 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             )?,
         },
         Command::Config { .. } | Command::Mount { .. } | Command::Mounts | Command::Unmount { .. } => unreachable!(),
-        Command::History { count } => emit(
+        Command::History { count, command:None } => emit(
             json,
             &store
                 .db
                 .history
                 .iter()
                 .rev()
-                .take(usize::try_from(*count).unwrap_or(usize::MAX))
+                .take(usize::try_from(count.unwrap_or(20)).unwrap_or(usize::MAX))
                 .collect::<Vec<_>>(),
         )?,
     }
@@ -1375,6 +1443,46 @@ async fn main() {
         std::process::exit(1);
     }
 }
+async fn history_command(cli:&Cli,home:&Path)->Result<Option<serde_json::Value>> {
+    use rdrive::history_control::Command as Action;
+    use std::time::Duration;
+    let action=match &cli.command {
+        Command::History{command:Some(command),..}=>match command {
+            HistoryCommand::Files{profile,remote,item_id,offset,page_size}=>Action::Files{profile:profile.clone(),remote:remote.as_ref().map(|s|path(s)).transpose()?,item_id:item_id.clone(),offset:*offset,page_size:*page_size},
+            HistoryCommand::Status{profile}=>Action::Status{profile:profile.clone()},
+            HistoryCommand::Config{profile,enabled,keep,max_age_days,max_bytes,unlimited}=>{
+                let config=rdrive::client_read::config(home)?;
+                let mut policy=profile.as_ref().map(|p|config.history.effective(p)).unwrap_or(config.history.default);
+                if let Some(value)=enabled{policy.enabled=*value;}if let Some(value)=keep{policy.keep=*value;}if let Some(value)=max_age_days{policy.max_age_days=*value;}if let Some(value)=max_bytes{policy.max_bytes=Some(*value);}if *unlimited{policy.max_bytes=None;}
+                let command=rdrive::profile_admin::Command::new(rdrive::profile_admin::Change::HistoryPolicy{profile:profile.clone(),policy},None)?;
+                return Ok(Some(rdrive::profile_admin::dispatch(home,&command,Duration::from_secs(300)).await?));
+            },
+            HistoryCommand::Export{profile,version,local}=>Action::Export{profile:profile.clone(),version:version.clone(),local:local.clone()},
+            HistoryCommand::Restore{profile,version,target,replace,plan,apply}=>Action::Restore{profile:profile.clone(),version:version.clone(),target:target.as_ref().map(|s|path(s)).transpose()?,replace:*replace,plan:plan.clone(),apply:*apply},
+            HistoryCommand::Prune{profile,apply}=>Action::Prune{profile:profile.clone(),apply:*apply},
+            HistoryCommand::Clear{profile,apply}=>Action::Clear{profile:profile.clone(),apply:*apply},
+            HistoryCommand::Import{profile,remote,local,request_id}=>Action::Import{profile:profile.clone(),remote:path(remote)?,local:local.clone(),request_id:request_id.clone().unwrap_or_else(||uuid::Uuid::new_v4().to_string())},
+        },
+        Command::Checkpoint{command}=>match command {
+            CheckpointCommand::Status=>Action::CheckpointStatus,
+            CheckpointCommand::List=>Action::CheckpointList,
+            CheckpointCommand::Config{enabled,max_records}=>{
+                let mut policy=rdrive::client_read::config(home)?.checkpoints;
+                if let Some(value)=enabled{policy.enabled=*value;}if let Some(value)=max_records{policy.max_records=*value;}
+                let command=rdrive::profile_admin::Command::new(rdrive::profile_admin::Change::CheckpointPolicy{policy},None)?;
+                return Ok(Some(rdrive::profile_admin::dispatch(home,&command,Duration::from_secs(300)).await?));
+            },
+            CheckpointCommand::Create{authorize}=>Action::CheckpointCreate{authorize:*authorize},
+            CheckpointCommand::Inspect{id}=>Action::CheckpointInspect{id:id.clone()},
+            CheckpointCommand::Export{id,payload,local,authorize}=>Action::CheckpointExport{id:id.clone(),payload:payload.clone(),local:local.clone(),authorize:*authorize},
+            CheckpointCommand::Reconcile{id,authorize}=>Action::CheckpointReconcile{id:id.clone(),authorize:*authorize},
+            CheckpointCommand::Forget{id,apply}=>Action::CheckpointForget{id:id.clone(),apply:*apply},
+        },
+        _=>return Ok(None),
+    };
+    Ok(Some(rdrive::profile_admin::dispatch_history(home,&action,Duration::from_secs(300)).await?))
+}
+
 async fn run(cli: &Cli) -> Result<()> {
     run_with_native(cli, &NativeCalls::default()).await
 }
@@ -1409,6 +1517,7 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
     }
     let home = rdrive::shared_home::resolve(cli.home.as_deref())?;
     rdrive::state_directory::guard(&home)?;
+    if let Some(value) = history_command(cli, &home).await? {return emit(cli.json, &value);}
     if let Some(value) = read_command(cli, &home).await? { return emit(cli.json, &value); }
     if let Some((request, wait)) = profile_command(cli)? {
         return emit(cli.json, &rdrive::profile_admin::dispatch(&home, &request, wait).await?);
@@ -1577,7 +1686,9 @@ mod cli_tests {
     #[test]
     fn history_count_and_transfer_limit_parse_without_type_collision() {
         let cli = Cli::try_parse_from(["rdrive", "history", "--limit", "3"]).unwrap();
-        assert!(matches!(cli.command, Command::History { count: 3 }));
+        assert!(matches!(cli.command, Command::History { count: Some(3), .. }));
+        let cli=Cli::try_parse_from(["rdrive","history","restore","p","version"]).unwrap();
+        assert_eq!(cli.limit,None,"history's display default must not throttle payload transfers");
         let cli = Cli::try_parse_from(["rdrive", "--limit", "1024", "status"]).unwrap();
         assert_eq!(cli.limit, Some(1024));
     }
@@ -1808,7 +1919,7 @@ mod cli_contract {
             for child in children { let mut path=path.to_vec(); path.push(child.get_name().into()); visit(child, &path, cases); }
             return;
         }
-        let args = command.get_arguments().filter(|arg| !["help", "version"].contains(&arg.get_id().as_str())).collect::<Vec<_>>();
+        let args = command.get_arguments().filter(|arg| arg.is_positional() || !["help", "version"].contains(&arg.get_id().as_str())).collect::<Vec<_>>();
         let mut required = args.iter().filter(|arg| arg.is_required_set()).copied().collect::<Vec<_>>();
         required.sort_by_key(|arg| arg.get_index().unwrap_or(0));
         let mut base = vec!["rdrive".into()]; base.extend(path.to_vec());
@@ -1827,6 +1938,7 @@ mod cli_contract {
                     _ => {}
                 }
             }
+            if path==["history","restore"]&&arg.get_id()=="apply" {invocation.extend(["--plan".into(),"fixture-plan".into()]);}
             if !arg.is_required_set() && !(cache_config && arg.get_id()=="unlimited") { append(&mut invocation, arg); }
             Cli::try_parse_from(&invocation).unwrap_or_else(|error| panic!("parameter {invocation:?}: {error}"));
             let mut values = 1;
@@ -1856,7 +1968,7 @@ mod cli_contract {
     fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
         let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
         let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(leaves.len(),104,"update the public interface inventory when adding a command");
+        assert_eq!(leaves.len(),119,"update the public interface inventory when adding a command");
         assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
         let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();

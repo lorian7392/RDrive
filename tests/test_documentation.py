@@ -69,7 +69,7 @@ def rust_command_paths():
             if not variant:
                 raise AssertionError(f"unrecognized subcommand declaration: {fragment}")
             name = re.sub(r"(?<!^)(?=[A-Z])", "-", variant.group(1)).lower()
-            nested = re.search(r"\bcommand\s*:\s*(\w+Command)\b", fragment)
+            nested = re.search(r"\bcommand\s*:\s*(?:Option\s*<\s*)?(\w+Command)\b", fragment)
             variants.append((name, nested.group(1) if nested else None))
         enums[match.group(1)] = variants
     result = {()}
@@ -95,7 +95,7 @@ def rust_fields(path, name):
 
 class DocumentationContract(unittest.TestCase):
     def test_public_documentation_links_exist_without_local_build_artifacts(self):
-        documents = [ROOT / name for name in ["README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "docs/README.md", "docs/INSTALLATION.md", "docs/QUICKSTART.md", "docs/FEATURES.md", "docs/ARCHITECTURE.md", "docs/TROUBLESHOOTING.md", "docs/TESTING.md", "docs/COVERAGE.md", "docs/REPOSITORY.md"]]
+        documents = [ROOT / name for name in ["README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "docs/README.md", "docs/INSTALLATION.md", "docs/QUICKSTART.md", "docs/FEATURES.md", "docs/ARCHITECTURE.md", "docs/TROUBLESHOOTING.md", "docs/TESTING.md", "docs/COVERAGE.md", "docs/REPOSITORY.md", "docs/HISTORY.md"]]
         documents += sorted((ROOT / "docs/reference").glob("*.md"))
         for document in documents:
             for destination in re.findall(r'\[[^\]\n]*\]\(([^)]+)\)', document.read_text()):
@@ -139,6 +139,10 @@ class DocumentationContract(unittest.TestCase):
             ("src/policies.rs", "PolicyConfig", example["policies"]),
             ("src/policies.rs", "VersionPolicy", example["policies"]["versions"]),
             ("src/policies.rs", "ProfilePolicy", example["policies"]["profiles"]["dav"]),
+            ("src/history.rs", "HistoryConfig", example["history"]),
+            ("src/history.rs", "HistoryPolicy", example["history"]["default"]),
+            ("src/history.rs", "HistoryPolicy", example["history"]["profiles"]["dav"]),
+            ("src/checkpoints.rs", "Policy", example["checkpoints"]),
         ]
         declarations.extend(("src/config.rs", "Profile", value) for value in example["profiles"].values())
         for path, name, value in declarations:

@@ -508,6 +508,7 @@ pub(super) async fn process(
             {
                 bail!("version_conflict: namespace source changed or disappeared");
             }
+            if plan.deleted {crate::history::capture(&store,b,&d.profile,&source,req.id.as_deref(),"delete",&key,&plan.expected,false).await?;}
             b.rename_checked(&source, &target, &plan.expected).await?
         };
         plan.confirmed = Some(moved);
@@ -605,6 +606,9 @@ fn complete(
         .context("namespace receipt missing")?
         .response = Some(response.clone());
     plan.phase = "complete".into();
+    let from=remote(d,&plan.from)?;let to=remote(d,&plan.to)?;
+    if plan.deleted {crate::history::confirm_request(store,&d.profile,key,Some(&to))?;}else{crate::history::renamed(store,&d.profile,&from,&to)?;}
+    let _=crate::history::prune(store,&d.profile,true);
     j.requests.get_mut(key).unwrap().namespace = Some(plan);
     save_journal(store, &d.id, j)?;
     Ok(response)

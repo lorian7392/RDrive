@@ -87,7 +87,7 @@ def workflows(python, binary, group, output, library):
             ("mcp", "--report"), ("mcp_startup", "--report"), ("index", "--output"),
             ("search", "--report"), ("policy", "--output"),
             ("service", "--output"), ("profile_admin", "--report"),
-            ("state_directory", "--report"),
+            ("state_directory", "--report"), ("history", "--report"),
         ]:
             command = [python, str(ROOT / "tests" / (name + "_workflows.py")), str(binary)]
             if flag:

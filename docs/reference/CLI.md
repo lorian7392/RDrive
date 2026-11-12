@@ -223,7 +223,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.3`: **120 command entries** (including groups, excluding the root and automatic `help`), **104 executable leaf commands**, and **853 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.3`: **137 command entries** (including groups, excluding the root and automatic `help`), **119 executable leaf commands**, and **969 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -233,46 +233,47 @@ WebDAV and SMB files, offline cache, durable uploads, and conservative sync
 Usage: rdrive [OPTIONS] <COMMAND>
 
 Commands:
-  config     Inspect or relocate the shared connection and synchronization state
-  update     Check for a stable CLI release on GitHub
-  conflict   Inspect and repair ordinary two-way sync conflicts
-  mcp        Expose existing operations to AI clients over MCP standard input/output
-  profile    Add/list/remove connection profiles. Never accepts a password argument
-  info       Test connection and show backend capabilities
-  ls         List remote children or recursively search the tree
-  stat       Read remote type, size, timestamp and revision metadata
-  get        Download through a verified temporary file, then commit locally
-  cat        Print remote file bytes to stdout (status goes to stderr)
-  put        Snapshot a local file to the durable queue, then upload it
-  mkdir      Create a remote directory; --parents creates missing ancestors
-  mv         Rename or move within one connection, without overwrite by default
-  cp         Copy within one connection, without overwrite by default
-  rm         Explicit remote deletion. Directories require --recursive
-  url        Copyable location URL. Does not create a public sharing link
-  edit       Download, edit with an executable from EDITOR, then queue a guarded upload
-  cache      Fetch, pin, read offline and prune cached files
-  queue      Inspect, run or cancel durable upload jobs
-  sync       Plan by default; --apply commits. Conflicts stop the entire plan
-  watch      Repeat sync in the foreground; stop with Ctrl-C
-  notify     Stream server change notifications (SMB); overflow/disconnect requires rescan
-  repo       Atomic managed snapshot repository and durable transactions
-  provider   Finder/File Provider bridge and domain configuration
-  smart      Configure on-demand offline domains and manage retained local edits
-  index      Configure background metadata indexing and request scoped refreshes
-  filter     Smart inclusion/exclusion rules; never deletes excluded remote files
-  policy     Automatic version retention and conflict resolution policy
-  service    Install and control the per-user background supervisor
-  metadata   Capture, apply or synchronize selected user extended attributes/Finder tags
-  versions   Save, inspect, restore and prune custom remote file versions
-  lock       Acquire a WebDAV write lock; save its token for later writes/unlock
-  unlock     Uses RDRIVE_WEBDAV_LOCK_TOKEN; tokens are not accepted as arguments
-  status     Local queue/cache summary; works offline
-  mount      Mount through macOS native SMB/WebDAV helpers
-  mounts     List mounts reported by the operating system
-  unmount    Unmount a native SMB/WebDAV filesystem
-  transfers  Inspect resumable transfers or discard a saved download prefix
-  history    Show locally recorded completed operations
-  help       Print this message or the help of the given subcommand(s)
+  config      Inspect or relocate the shared connection and synchronization state
+  update      Check for a stable CLI release on GitHub
+  conflict    Inspect and repair ordinary two-way sync conflicts
+  mcp         Expose existing operations to AI clients over MCP standard input/output
+  profile     Add/list/remove connection profiles. Never accepts a password argument
+  info        Test connection and show backend capabilities
+  ls          List remote children or recursively search the tree
+  stat        Read remote type, size, timestamp and revision metadata
+  get         Download through a verified temporary file, then commit locally
+  cat         Print remote file bytes to stdout (status goes to stderr)
+  put         Snapshot a local file to the durable queue, then upload it
+  mkdir       Create a remote directory; --parents creates missing ancestors
+  mv          Rename or move within one connection, without overwrite by default
+  cp          Copy within one connection, without overwrite by default
+  rm          Explicit remote deletion. Directories require --recursive
+  url         Copyable location URL. Does not create a public sharing link
+  edit        Download, edit with an executable from EDITOR, then queue a guarded upload
+  cache       Fetch, pin, read offline and prune cached files
+  queue       Inspect, run or cancel durable upload jobs
+  sync        Plan by default; --apply commits. Conflicts stop the entire plan
+  watch       Repeat sync in the foreground; stop with Ctrl-C
+  notify      Stream server change notifications (SMB); overflow/disconnect requires rescan
+  repo        Atomic managed snapshot repository and durable transactions
+  provider    Finder/File Provider bridge and domain configuration
+  smart       Configure on-demand offline domains and manage retained local edits
+  index       Configure background metadata indexing and request scoped refreshes
+  filter      Smart inclusion/exclusion rules; never deletes excluded remote files
+  policy      Automatic version retention and conflict resolution policy
+  service     Install and control the per-user background supervisor
+  metadata    Capture, apply or synchronize selected user extended attributes/Finder tags
+  versions    Save, inspect, restore and prune custom remote file versions
+  lock        Acquire a WebDAV write lock; save its token for later writes/unlock
+  unlock      Uses RDRIVE_WEBDAV_LOCK_TOKEN; tokens are not accepted as arguments
+  status      Local queue/cache summary; works offline
+  mount       Mount through macOS native SMB/WebDAV helpers
+  mounts      List mounts reported by the operating system
+  unmount     Unmount a native SMB/WebDAV filesystem
+  transfers   Inspect resumable transfers or discard a saved download prefix
+  history     Show locally recorded completed operations
+  checkpoint  Optional verified local APFS checkpoints; never rolls back the state database
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>          State/config directory (also RDRIVE_HOME)
@@ -2669,12 +2670,361 @@ Options:
 ```text
 Show locally recorded completed operations
 
-Usage: rdrive history [OPTIONS]
+Usage: rdrive history [OPTIONS] [COMMAND]
+
+Commands:
+  files    List retained file versions, including their preparation/confirmation state
+  status   Show history policy, retained bytes and prepared entries
+  config   Set global policy or a connection override without stopping Finder
+  export   Export a verified local copy without replacing the destination
+  restore  Preview a new copy or guarded replacement; apply only the saved plan
+  prune    Preview retention cleanup; prepared entries and restore decisions stay protected
+  clear    Preview removal of confirmed, unprotected history only
+  import   Import verified recovered local content as a new history version
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>          State/config directory (also RDRIVE_HOME)
-      --limit <limit>        [default: 20]
+      --limit <limit>
       --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history files`
+
+```text
+List retained file versions, including their preparation/confirmation state
+
+Usage: rdrive history files [OPTIONS] <PROFILE> [REMOTE]
+
+Arguments:
+  <PROFILE>
+  [REMOTE]
+
+Options:
+      --home <HOME>            State/config directory (also RDRIVE_HOME)
+      --item-id <ITEM_ID>
+      --json                   Compact machine-readable JSON. Errors are JSON on stderr
+      --offset <OFFSET>        [default: 0]
+      --page-size <PAGE_SIZE>  [default: 100]
+      --progress <PROGRESS>    Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>            Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                   Print help
+```
+
+### `rdrive history status`
+
+```text
+Show history policy, retained bytes and prepared entries
+
+Usage: rdrive history status [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history config`
+
+```text
+Set global policy or a connection override without stopping Finder
+
+Usage: rdrive history config [OPTIONS]
+
+Options:
+      --home <HOME>                  State/config directory (also RDRIVE_HOME)
+      --profile <PROFILE>
+      --enabled <ENABLED>            [possible values: true, false]
+      --json                         Compact machine-readable JSON. Errors are JSON on stderr
+      --keep <KEEP>
+      --max-age-days <MAX_AGE_DAYS>
+      --progress <PROGRESS>          Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>                  Concurrent queue targets. Jobs for the same target retain order [default: 4]
+      --max-bytes <MAX_BYTES>
+      --unlimited
+  -h, --help                         Print help
+```
+
+### `rdrive history export`
+
+```text
+Export a verified local copy without replacing the destination
+
+Usage: rdrive history export [OPTIONS] <PROFILE> <VERSION> <LOCAL>
+
+Arguments:
+  <PROFILE>
+  <VERSION>
+  <LOCAL>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history restore`
+
+```text
+Preview a new copy or guarded replacement; apply only the saved plan
+
+Usage: rdrive history restore [OPTIONS] <PROFILE> <VERSION>
+
+Arguments:
+  <PROFILE>
+  <VERSION>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --to <TARGET>
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --replace
+      --plan <PLAN>
+      --apply
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history prune`
+
+```text
+Preview retention cleanup; prepared entries and restore decisions stay protected
+
+Usage: rdrive history prune [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+
+Options:
+      --apply
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history clear`
+
+```text
+Preview removal of confirmed, unprotected history only
+
+Usage: rdrive history clear [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+
+Options:
+      --apply
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive history import`
+
+```text
+Import verified recovered local content as a new history version
+
+Usage: rdrive history import [OPTIONS] <PROFILE> <REMOTE> <LOCAL>
+
+Arguments:
+  <PROFILE>
+  <REMOTE>
+  <LOCAL>
+
+Options:
+      --home <HOME>              State/config directory (also RDRIVE_HOME)
+      --request-id <REQUEST_ID>
+      --json                     Compact machine-readable JSON. Errors are JSON on stderr
+      --progress <PROGRESS>      Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>              Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                     Print help
+```
+
+### `rdrive checkpoint`
+
+```text
+Optional verified local APFS checkpoints; never rolls back the state database
+
+Usage: rdrive checkpoint [OPTIONS] <COMMAND>
+
+Commands:
+  status     Read local APFS/Time Machine capability and policy without changing snapshots
+  list       List owned checkpoint records and current OS snapshot availability
+  config     Configure optional checkpoints; no snapshot is created by configuration
+  create     Create and verify a local checkpoint; --authorize may prompt in a terminal
+  inspect    Inspect the recorded file manifest, including payload export eligibility
+  export     Export one recorded local payload to a new absolute path
+  reconcile  Verify a matching snapshot after an interrupted creation command
+  forget     Preview forgetting an owned local record; OS snapshots remain managed by macOS
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint status`
+
+```text
+Read local APFS/Time Machine capability and policy without changing snapshots
+
+Usage: rdrive checkpoint status [OPTIONS]
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint list`
+
+```text
+List owned checkpoint records and current OS snapshot availability
+
+Usage: rdrive checkpoint list [OPTIONS]
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint config`
+
+```text
+Configure optional checkpoints; no snapshot is created by configuration
+
+Usage: rdrive checkpoint config [OPTIONS]
+
+Options:
+      --enabled <ENABLED>          [possible values: true, false]
+      --home <HOME>                State/config directory (also RDRIVE_HOME)
+      --json                       Compact machine-readable JSON. Errors are JSON on stderr
+      --max-records <MAX_RECORDS>
+      --limit <LIMIT>              Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>        Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>                Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                       Print help
+```
+
+### `rdrive checkpoint create`
+
+```text
+Create and verify a local checkpoint; --authorize may prompt in a terminal
+
+Usage: rdrive checkpoint create [OPTIONS]
+
+Options:
+      --authorize
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint inspect`
+
+```text
+Inspect the recorded file manifest, including payload export eligibility
+
+Usage: rdrive checkpoint inspect [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint export`
+
+```text
+Export one recorded local payload to a new absolute path
+
+Usage: rdrive checkpoint export [OPTIONS] <ID> <PAYLOAD> <LOCAL>
+
+Arguments:
+  <ID>
+  <PAYLOAD>
+  <LOCAL>
+
+Options:
+      --authorize
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint reconcile`
+
+```text
+Verify a matching snapshot after an interrupted creation command
+
+Usage: rdrive checkpoint reconcile [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --authorize
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
+  -h, --help                 Print help
+```
+
+### `rdrive checkpoint forget`
+
+```text
+Preview forgetting an owned local record; OS snapshots remain managed by macOS
+
+Usage: rdrive checkpoint forget [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --apply
+      --home <HOME>          State/config directory (also RDRIVE_HOME)
+      --json                 Compact machine-readable JSON. Errors are JSON on stderr
+      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
       --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
       --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
   -h, --help                 Print help
