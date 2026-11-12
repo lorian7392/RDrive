@@ -238,7 +238,9 @@ pub(super) fn next_directory_where(
                 });
             let pending = last.is_none_or(|last| demand.requested > last) || failed_after_success;
             browsed |= exact && !demand.force && !demand.recursive;
-            requested |= pending;
+            // A recursive crawl enables descendants but is not an exact
+            // interactive request for every cold directory that it contains.
+            requested |= pending && exact;
             manual_pending |= pending && (demand.force || demand.recursive);
             forced |= pending && demand.force;
         }
@@ -863,6 +865,28 @@ mod tests {
     fn excluded_directory_is_not_scheduled_even_when_explicitly_demanded() {
         let mut journal=journal();directory(&mut journal,"excluded","excluded","root");let mut settings=policy();settings.enabled=false;
         assert_eq!(next_directory_where(&journal,&[demand("excluded","excluded",NOW)],&settings,NOW,|path,_|path!="excluded").as_deref(),Some("root"),"root initialization remains available while the excluded child is skipped");
+    }
+
+    #[test]
+    fn exact_cold_folder_requests_precede_a_broad_recursive_crawl_on_normal_turns() {
+        for forced in [false,true] {
+            for turn in [0,1] {
+                let mut j=journal();scanned(&mut j,"root",NOW);directory(&mut j,"home","GH666","root");scanned(&mut j,"home",NOW);
+                directory(&mut j,"selected","GH666/Backup","home");
+                for n in 0..64 {directory(&mut j,&format!("sibling-{n:02}"),&format!("cold-{n:02}"),"root");}
+                j.directory_turn=turn;
+                let mut crawl=demand("root","",NOW-1);crawl.force=true;crawl.recursive=true;
+                let mut selected=demand("selected","GH666/Backup",NOW+1);selected.force=forced;selected.finder=forced;
+                let requests=[crawl,selected];
+                assert_eq!(next_directory(&j,&requests,&policy(),NOW+1).as_deref(),Some("selected"),"exact folder request lost to inherited crawl on turn {turn}, forced={forced}");
+                j.directory_attempts.insert("selected".into(),ScanAttempt{last:NOW,failures:1,next_try:NOW+10000});
+                assert_ne!(next_directory(&j,&requests,&policy(),NOW+1).as_deref(),Some("selected"),"exact request cannot bypass retry backoff");
+                j.directory_attempts.remove("selected");
+                assert_ne!(next_directory_where(&j,&requests,&policy(),NOW+1,|path,_|path!="GH666/Backup").as_deref(),Some("selected"),"exact request cannot bypass filters");
+                j.directory_turn=3;
+                assert_ne!(next_directory(&j,&requests,&policy(),NOW+1).as_deref(),Some("selected"),"reserved crawl turns retain breadth-first fairness");
+            }
+        }
     }
 
 }

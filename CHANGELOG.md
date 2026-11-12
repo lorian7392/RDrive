@@ -4,6 +4,8 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Prioritize an explicitly opened or refreshed cold folder over inherited recursive connection-refresh work.
+
 - Index retained mutations, deletion scopes, and metadata refresh demands once per pass; skip unchanged overlay writes while preserving required normalization updates.
 
 - Run metadata reads independently across Smart connections, revalidate before publication, and retain serialized upload recovery.
