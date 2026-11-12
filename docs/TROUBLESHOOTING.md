@@ -136,6 +136,10 @@ Smart requires a profile, domain configuration, accepted/enabled native extensio
 
 Inspect `provider domains`, `smart status`, `index status DOMAIN`, and companion `--diagnose` / `--list-domains`. Verify the same state/IPC paths and ensure an old embedded CLI is not still running after upgrade. See [macOS integration](MACOS_INTEGRATION.md).
 
+For an empty or stale Smart directory, inspect `rdrive index status DOMAIN`. `pending` includes discovered directories that have not completed their first successful scan; it does not mean all of them are currently running. An existing SQLite index can therefore be incomplete.
+
+Select a Smart folder in Finder and choose **Refresh Index**, or run `rdrive index refresh DOMAIN --recursive` for the connection tree. The full companion app also offers **Refresh Connection Index**; its headless resident notification helper does not show the menu bar UI. A queued acknowledgment means the request was saved. The owned service must be running and synchronization unpaused, and filters and retry backoff still apply.
+
 `index refresh` retains a request for the background worker. Offline search reads acquired filename/path metadata without fetching content or contacting the server. Unscanned directories, paused services, and filters affect results. See [indexing](DIRECTORY_INDEXING.md).
 
 Independent Finder Sync menus/badges and native File Provider decorations are different mechanisms. Mapping an ordinary directory or network volume does not make it a Smart domain.

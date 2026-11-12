@@ -4,6 +4,12 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Run metadata reads independently across Smart connections, revalidate before publication, and retain serialized upload recovery.
+- Enumerate SMB metadata with full 128-bit identities in bulk when supported, with a narrowly scoped compatibility fallback.
+- Keep valid cached listings available when a browse hint cannot be saved.
+- Bootstrap native notifications in bounded pages, reconcile concurrent changes, and isolate failures between connections.
+- Clarify Finder’s Refresh Index action and add a recursive Refresh Connection Index action in the full companion menu.
+
 - Add state-directory inspection, verified migration, and journal-based recovery through `rdrive config`, including shared locator and managed service updates.
 - Add profile changes through a private same-user broker bound to the running provider's state directory, with a standalone path when no broker is active.
 - Save profile changes and replay receipts atomically; add bounded waits, same-request retries within 24 hours, and retained-data checks before profile removal.

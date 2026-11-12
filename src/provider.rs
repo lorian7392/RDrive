@@ -12,6 +12,7 @@ mod namespace;
 mod resolution;
 mod transfers;
 mod admin;
+mod background_index;
 pub use resolution::{refresh_stale_smart_directory, resolve_smart, smart_repair_status, repair_stale_smart_directory};
 #[async_trait::async_trait]
 trait Connector: Send + Sync {
@@ -234,6 +235,10 @@ fn emit_namespace(store:&Store,d:&Domain,j:&mut Journal,old:&BTreeMap<String,Rec
 async fn refreshed_directory(b:&dyn Backend,d:&Domain,j:&Journal,parent_id:&str)->Result<BTreeMap<String,Record>> {
     let parent=scope_parent(j,parent_id)?;let backend_parent=remote(d,&parent)?;
     let incoming=b.list_metadata(&backend_parent).await?;
+    directory_entries(b,d,j,parent_id,incoming)
+}
+fn directory_entries(b:&dyn Backend,d:&Domain,j:&Journal,parent_id:&str,incoming:Vec<Entry>)->Result<BTreeMap<String,Record>> {
+    let parent=scope_parent(j,parent_id)?;let backend_parent=remote(d,&parent)?;
     let old=&j.items;let mut next=old.clone();let mut entries=BTreeMap::new();
     for entry in incoming {
         if backend::normalize(&entry.path)?!=entry.path||entry.path.rsplit_once('/').map(|(p,_)|p).unwrap_or("")!=backend_parent{bail!("unsafe provider child path");}
@@ -327,10 +332,8 @@ async fn provider_scan(b:&dyn Backend,root:&str)->Result<Vec<Entry>>{
         let path=relative(root,&item.path)?;if !keep_internal(&path){continue;}if item.is_dir{pending.push(item.path.clone());}all.push(item);
     }}Ok(all)
 }
-async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<Option<repository::Snapshot>> {
-    let old=j.items.clone();let mut next=BTreeMap::new();let mut pinned_snapshot=None;
-    if d.repository {
-        let snapshot=repository::read(store,b,&d.remote).await?;
+fn repository_entries(d:&Domain,j:&Journal,snapshot:&repository::Snapshot)->Result<BTreeMap<String,Record>> {
+    let old=&j.items;let mut next=BTreeMap::new();
         for (path,entry) in &snapshot.commit.entries {
             let parent=path.rsplit_once('/').map(|p|p.0).unwrap_or("");
             let parent_id=if parent.is_empty(){"root".into()}else{snapshot.commit.entries.get(parent).context("missing managed parent")?.id.clone()};
@@ -341,6 +344,13 @@ async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<O
             let item=Item{id:entry.id.clone(),parent_id,name:path.rsplit('/').next().unwrap().into(),kind:entry.kind.clone(),size:entry.size,modified:Some(entry.modified.clone()),content_version:entry.blob.clone().unwrap_or_else(||"directory".into()),metadata_version:mv,pinned,capabilities:vec!["read","write","add","rename","reparent","delete"].into_iter().map(str::to_owned).collect(),tag_data_hex:tags,extended_attributes:attributes,smart:d.smart,sync_state:None,sync_message:None,has_unsynced_changes:false,native_materialized:false};
             next.insert(entry.id.clone(),Record{path:path.clone(),item,entry:None,strong:None,client_id:old.get(&entry.id).and_then(|r|r.client_id.clone()),metadata_known:entry.metadata.is_some(),metadata_checked:0});
         }
+    Ok(next)
+}
+async fn refresh(store:&Store,b:&dyn Backend,d:&Domain,j:&mut Journal)->Result<Option<repository::Snapshot>> {
+    let old=j.items.clone();let mut next=BTreeMap::new();let mut pinned_snapshot=None;
+    if d.repository {
+        let snapshot=repository::read(store,b,&d.remote).await?;
+        next=repository_entries(d,j,&snapshot)?;
         pinned_snapshot=Some(snapshot);
     }else {
         let mut entries=provider_scan(b,&d.remote).await?;entries.retain(|e|relative(&d.remote,&e.path).is_ok_and(|p|keep_internal(&p)));
@@ -445,7 +455,7 @@ fn catalog(d:&Domain,j:&Journal,req:&Request)->Result<Value> {
     }
 }
 fn is_smart_catalog(home:&Path,req:&Request)->bool {
-    ["item","list","changes"].contains(&req.op.as_str())&&domains(home).is_ok_and(|all|all.iter().any(|d|d.id==req.domain&&d.smart))
+    ["item","list","changes","watcher_snapshot"].contains(&req.op.as_str())&&domains(home).is_ok_and(|all|all.iter().any(|d|d.id==req.domain&&d.smart))
 }
 fn update_overlay(store:&Store,d:&Domain)->Result<()> {
     let mut j=checked_journal(&store.home,&store.config,d)?;let old=j.items.clone();let mut next=std::mem::take(&mut j.items);apply_policies(store,d,&j,&mut next)?;
@@ -512,7 +522,7 @@ fn finder_index_refresh(home: &Path, request: &Request) -> Result<Value> {
         }
         record.path
     };
-    queue_index_refresh(home, &domain, binding, id.into(), path, false, true)
+    queue_index_refresh(home, &domain, binding, id.into(), path, request.recursive, true)
 }
 
 /// A Finder request and a recursive CLI request have separate durable slots
@@ -652,18 +662,22 @@ pub async fn process(home:&Path,staging:&Path,fd:&File,req:Request,context:crate
     if req.op=="pin"{return local_pin(home,&req);}
     if req.op=="native_error"{return local_native_error(home,&req);}
     let all=domains(home)?;let d=all.into_iter().find(|d|d.id==req.domain).context("no_such_item: domain missing")?;
+    if req.op=="watcher_snapshot"&&!d.smart {bail!("unsupported: watcher snapshots require a Smart domain");}
     if !d.smart {return online_process(home,staging,fd,req,context).await;}
     if is_smart_catalog(home,&req){
         let config=state::read_json(&home.join("config.json"))?;
         let binding=journal_binding(&config,&d)?;
-        let payload=match index::query(home,&d,&binding,&req)? {
+        let query=|| if req.op=="watcher_snapshot" {index::watcher_snapshot(home,&d,&binding,&req)} else {index::query(home,&d,&binding,&req)};
+        let payload=match query()? {
             Some(payload)=>payload,
-            None=>{checked_journal(home,&config,&d)?;index::query(home,&d,&binding,&req)?.context("provider index was not initialized")?},
+            None=>{checked_journal(home,&config,&d)?;query()?.context("provider index was not initialized")?},
         };
-        if !d.repository {
+        // Browse hints are best-effort; an already validated cached catalog
+        // stays readable when its separate demand slot cannot be written.
+        let _= (||->Result<()> { if !d.repository {
             if req.op=="list" {let parent=req.parent_id.as_deref().unwrap_or("root");if parent!="working_set"{request_index_demand(home,&config,&d,parent,false)?;}}
             else if req.op=="item" {if let Some(id)=req.id.as_deref().filter(|id|*id!="root"){if index::lookup(home,&d.id,&binding,id)?.is_some_and(|r|r.item.kind=="file"){request_index_demand(home,&config,&d,id,true)?;}}}
-        }
+        } Ok(()) })();
         return Ok(payload);
     }
     if ["create","modify","delete"].contains(&req.op.as_str()) {
@@ -1074,11 +1088,15 @@ pub async fn serve(home:PathBuf,socket:PathBuf,staging:PathBuf,development_tcp:b
     let token=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
     if let Some(tcp)=&tcp{state::atomic_json(&endpoint,&json!({"transport":"tcp","host":"127.0.0.1","port":tcp.local_addr()?.port(),"token":token}))?;}
     let coordinator=Arc::new(tokio::sync::Mutex::new(()));
-    let backends=Arc::new(tokio::sync::Mutex::new(IndexBackends::new()));
+    let replay_busy=Arc::new(tokio::sync::Mutex::new(()));
+    let mut metadata_workers=background_index::Workers::default();
     let mut smart_tick=tokio::time::interval(std::time::Duration::from_millis(500));
     loop{tokio::select!{
         _=tokio::signal::ctrl_c()=>break,
-        _=smart_tick.tick()=>{let home=home.clone();let staging=staging.clone();let fd=staging_fd.clone();let coordinator=coordinator.clone();let backends=backends.clone();let administration=administration.clone();tokio::spawn(async move{if let Ok(_guard)=coordinator.try_lock(){let mut backends=backends.lock().await;let _=background_once_prioritized(&home,&staging,fd.as_ref(),&mut backends,Some(administration.priority.as_ref())).await;}});},
+        _=smart_tick.tick()=>{
+            let _=metadata_workers.schedule(&home,coordinator.clone(),administration.priority.clone());
+            if let Ok(busy)=replay_busy.clone().try_lock_owned() {let home=home.clone();let staging=staging.clone();let fd=staging_fd.clone();let coordinator=coordinator.clone();let administration=administration.clone();tokio::spawn(async move{let _busy=busy;let _=background_index::replay_once(&home,&staging,fd.as_ref(),administration.priority.as_ref(),coordinator.as_ref()).await;});}
+        },
         accepted=listener.accept()=>{let (stream,_)=accepted?;
             // A client may disconnect before credentials can be inspected.
             // Reject that connection without terminating the shared service.
@@ -1230,3 +1248,7 @@ mod final_local_tests;
 #[cfg(test)]
 #[path = "provider/final_coverage_tests.rs"]
 mod final_coverage_tests;
+
+#[cfg(test)]
+#[path = "provider/refresh_scheduler_tests.rs"]
+mod refresh_scheduler_tests;

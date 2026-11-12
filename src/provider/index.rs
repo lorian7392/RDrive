@@ -802,6 +802,64 @@ pub(super) fn directory_scan(
     Ok(result)
 }
 
+/// Bounded watcher bootstrap. Keep the first page's anchor while walking IDs,
+/// then consume ordinary changes from that anchor to reconcile concurrent edits.
+/// Large tags and sidecars are irrelevant to notification/download scheduling.
+pub(super) fn watcher_snapshot(
+    home: &Path,
+    domain: &Domain,
+    binding: &str,
+    request: &Request,
+) -> Result<Option<Value>> {
+    let cursor = request.id.as_deref().unwrap_or("");
+    if cursor.len() > 4096 || cursor.chars().any(char::is_control)
+        || (request.id.is_some() && (cursor.is_empty() || request.anchor.is_none()))
+    {
+        bail!("invalid watcher snapshot cursor");
+    }
+    let db = path(home, &domain.id);
+    if !present(&db)? {
+        return Ok(None);
+    }
+    let mut connection = open(&db, false)?;
+    let transaction = connection.transaction()?;
+    let (current, _) = validate_binding(&transaction, &domain.id, binding)?;
+    let baseline = request.anchor.as_deref().map(str::parse::<u64>).transpose()?.unwrap_or(current);
+    let first: Option<i64> = transaction.query_row("SELECT min(anchor) FROM events", [], |row| row.get(0))?;
+    if baseline > current || (baseline < current
+        && first.is_none_or(|first| baseline.saturating_add(1) < first as u64))
+    {
+        bail!("sync_anchor_expired");
+    }
+    let config: crate::config::Config = state::read_json(&home.join("config.json"))?;
+    let selector = crate::filtering::Selector::new(&config, &domain.profile)?;
+    let mut statement = transaction.prepare(
+        "SELECT i.id,i.item_json,d.path FROM items i JOIN search_docs d ON d.id=i.id WHERE i.id>?1 ORDER BY i.id LIMIT 257",
+    )?;
+    let raw = statement.query_map([cursor], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let next_id = (raw.len() > 256).then(|| raw[255].0.clone());
+    let mut items = Vec::new();
+    for (id, bytes, path) in raw.into_iter().take(256) {
+        let mut item: Item = serde_json::from_str(&bytes).context("corrupt provider item projection")?;
+        if item.id != id {
+            bail!("corrupt provider item identity");
+        }
+        if item.sync_state.as_deref() == Some("queued_delete")
+            || !selector.allowed(&path, item.kind == "directory")?
+        {
+            continue;
+        }
+        item.tag_data_hex = None;
+        item.extended_attributes.clear();
+        item.sync_message = None;
+        item.capabilities.clear();
+        items.push(item);
+    }
+    Ok(Some(json!({"items":items,"anchor":baseline.to_string(),"next_id":next_id})))
+}
+
 pub(super) fn status(home: &Path, domain: &str, binding: &str) -> Result<Value> {
     let db = path(home, domain);
     if !present(&db)? {
@@ -872,6 +930,96 @@ mod tests {
     fn request(op: &str, parent: &str) -> Request {
         serde_json::from_value(json!({"v":1,"op":op,"domain":"index-test","parent_id":parent}))
             .unwrap()
+    }
+
+    #[test]
+    fn watcher_bootstrap_is_bounded_and_catches_edits_between_pages() {
+        let (_temporary, home, domain, mut journal) = fixture();
+        state::atomic_json(&home.join("config.json"), &crate::config::Config::default()).unwrap();
+        for number in 0..258 {
+            let id = format!("r{number:04}");
+            journal.items.insert(id.clone(), record(&domain, &id, "root", &id));
+        }
+        let pinned = &mut journal.items.get_mut("r0000").unwrap().item;
+        pinned.pinned = true;
+        pinned.tag_data_hex = Some("ab".repeat(200_000));
+        pinned.extended_attributes.insert("large".into(), "cd".repeat(200_000));
+        pinned.sync_message = Some("long diagnostic".repeat(100));
+        journal.items.get_mut("r0001").unwrap().path = "excluded.part".into();
+        journal.items.get_mut("r0001").unwrap().item.name = "excluded.part".into();
+        journal.items.get_mut("r0002").unwrap().item.sync_state = Some("queued_delete".into());
+        journal.anchor = 5;
+        journal.events.push(Event { anchor: 5, item: Some(journal.items["r0000"].item.clone()), deleted: None });
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let req = request("watcher_snapshot", "working_set");
+        let first = watcher_snapshot(&home, &domain, "bound", &req).unwrap().unwrap();
+        assert_eq!(first["anchor"], "5");
+        assert_eq!(first["next_id"], "r0255");
+        assert_eq!(first["items"].as_array().unwrap().len(), 254);
+        assert_eq!(first["items"][0]["pinned"], true);
+        assert!(first["items"][0]["tag_data_hex"].is_null());
+        assert_eq!(first["items"][0]["extended_attributes"], json!({}));
+        assert_eq!(first["items"][0]["capabilities"], json!([]));
+        assert!(first.to_string().len() < 200_000);
+        journal.items.get_mut("r0000").unwrap().item.metadata_version = "changed".into();
+        journal.items.remove("r0257");
+        for id in ["r0000a", "r9999"] {
+            journal.items.insert(id.into(), record(&domain, id, "root", id));
+        }
+        for (anchor, id) in [(6, "r0000"), (7, "r0000a"), (8, "r9999")] {
+            journal.events.push(Event { anchor, item: Some(journal.items[id].item.clone()), deleted: None });
+        }
+        journal.events.push(Event { anchor: 9, item: None, deleted: Some("r0257".into()) });
+        journal.anchor = 9;
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let mut next = req.clone();
+        next.id = first["next_id"].as_str().map(str::to_owned);
+        next.anchor = Some("5".into());
+        let second = watcher_snapshot(&home, &domain, "bound", &next).unwrap().unwrap();
+        assert_eq!(second["anchor"], "5");
+        assert!(second["next_id"].is_null());
+        assert_eq!(second["items"].as_array().unwrap().len(), 2);
+        let mut changes = request("changes", "working_set");
+        changes.anchor = Some("5".into());
+        let catchup = query(&home, &domain, "bound", &changes).unwrap().unwrap();
+        assert_eq!(catchup["anchor"], "9");
+        assert_eq!(catchup["items"].as_array().unwrap().len(), 3);
+        assert_eq!(catchup["deleted"], json!(["r0257"]));
+    }
+
+    #[test]
+    fn watcher_bootstrap_rejects_bad_cursors_expired_anchors_and_corrupt_rows() {
+        let (_temporary, home, domain, mut journal) = fixture();
+        state::atomic_json(&home.join("config.json"), &crate::config::Config::default()).unwrap();
+        let mut req = request("watcher_snapshot", "working_set");
+        assert!(watcher_snapshot(&home, &domain, "bound", &req).unwrap().is_none());
+        for cursor in ["".into(), "bad\n".into(), "x".repeat(4097), "missing-anchor".into()] {
+            req.id = Some(cursor);
+            assert!(watcher_snapshot(&home, &domain, "bound", &req).is_err());
+        }
+        req.id = None;
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        let empty = watcher_snapshot(&home, &domain, "bound", &req).unwrap().unwrap();
+        assert_eq!(empty["items"], json!([]));
+        assert_eq!(empty["anchor"], "0");
+        journal.anchor = 100;
+        let row = record(&domain, "a", "root", "a");
+        journal.items.insert("a".into(), row.clone());
+        journal.events.push(Event { anchor: 100, item: Some(row.item), deleted: None });
+        save(&home, &domain.id, "bound", &journal).unwrap();
+        for anchor in ["5", "0", "101"] {
+            req.anchor = Some(anchor.into());
+            assert!(watcher_snapshot(&home, &domain, "bound", &req).unwrap_err().to_string().contains("sync_anchor_expired"));
+        }
+        req.anchor = Some("invalid".into());
+        assert!(watcher_snapshot(&home, &domain, "bound", &req).is_err());
+        req.anchor = None;
+        assert!(watcher_snapshot(&home, &domain, "wrong", &req).is_err());
+        let db = open(&path(&home, &domain.id), true).unwrap();
+        db.execute("UPDATE items SET item_json=json_set(item_json,'$.id','wrong')", []).unwrap();
+        assert!(watcher_snapshot(&home, &domain, "bound", &req).unwrap_err().to_string().contains("identity"));
+        db.execute("UPDATE items SET item_json='{'", []).unwrap();
+        assert!(watcher_snapshot(&home, &domain, "bound", &req).unwrap_err().to_string().contains("projection"));
     }
 
     #[test]

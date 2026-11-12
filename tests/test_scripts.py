@@ -305,7 +305,7 @@ class NativeBuildScriptTests(TemporaryFiles):
         self.assertEqual(report["embedded_cli_sha256"], report["source_cli_sha256"])
         self.assertEqual(report["cli_version"], "rdrive 0.8.3")
         self.assertEqual(report["version"], "0.8.3")
-        self.assertEqual(report["bundle_build"], "21")
+        self.assertEqual(report["bundle_build"], "22")
         self.assertEqual(report["app_group"], "group.io.rdrive.shared")
         self.assertIsNone(report["development_ipc_root"])
         self.assertFalse(report["distribution_ready"])
@@ -325,7 +325,7 @@ class NativeBuildScriptTests(TemporaryFiles):
                           for action in provider["NSExtensionFileProviderActions"]],
                          ["rdrive.refresh", "rdrive.pin", "rdrive.unpin"])
         refresh = provider["NSExtensionFileProviderActions"][0]
-        self.assertEqual(refresh["NSExtensionFileProviderActionName"], "Refresh")
+        self.assertEqual(refresh["NSExtensionFileProviderActionName"], "Refresh Index")
         self.assertEqual(refresh["NSExtensionFileProviderActionActivationRule"],
                          "fileproviderItems.@count == 1 AND SUBQUERY(fileproviderItems, $item, "
                          "$item.userInfo.rdriveSmart == YES AND $item.contentType.identifier == 'public.folder').@count == 1")

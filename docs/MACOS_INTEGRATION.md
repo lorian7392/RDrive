@@ -158,10 +158,12 @@ extension access to that directory.
 ## Finder actions and availability
 
 RDrive adds Show Sync Status, Keep Offline and Allow Automatic Removal to the
-File Provider menu. Right-click one Smart folder and choose **Refresh** to queue
+File Provider menu. Right-click one Smart folder and choose **Refresh Index** to queue
 a refresh of its immediate contents. The menu-bar companion offers **Refresh
-Connection** for each Smart connection, which refreshes its root. Choose that
-command for a managed repository, which refreshes its entire snapshot. The
+Connection Index** for each Smart connection, which recursively refreshes its tree.
+This menu is available in the full companion app; the resident notification helper
+runs without a menu bar icon. For a managed repository, the command refreshes
+its entire snapshot. The
 background service applies the refresh and notifies Finder when the catalog
 changes. Use Finder's cloud download button or open an online-only
 item to download it. Finder offers Remove Download for eligible local copies.

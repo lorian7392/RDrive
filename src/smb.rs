@@ -14,7 +14,7 @@ use smb::connection::EncryptionMode;
 use smb::{
     Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, DirAccessMask,
     Directory, FileAccessMask, FileAttributes, FileCreateArgs, FileDispositionInformation,
-    FileFsVolumeInformation, FileIdBothDirectoryInformation, FileIdInformation,
+    FileFsVolumeInformation, FileIdBothDirectoryInformation, FileIdExtdDirectoryInformation, FileIdInformation,
     FileInternalInformation, FileNetworkOpenInformation, FileRenameInformation, GetLen,
     NotifyAction, NotifyFilter, ReadAt, Resource, ResourceHandle, ShareAccessFlags, UncPath,
     WriteAt,
@@ -28,6 +28,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const CHUNK: usize = 64 * 1024;
+const METADATA_CONCURRENCY: usize = 8;
 
 #[derive(Default)]
 struct LifecycleCounters {
@@ -62,6 +63,13 @@ trait ClientDriver: Send + Sync {
     async fn pause(&self, duration: Duration);
     async fn information(&self, handle: &ResourceHandle) -> smb::Result<FileNetworkOpenInformation> { handle.query_info::<FileNetworkOpenInformation>().await }
     async fn identity(&self, handle: &ResourceHandle) -> Result<FileIdInformation> { stable_identity(handle).await }
+    async fn identity_128(&self, handle: &ResourceHandle) -> smb::Result<FileIdInformation> { handle.query_info::<FileIdInformation>().await }
+    async fn directory_extended(&self, dir: &Arc<Directory>) -> smb::Result<Vec<FileIdExtdDirectoryInformation>> {
+        collect_directory_rows(Directory::query::<FileIdExtdDirectoryInformation>(dir, "*").await?).await
+    }
+    async fn directory_legacy(&self, dir: &Arc<Directory>) -> smb::Result<Vec<FileIdBothDirectoryInformation>> {
+        collect_directory_rows(Directory::query::<FileIdBothDirectoryInformation>(dir, "*").await?).await
+    }
     async fn read(&self, file: &smb::File, buffer: &mut [u8], offset: u64) -> smb::Result<usize> { file.read_at(buffer, offset).await }
     async fn write(&self, file: &smb::File, buffer: &[u8], offset: u64) -> smb::Result<usize> { file.write_at(buffer, offset).await }
     async fn close_file(&self, file: &smb::File) -> smb::Result<()> { file.close().await }
@@ -1623,14 +1631,8 @@ impl Backend for Smb {
             let mut metadata = entry(&path, &info);
             // Deliberately weak: metadata enumeration must not download file
             // contents. It never authorizes a guarded overwrite/download.
-            metadata.etag = Some(format!(
-                "W/smb-meta:{:016x}:{:032x}:{}:{}:{}",
-                identity.volume_serial_number,
-                identity.file_id,
-                info.end_of_file,
-                info.last_write_time.since_epoch().as_nanos(),
-                info.change_time.since_epoch().as_nanos()
-            ));
+            metadata.etag = Some(metadata_revision(identity.volume_serial_number, identity.file_id,
+                info.end_of_file, info.last_write_time, info.change_time));
             Ok(Some(metadata))
         }
         .await;
@@ -1678,14 +1680,28 @@ impl Backend for Smb {
                     .await?
                     .file_attributes,
             )?;
-            let mut stream = Directory::query::<FileIdBothDirectoryInformation>(&dir, "*").await?;
+            // Extended rows contain the same full file identity and change/write
+            // timestamps as stat_metadata. One volume lookup replaces N child
+            // opens without reading payloads or strengthening these revisions.
+            let bulk = match self.client.driver.directory_extended(&dir).await {
+                Ok(rows) => match self.client.driver.identity_128(dir.handle()).await {
+                    Ok(identity) => Some((identity.volume_serial_number, rows)),
+                    // A server may implement extended enumeration while its
+                    // individual FileIdInformation class is unsupported. Do
+                    // not mix 128-bit rows with legacy 64-bit identity tokens.
+                    Err(error) if unsupported_directory_class(&error) => None,
+                    Err(error) => return Err(error.into()),
+                },
+                Err(error) if unsupported_directory_class(&error) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some((volume, rows)) = bulk {
+                return Ok((extended_metadata_entries(&path, volume, rows)?, false));
+            }
             let mut entries = Vec::new();
-            while let Some(item) = stream.next().await {
-                let item = item?;
+            for item in self.client.driver.directory_legacy(&dir).await? {
                 let name = item.file_name.to_string();
-                if name == "." || name == ".." {
-                    continue;
-                }
+                if name == "." || name == ".." { continue; }
                 valid_component(&name)?;
                 reject_reparse(item.file_attributes)?;
                 entries.push(Entry {
@@ -1697,22 +1713,23 @@ impl Backend for Smb {
                 });
             }
             entries.sort_by(|a, b| a.path.cmp(&b.path));
-            Ok(entries)
+            Ok((entries, true))
         }
         .await;
-        let mut entries = finish(
+        let (entries, legacy) = finish(
             result,
             dir.handle().close().await.map_err(anyhow::Error::from),
         )?;
-        for item in &mut entries {
-            if !internal_artifact(&item.path) {
-                *item = self
-                    .stat_metadata(&item.path)
-                    .await?
-                    .context("SMB file disappeared during directory scan")?;
-            }
-        }
-        Ok(entries)
+        if !legacy { return Ok(entries); }
+        // Preserve the legacy full metadata checks, but bound concurrent child
+        // opens. Drain every result before reporting an error so one failed
+        // lookup cannot cancel sibling operations before their CLOSE completes.
+        let checked = futures_util::stream::iter(entries).map(|item| async move {
+            if internal_artifact(&item.path) { return Ok(item); }
+            self.stat_metadata(&item.path).await?
+                .context("SMB file disappeared during directory scan")
+        }).buffered(METADATA_CONCURRENCY).collect::<Vec<Result<Entry>>>().await;
+        checked.into_iter().collect()
     }
 
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
@@ -2304,6 +2321,40 @@ async fn stable_identity(file: &ResourceHandle) -> Result<FileIdInformation> {
     stable_identity_from(file).await
 }
 
+async fn collect_directory_rows<T: Send>(mut stream: impl futures_util::Stream<Item = smb::Result<T>> + Unpin + Send) -> smb::Result<Vec<T>> {
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await { rows.push(row?); }
+    Ok(rows)
+}
+
+fn unsupported_directory_class(error: &smb::Error) -> bool {
+    matches!(error, smb::Error::ReceivedErrorMessage(status, _) | smb::Error::UnexpectedMessageStatus(status)
+        if matches!(smb::Status::try_from(*status).ok(), Some(smb::Status::InvalidInfoClass | smb::Status::NotSupported)))
+}
+
+fn metadata_revision(volume: u64, file_id: u128, size: u64, write: FileTime, change: FileTime) -> String {
+    format!("W/smb-meta:{volume:016x}:{file_id:032x}:{size}:{}:{}",
+        write.since_epoch().as_nanos(), change.since_epoch().as_nanos())
+}
+
+fn extended_metadata_entries(path: &str, volume: u64, rows: Vec<FileIdExtdDirectoryInformation>) -> Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for item in rows {
+        let name = item.file_name.to_string();
+        if name == "." || name == ".." { continue; }
+        valid_component(&name)?;
+        reject_reparse(item.file_attributes)?;
+        if item.reparse_point_tag != 0 { bail!("SMB reparse points are rejected"); }
+        let path = backend::join(path, &name)?;
+        let etag = (!internal_artifact(&path)).then(|| metadata_revision(volume, item.file_id,
+            item.end_of_file, item.last_write_time, item.change_time));
+        entries.push(Entry { path, is_dir: item.file_attributes.directory(), size: item.end_of_file,
+            modified: unix_ms(item.last_write_time), etag });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
 #[async_trait]
 trait IdentityQuery: Send + Sync {
     async fn file_id(&self) -> smb::Result<FileIdInformation>;
@@ -2797,6 +2848,15 @@ mod tests {
         let share = UncPath::from_str(r"\\127.0.0.1\unused").unwrap();
         Smb { client: Arc::new(ManagedClient::new(Client::new(ClientConfig::default()), share.clone(), "fake", "unused")), share, root: root.into(), encryption_required: true, scope: "scope".into(), transfer: TransferContext::default(), guard_hooks: None, notify_buffer: None }
     }
+    struct MetadataGate {
+        entered: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    impl Default for MetadataGate {
+        fn default() -> Self { Self { entered: 0.into(), active: 0.into(), peak: 0.into(), release: tokio::sync::Semaphore::new(0) } }
+    }
     #[derive(Default)]
     struct ScriptedDriver {
         liveness: std::sync::Mutex<std::collections::VecDeque<smb::Result<bool>>>,
@@ -2808,7 +2868,14 @@ mod tests {
         forward: std::sync::atomic::AtomicBool,
         resources: std::sync::Mutex<std::collections::VecDeque<Resource>>,
         information: std::sync::Mutex<std::collections::VecDeque<smb::Result<FileNetworkOpenInformation>>>,
+        extended_rows: std::sync::Mutex<std::collections::VecDeque<smb::Result<Vec<FileIdExtdDirectoryInformation>>>>,
+        legacy_rows: std::sync::Mutex<std::collections::VecDeque<smb::Result<Vec<FileIdBothDirectoryInformation>>>>,
+        extended_queries: std::sync::atomic::AtomicUsize,
+        metadata_gate: std::sync::Mutex<Option<Arc<MetadataGate>>>,
+        identity_calls: std::sync::atomic::AtomicUsize,
+        legacy_queries: std::sync::atomic::AtomicUsize,
         identities: std::sync::Mutex<std::collections::VecDeque<Result<FileIdInformation>>>,
+        full_identities: std::sync::Mutex<std::collections::VecDeque<smb::Result<FileIdInformation>>>,
         reads: std::sync::Mutex<std::collections::VecDeque<Option<smb::Result<usize>>>>,
         writes: std::sync::Mutex<std::collections::VecDeque<smb::Result<usize>>>,
         closes: std::sync::Mutex<std::collections::VecDeque<smb::Result<()>>>,
@@ -2842,7 +2909,30 @@ mod tests {
             let scripted = self.information.lock().unwrap().pop_front(); if let Some(result) = scripted { result } else { handle.query_info::<FileNetworkOpenInformation>().await }
         }
         async fn identity(&self, handle: &ResourceHandle) -> Result<FileIdInformation> {
+            use std::sync::atomic::Ordering;
+            self.identity_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.metadata_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                let active = gate.active.fetch_add(1, Ordering::SeqCst) + 1;
+                gate.peak.fetch_max(active, Ordering::SeqCst); gate.entered.fetch_add(1, Ordering::SeqCst);
+                gate.release.acquire().await.unwrap().forget();
+                gate.active.fetch_sub(1, Ordering::SeqCst);
+            }
             let scripted = self.identities.lock().unwrap().pop_front(); if let Some(result) = scripted { result } else { stable_identity(handle).await }
+        }
+        async fn identity_128(&self, handle: &ResourceHandle) -> smb::Result<FileIdInformation> {
+            let scripted = self.full_identities.lock().unwrap().pop_front();
+            if let Some(result) = scripted { result } else { NetworkDriver.identity_128(handle).await }
+        }
+        async fn directory_extended(&self, dir: &Arc<Directory>) -> smb::Result<Vec<FileIdExtdDirectoryInformation>> {
+            self.extended_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let scripted = self.extended_rows.lock().unwrap().pop_front();
+            if let Some(result) = scripted { result } else { NetworkDriver.directory_extended(dir).await }
+        }
+        async fn directory_legacy(&self, dir: &Arc<Directory>) -> smb::Result<Vec<FileIdBothDirectoryInformation>> {
+            self.legacy_queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let scripted = self.legacy_rows.lock().unwrap().pop_front();
+            if let Some(result) = scripted { result } else { NetworkDriver.directory_legacy(dir).await }
         }
         async fn read(&self, file: &smb::File, buffer: &mut [u8], offset: u64) -> smb::Result<usize> {
             let scripted = self.reads.lock().unwrap().pop_front().flatten(); if let Some(result) = scripted { result } else { file.read_at(buffer, offset).await }
@@ -2874,6 +2964,58 @@ mod tests {
     }
     fn managed_with_driver(driver: Arc<ScriptedDriver>) -> ManagedClient {
         let mut client = Arc::try_unwrap(offline_client("").client).ok().unwrap(); client.driver = driver; client
+    }
+
+    fn extended_row(name: &str, file_id: u128) -> FileIdExtdDirectoryInformation {
+        FileIdExtdDirectoryInformation { file_index: 0, creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO, last_write_time: FileTime::ZERO, change_time: FileTime::ZERO,
+            end_of_file: 7, allocation_size: 4096, file_attributes: FileAttributes::new(),
+            ea_size: Some(0), reparse_tag: None, reparse_point_tag: 0, file_id, file_name: name.into() }
+    }
+
+    #[test]
+    fn bulk_metadata_preserves_full_identity_and_rejects_unsafe_rows() {
+        let id = (1u128 << 120) | 42;
+        let internal = format!(".rdrive-upload-{}", uuid::Uuid::new_v4());
+        let mut directory = extended_row("a-directory", id + 1);
+        directory.file_attributes = directory.file_attributes.with_directory(true);
+        let entries = extended_metadata_entries("parent", 99, vec![extended_row("z-file", id),
+            extended_row(".", 0), extended_row("..", 0), directory, extended_row(&internal, 2)]).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].etag.is_none(), "internal receipts retain existing non-authoritative metadata semantics");
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[2].etag.as_deref(), Some("W/smb-meta:0000000000000063:0100000000000000000000000000002a:7:0:0"));
+        assert!(require_strong_revision(&entries[2]).is_err());
+        for name in ["../escape", "a/b", "a\\b", "name:stream"] {
+            assert!(extended_metadata_entries("", 1, vec![extended_row(name, id)]).is_err());
+        }
+        let mut row = extended_row("reparse", id);
+        row.file_attributes = row.file_attributes.with_reparse_point(true);
+        assert!(extended_metadata_entries("", 1, vec![row]).unwrap_err().to_string().contains("reparse"));
+        let mut row = extended_row("inconsistent-reparse", id); row.reparse_point_tag = 0xa000000c;
+        assert!(extended_metadata_entries("", 1, vec![row]).unwrap_err().to_string().contains("reparse"));
+        assert!(extended_metadata_entries("", 1, vec![]).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn directory_row_collection_rejects_partial_stream_errors() {
+        use futures_util::stream;
+        assert_eq!(collect_directory_rows(stream::iter([Ok(7), Ok(9)])).await.unwrap(), vec![7, 9]);
+        assert!(collect_directory_rows::<u8>(stream::iter([])).await.unwrap().is_empty());
+        let error = collect_directory_rows(stream::iter([Ok(7), Err(smb::Error::ConnectionStopped), Ok(9)])).await.unwrap_err();
+        assert!(matches!(error, smb::Error::ConnectionStopped), "partial directory results must never become a successful listing");
+    }
+
+    #[test]
+    fn only_explicitly_unsupported_query_classes_allow_slow_metadata_fallback() {
+        for status in [0xc0000003, 0xc00000bb] {
+            assert!(unsupported_directory_class(&smb::Error::UnexpectedMessageStatus(status)));
+        }
+        for error in [smb::Error::UnexpectedMessageStatus(0xc000006d),
+            smb::Error::UnexpectedMessageStatus(0xc000000d), smb::Error::ConnectionStopped,
+            smb::Error::MissingPermissions("denied".into())] {
+            assert!(!unsupported_directory_class(&error));
+        }
     }
 
     #[tokio::test]
@@ -3619,7 +3761,115 @@ mod tests {
         Ok(())
     }
 
+    async fn bulk_metadata_transport_regression(real: &Smb, profile: &Profile, root: &str) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let driver = Arc::new(ScriptedDriver::default()); driver.forward.store(true, Ordering::SeqCst);
+        let mut client = Smb::new(profile, "testpass").await?;
+        Arc::get_mut(&mut client.client).unwrap().driver = driver.clone();
+        let entries = client.list_metadata(root).await?;
+        assert!(!entries.is_empty());
+        assert_eq!(driver.extended_queries.load(Ordering::SeqCst), 1);
+        let actual_legacy = driver.legacy_queries.load(Ordering::SeqCst);
+        println!("OBSERVED Samba extended query supported: {}", actual_legacy == 0);
+        let mut extended = Vec::new();
+        for item in entries.iter().filter(|item| !internal_artifact(&item.path)) {
+            assert!(item.same_revision(&real.stat_metadata(&item.path).await?.unwrap()),
+                "directory revision differs from stat_metadata for {}", item.path);
+            let mut args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_read_attributes(true));
+            args.options = CreateOptions::new().with_open_reparse_point(true);
+            let resource = real.client.create_file(&real.unc(&item.path)?, &args).await?;
+            let info = handle(&resource).query_info::<FileNetworkOpenInformation>().await?;
+            let identity = stable_identity(handle(&resource)).await?;
+            handle(&resource).close().await?;
+            let mut row = extended_row(item.path.rsplit('/').next().unwrap(), identity.file_id);
+            row.end_of_file = info.end_of_file; row.last_write_time = info.last_write_time;
+            row.change_time = info.change_time; row.file_attributes = info.file_attributes;
+            extended.push(row);
+        }
+        // Samba releases which lack the extended query class exercise the
+        // conservative live fallback above. Feed independently queried real
+        // server metadata through the supported-row seam to verify the fast
+        // path on those releases as well, including actual volume/identity.
+        let mut args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_read_attributes(true));
+        args.options = CreateOptions::new().with_open_reparse_point(true);
+        let parent = real.client.create_file(&real.unc(root)?, &args).await?;
+        let volume = stable_identity(handle(&parent)).await?.volume_serial_number;
+        handle(&parent).close().await?;
+        driver.dispositions.lock().unwrap().clear();
+        driver.full_identities.lock().unwrap().push_back(Ok(FileIdInformation { volume_serial_number: volume, file_id: 0 }));
+        driver.extended_rows.lock().unwrap().push_back(Ok(extended));
+        let bulk = client.list_metadata(root).await?;
+        assert_eq!(driver.dispositions.lock().unwrap().len(), root.split('/').count() + 1,
+            "bulk enumeration must not open children regardless of directory width");
+        assert_eq!(bulk, entries.iter().filter(|item| !internal_artifact(&item.path)).cloned().collect::<Vec<_>>());
+        for status in [0xc0000003, 0xc00000bb] {
+            driver.extended_rows.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(status)));
+            let observed = client.list_metadata(root).await?;
+            assert_eq!(observed, entries, "unsupported query fallback changed revisions");
+        }
+        assert_eq!(driver.legacy_queries.load(Ordering::SeqCst), actual_legacy + 2);
+        for error in [smb::Error::UnexpectedMessageStatus(0xc000006d), smb::Error::ConnectionStopped,
+            smb::Error::InvalidArgument("malformed directory response".into())] {
+            driver.extended_rows.lock().unwrap().push_back(Err(error));
+            assert!(client.list_metadata(root).await.is_err());
+            assert_eq!(driver.legacy_queries.load(Ordering::SeqCst), actual_legacy + 2, "authentication/transport/data errors must propagate");
+        }
+        driver.extended_rows.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(0xc00000bb)));
+        driver.legacy_rows.lock().unwrap().push_back(Err(smb::Error::MissingPermissions("legacy query denied".into())));
+        assert!(client.list_metadata(root).await.is_err());
+        driver.extended_rows.lock().unwrap().push_back(Ok(vec![extended_row("full-id.bin", (1u128 << 120) | 42)]));
+        driver.full_identities.lock().unwrap().push_back(Ok(FileIdInformation { volume_serial_number: 99, file_id: 7 }));
+        let observed = client.list_metadata(root).await?;
+        assert_eq!(observed[0].etag.as_deref(), Some("W/smb-meta:0000000000000063:0100000000000000000000000000002a:7:0:0"));
+        driver.extended_rows.lock().unwrap().push_back(Ok(vec![extended_row("invalid/path", 1)]));
+        driver.full_identities.lock().unwrap().push_back(Ok(FileIdInformation { volume_serial_number: volume, file_id: 0 }));
+        assert!(client.list_metadata(root).await.is_err());
+        driver.extended_rows.lock().unwrap().push_back(Ok(vec![]));
+        driver.full_identities.lock().unwrap().push_back(Err(smb::Error::MissingPermissions("synthetic parent volume query error".into())));
+        assert!(client.list_metadata(root).await.is_err());
+        for status in [0xc0000003, 0xc00000bb] {
+            driver.extended_rows.lock().unwrap().push_back(Ok(vec![extended_row("never-adopt-truncated-id", 1u128 << 120)]));
+            driver.full_identities.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(status)));
+            assert_eq!(client.list_metadata(root).await?, entries, "mixed query support must preserve the individual stat identity format");
+        }
+        // Exercise the actual individual-ID query rather than only its seam.
+        driver.extended_rows.lock().unwrap().push_back(Ok(vec![]));
+        let _ = client.list_metadata(root).await?;
+        let wide = backend::join(root, "bounded-metadata")?; real.mkdir(&wide).await?;
+        fixture_docker(&["exec", "sh", "-c", "i=0; while [ $i -lt 24 ]; do printf content > \"$1/item-$i\"; i=$((i+1)); done", "sh", &format!("/share/{wide}")]).await?;
+        let gate = Arc::new(MetadataGate::default());
+        *driver.metadata_gate.lock().unwrap() = Some(gate.clone());
+        driver.extended_rows.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(0xc00000bb)));
+        let client = Arc::new(client);
+        let task = { let client = client.clone(); let wide = wide.clone(); tokio::spawn(async move { client.list_metadata(&wide).await }) };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gate.entered.load(Ordering::SeqCst) < METADATA_CONCURRENCY { tokio::task::yield_now().await; }
+        }).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), METADATA_CONCURRENCY, "metadata concurrency exceeded its admission bound");
+        gate.release.add_permits(24);
+        let wide_entries = task.await??;
+        assert_eq!(wide_entries.len(), 24);
+        assert_eq!(gate.peak.load(Ordering::SeqCst), METADATA_CONCURRENCY);
+        assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+        *driver.metadata_gate.lock().unwrap() = None;
+        let before = driver.identity_calls.load(Ordering::SeqCst);
+        driver.extended_rows.lock().unwrap().push_back(Err(smb::Error::UnexpectedMessageStatus(0xc00000bb)));
+        driver.identities.lock().unwrap().push_back(Err(anyhow!("synthetic failed child identity")));
+        assert!(client.list_metadata(&wide).await.unwrap_err().to_string().contains("failed child identity"));
+        assert_eq!(driver.identity_calls.load(Ordering::SeqCst) - before, 24, "an error must not cancel remaining child handle cleanup");
+        let rows = client.list_metadata(&wide).await?;
+        assert_eq!(rows, wide_entries, "bounded fallback changed order or weak revisions");
+        for item in rows { assert!(item.same_revision(&real.stat_metadata(&item.path).await?.unwrap())); }
+        fixture_docker(&["exec", "ln", "-s", "item-0", &format!("/share/{wide}/transparent-link")]).await?;
+        let linked = client.list_metadata(&wide).await?.into_iter().find(|item| item.path.ends_with("/transparent-link")).context("Samba did not enumerate its transparent POSIX symlink")?;
+        assert!(linked.same_revision(&real.stat_metadata(&linked.path).await?.unwrap()), "server-transparent symlink metadata semantics changed");
+        println!("PROOF full-128-bit bulk metadata uses constant child opens; real fallback preserves revisions, bounds concurrency at 8, and drains errors");
+        Ok(())
+    }
+
     async fn mocked_resource_failures(real: &Smb, profile: &Profile, root: &str, directory: &Path) -> Result<()> {
+        bulk_metadata_transport_regression(real, profile, root).await?;
         use std::sync::atomic::Ordering;
         let driver = Arc::new(ScriptedDriver::default()); driver.forward.store(true, Ordering::SeqCst);
         let mut client = Smb::new(profile, "testpass").await?;

@@ -423,9 +423,9 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         connections.addItem(withTitle: "Loading connections…", action: nil, keyEquivalent: "")
         let parent = NSMenuItem(title: "Add Connection to Finder", action: nil, keyEquivalent: "")
         parent.submenu = connections; menu.addItem(parent)
-        let refresh = NSMenu(title: "Refresh Connection")
+        let refresh = NSMenu(title: "Refresh Connection Index")
         refresh.addItem(withTitle: "Loading connections…", action: nil, keyEquivalent: "")
-        let refreshParent = NSMenuItem(title: "Refresh Connection", action: nil, keyEquivalent: "")
+        let refreshParent = NSMenuItem(title: "Refresh Connection Index", action: nil, keyEquivalent: "")
         refreshParent.submenu = refresh
         menu.addItem(refreshParent)
         DispatchQueue.global(qos: .utility).async {
@@ -455,7 +455,7 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Enable Finder Menus…", action: #selector(enableFinder), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Open Cloud Storage", action: #selector(openStorage), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Refresh Connections", action: #selector(refreshConnections), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Reload Connection Menu", action: #selector(refreshConnections), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit RDrive", action: #selector(quit), keyEquivalent: "q").target = self
         updateRoots()
@@ -475,11 +475,11 @@ final class CompanionDelegate: NSObject, NSApplicationDelegate {
         guard let id = sender.representedObject as? String, let bridge = bridge else { return }
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let reply = try self.integration.request(bridge, ["op": "refresh_index", "domain": id, "id": "root"])
+                let reply = try self.integration.request(bridge, ["op": "refresh_index", "domain": id, "id": "root", "recursive": true])
                 guard reply["queued"] as? Bool == true else {
                     throw NativeFailure.bridge("RDrive did not acknowledge the refresh request.")
                 }
-                DispatchQueue.main.async { self.showMessage("Folder list refresh queued.") }
+                DispatchQueue.main.async { self.showMessage("Connection index refresh queued.") }
             } catch {
                 DispatchQueue.main.async { self.showMessage(providerError(error).localizedDescription) }
             }

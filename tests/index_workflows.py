@@ -519,6 +519,44 @@ def run(binary, output=None):
             migration.stop()
             passed("backend binding changes and unsafe refresh paths fail closed without reusing another scope")
 
+            for directory in ("first-scope", "second-scope/known"):
+                (remote / directory).mkdir(parents=True)
+            (remote / "second-scope/known/cached.txt").write_bytes(b"cached child")
+            independent = broker("independent", "slow-domain", "first-scope")
+            independent.configure()
+            independent.cli("smart", "setup", "healthy-domain", "fixture", "second-scope")
+            independent.start()
+            healthy = wait(lambda: sqlite_items(independent.home, "healthy-domain")
+                           if "known/cached.txt" in sqlite_items(independent.home, "healthy-domain") else None,
+                           "second connection cache warmup", 20)
+            healthy_parent = healthy["known"]["id"]
+            blocked = dict(entered=threading.Event(), release=threading.Event())
+            IndexedDav.gates["/dav/first-scope"] = blocked
+            try:
+                independent.ok(op="refresh_index", domain="slow-domain", id="root")
+                assert blocked["entered"].wait(10), "first connection refresh never reached its network gate"
+                samples = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    for _ in range(3):
+                        start = time.monotonic()
+                        cached = pool.submit(independent.ok, op="list", domain="healthy-domain",
+                                             parent_id=healthy_parent).result(timeout=2)
+                        samples.append((time.monotonic() - start) * 1000)
+                        assert any(item["name"] == "cached.txt" for item in cached["items"])
+                (remote / "second-scope/known/new.txt").write_bytes(b"new child")
+                refresh = independent.ok(op="refresh_index", domain="healthy-domain", id=healthy_parent, recursive=True)
+                assert refresh["queued"] is True
+                wait(lambda: "known/new.txt" in sqlite_items(independent.home, "healthy-domain"),
+                     "healthy connection refresh must finish while first connection is held", 12)
+                assert not blocked["release"].is_set(), "fixture accidentally released the slow connection"
+                metrics["independent_connections"] = dict(cached_query_ms=samples,
+                    refresh_completed_before_slow_connection_release=True,
+                    method="One authenticated bridge, two domains; first remote root listing held at a deterministic gate")
+            finally:
+                blocked["release"].set()
+                independent.stop()
+            passed("one blocked connection cannot prevent another connection's cached reads or manual refresh")
+
             perf = broker("performance", "performance", "performance")
             perf.configure()
             perf.cli("index", "config", "--disable")
@@ -528,6 +566,21 @@ def run(binary, output=None):
             perf.start()
             wait(lambda: provider_database(perf.home, perf.domain).exists(), "10k SQLite migration", 30)
             assert len(sqlite_items(perf.home, perf.domain)) == 10100
+            watcher_ids, cursor, snapshot_anchor = set(), None, None
+            while True:
+                page = perf.ok(op="watcher_snapshot", **({"id": cursor, "anchor": snapshot_anchor} if cursor else {}))
+                assert len(page["items"]) <= 256
+                if snapshot_anchor is None:
+                    snapshot_anchor = page["anchor"]
+                assert page["anchor"] == snapshot_anchor
+                for item in page["items"]:
+                    assert item["id"] not in watcher_ids, "watcher bootstrap repeated an item"
+                    watcher_ids.add(item["id"])
+                cursor = page["next_id"]
+                if cursor is None:
+                    break
+            assert len(watcher_ids) == 10100
+            passed("native watcher bootstraps 10,100 items through bounded authenticated pages without duplication")
             large_path.write_bytes(b"{retained JSON is not a query source")
             # Corrupt only an unrelated full Record projection, keeping its
             # public Item projection intact. A full-Journal load would now fail;

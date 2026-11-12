@@ -48,9 +48,10 @@ fn validate_tree(tree:&BTreeMap<String,RepoItem>)->Result<()> {
         if let Some((parent,_))=path.rsplit_once('/') {if tree.get(parent).is_none_or(|p|p.kind!="directory"){bail!("repository parent is missing or not a directory: {parent}");}}
     }crate::sync::validate_path_collisions(tree.keys())?;Ok(())
 }
-async fn json_file<T:serde::de::DeserializeOwned>(store:&Store,b:&dyn Backend,remote:&str)->Result<T>{
+async fn json_file<T:serde::de::DeserializeOwned>(store:&Store,b:&dyn Backend,remote:&str)->Result<T>{json_file_at(&store.home,b,remote).await}
+async fn json_file_at<T:serde::de::DeserializeOwned>(home:&Path,b:&dyn Backend,remote:&str)->Result<T>{
     let e=b.stat(remote).await?.context("repository record missing")?;if e.is_dir||e.size>MAX_MANIFEST{bail!("repository record exceeds allowed size");}
-    let temp=store.home.join("tmp").join(uuid::Uuid::new_v4().to_string());
+    let temp=home.join("tmp").join(uuid::Uuid::new_v4().to_string());
     let result=async{crate::operations::verified_download(b,remote,&temp).await?;Ok(serde_json::from_slice::<T>(&fs::read(&temp)?)?)}.await;
     let _=fs::remove_file(temp);result
 }
@@ -69,8 +70,9 @@ pub async fn init(store:&Store,b:&dyn Backend,root:&str)->Result<Snapshot>{
     let observed:serde_json::Value=json_file(store,b,&format_path).await?;if observed!=format{bail!("incompatible repository format");}
     read(store,b,&root).await
 }
-pub async fn read(store:&Store,b:&dyn Backend,root:&str)->Result<Snapshot>{
-    let observed:serde_json::Value=json_file(store,b,&backend::join(root,&format!("{CONTROL}/FORMAT.json"))?).await?;
+pub async fn read(store:&Store,b:&dyn Backend,root:&str)->Result<Snapshot>{read_at(&store.home,b,root).await}
+pub(crate) async fn read_at(home:&Path,b:&dyn Backend,root:&str)->Result<Snapshot>{
+    let observed:serde_json::Value=json_file_at(home,b,&backend::join(root,&format!("{CONTROL}/FORMAT.json"))?).await?;
     if observed!=serde_json::json!({"format":"rdrive-snapshot-repository","version":1,"publication":"append-only-atomic-rename"}){bail!("invalid repository format");}
     let dir=backend::join(&backend::normalize(root)?,&format!("{CONTROL}/commits"))?;
     let mut files=b.list(&dir).await?;files.sort_by(|a,b|a.path.cmp(&b.path));
@@ -79,7 +81,7 @@ pub async fn read(store:&Store,b:&dyn Backend,root:&str)->Result<Snapshot>{
         let name=e.path.rsplit('/').next().context("invalid commit name")?;
         if e.is_dir||!name.ends_with(".json")||name.len()!=25||!name.is_ascii()||!name[..20].bytes().all(|c|c.is_ascii_digit()){bail!("unexpected entry in immutable commit directory");}
         let sequence=name[..20].parse::<u64>()?;if sequence!=current.commit.sequence+1{bail!("repository commit chain contains a missing/duplicate slot");}
-        let next:Snapshot=json_file(store,b,&e.path).await?;next.validate()?;
+        let next:Snapshot=json_file_at(home,b,&e.path).await?;next.validate()?;
         let expected_parent=if sequence==1{None}else{Some(current.checksum.clone())};
         if next.commit.sequence!=sequence||next.commit.parent!=expected_parent{bail!("repository history is not one valid parent chain");}
         current=next;

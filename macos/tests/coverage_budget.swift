@@ -18,6 +18,11 @@ final class BudgetPeer {
     var ledger: [String: [String: UInt64]] = [:]
     var expireChanges = false
     var malformedCatalog = false
+    var malformedDomains = Set<String>()
+    var catalogByDomain: [String: [[String: Any]]] = [:]
+    var snapshotReply: [String: Any]?
+    var blockedCatalogDomain: String?
+    let catalogStarted = DispatchSemaphore(value: 0)
     var incompleteBudget = false
     var rejectReservation = false
     var extraUsed: UInt64 = 0
@@ -68,12 +73,23 @@ final class BudgetPeer {
             try! Data("provider-content".utf8).write(to:staged)
             return ["ok":true,"item":items[request["id"] as! String]!,"content_path":staged.path]
         case "native_error", "pin":return ["ok":true]
-        case "list", "changes":
+        case "list", "changes", "watcher_snapshot":
             if request["op"] as? String == "changes" && expireChanges {
                 expireChanges = false; return ["ok": false, "error": ["code": "sync_anchor_expired"]]
             }
-            if malformedCatalog { return ["ok": true] }
-            return ["ok": true, "items": catalog, "deleted": ["removed-file"], "anchor": "next"]
+            let domain = request["domain"] as? String ?? ""
+            if malformedCatalog || malformedDomains.contains(domain) { return ["ok": true] }
+            let values = catalogByDomain[domain] ?? catalog
+            if request["op"] as? String == "watcher_snapshot" {
+                if let override = snapshotReply { return override }
+                let cursor = request["id"] as? String ?? ""
+                let remaining = values.sorted { ($0["id"] as! String) < ($1["id"] as! String) }.filter { ($0["id"] as! String) > cursor }
+                let page = Array(remaining.prefix(256))
+                var response: [String: Any] = ["ok": true, "items": page, "anchor": request["anchor"] as? String ?? "next"]
+                if remaining.count > page.count { response["next_id"] = page.last!["id"] }
+                return response
+            }
+            return ["ok": true, "items": values, "deleted": ["removed-file"], "anchor": "next"]
         case "cache_budget":
             if incompleteBudget { return ["ok": true] }
             if let domain = request["domain"] as? String, let used = request["native_used_bytes"] as? NSNumber {
@@ -110,6 +126,14 @@ final class BudgetPeer {
             }
             guard let newline = raw.firstIndex(of: 10), let request = try? JSONSerialization.jsonObject(with: raw.prefix(upTo: newline)) as? [String: Any] else { continue }
             if request["op"] as? String == "fetch" { fetchStarted.signal() }
+            if ["watcher_snapshot", "changes"].contains(request["op"] as? String ?? ""),
+               inspect({ $0.blockedCatalogDomain }) == request["domain"] as? String {
+                mutate { $0.calls.append(request) }; catalogStarted.signal()
+                // A deliberately blocked request acknowledges cancellation by
+                // reading EOF, just as the main IPC cancellation fixture does.
+                while Darwin.read(fd, &buffer, buffer.count) > 0 { }
+                continue
+            }
             guard var payload = try? JSONSerialization.data(withJSONObject: reply(request)) else { continue }
             payload.append(10)
             payload.withUnsafeBytes { bytes in
@@ -183,11 +207,15 @@ private final class BudgetManager: NativeDomainManaging {
 private final class BudgetSystem: NativeSystemManaging {
     var registered = [NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier("budget-domain"), displayName: "Synthetic Budget")]
     var managerValue: BudgetManager?
+    var domainManagers: [String: BudgetManager] = [:]
+    var missingManagers = Set<String>()
     var error: Error?
     var silent = false
     init(_ manager: BudgetManager?) { managerValue = manager }
     func domains(completionHandler: @escaping ([NSFileProviderDomain], Error?) -> Void) { if !silent { completionHandler(registered, error) } }
-    func manager(for domain: NSFileProviderDomain) -> NativeDomainManaging? { managerValue }
+    func manager(for domain: NSFileProviderDomain) -> NativeDomainManaging? {
+        missingManagers.contains(domain.identifier.rawValue) ? nil : domainManagers[domain.identifier.rawValue] ?? managerValue
+    }
 }
 
 enum BudgetCoverageTests {
@@ -347,6 +375,11 @@ enum BudgetCoverageTests {
         peer.mutate{$0.catalog=[];$0.limit=1024}
         try resetState()
         try testWatcher(peer, manager, system, own)
+        print("PASS native watcher pin scheduling, cooldown and anchor recovery")
+        try testWatcherDomainIsolation(paths)
+        print("PASS native watcher per-domain failure isolation and pending-request cancellation")
+        try testWatcherPages(paths)
+        print("PASS native bounded snapshot paging, stable anchors, healthy-domain fairness and unseen deletions")
         print("PASS mocked native cache accounting, owned leases, protected LRU, rollback, recursive pins, SDK error/timeouts and watcher reconciliation")
     }
 
@@ -385,4 +418,102 @@ enum BudgetCoverageTests {
         let calls = peer.inspect { $0.calls.count }
         try expect(try poll(watcher) == nil && peer.inspect { $0.calls.count } == calls, "Stopped watcher issued more requests")
     }
+    private static func testWatcherDomainIsolation(_ paths: NativePaths) throws {
+        let peer = try BudgetPeer(root: paths.group); defer { peer.stop() }
+        let healthy = BudgetManager(peer.paths.group)
+        let system = BudgetSystem(nil)
+        system.registered = ["broken", "healthy"].map {
+            NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier($0), displayName: $0)
+        }
+        system.domainManagers["healthy"] = healthy
+        peer.mutate {
+            $0.configured = [["id": "broken", "smart": true], ["id": "healthy", "smart": true]]
+            $0.catalogByDomain["healthy"] = [try! item("healthy-file", parent: "healthy-folder")]
+            $0.malformedDomains = ["broken"]
+        }
+        let bridge = BackendBridge(paths: peer.paths)
+        let watcher = NativeDomainWatcher(bridge: bridge, system: system, timeout: 0.1)
+        defer { watcher.stop() }
+        // A missing first manager must not prevent a later local catalog signal.
+        try expect(try poll(watcher) != nil && healthy.signalled.contains("healthy-folder"),
+                   "A missing domain manager hid a healthy later domain")
+        system.domainManagers["broken"] = BudgetManager(peer.paths.group)
+        healthy.signalled = []
+        try expect(try poll(watcher) != nil && healthy.signalled.contains("healthy-folder"),
+                   "A malformed first catalog hid a healthy later domain")
+        peer.mutate { $0.malformedDomains = [] }
+        try expect(try poll(watcher) == nil, "A recovered domain retained an old poll failure")
+        healthy.signalled = []
+        peer.mutate { $0.expireChanges = true }
+        try expect(try poll(watcher) == nil && healthy.signalled.contains("healthy-folder"),
+                   "An expired first-domain anchor hid a healthy later domain")
+
+        let cancelled = NativeDomainWatcher(bridge: bridge, system: system, timeout: 0.1)
+        peer.mutate { $0.calls = []; $0.blockedCatalogDomain = "broken" }
+        let done = DispatchSemaphore(value: 0); var failure: Error?
+        cancelled.poll { failure = $0; done.signal() }
+        try wait(peer.catalogStarted)
+        cancelled.stop()
+        try wait(done)
+        try expect((failure as NSError?)?.code == NSUserCancelledError,
+                   "Stopping a domain poll did not preserve cancellation")
+        try expect(!peer.inspect { $0.calls.contains { (["watcher_snapshot", "changes"].contains($0["op"] as? String ?? "")) && $0["domain"] as? String == "healthy" } },
+                   "A cancelled poll continued into another domain")
+    }
+
+    private static func testWatcherPages(_ paths: NativePaths) throws {
+        let peer = try BudgetPeer(root: paths.group); defer { peer.stop() }
+        let manager = BudgetManager(peer.paths.group)
+        let system = BudgetSystem(manager)
+        let healthy = BudgetManager(peer.paths.group)
+        system.registered.append(NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier("healthy-page"), displayName: "Healthy"))
+        system.domainManagers["healthy-page"] = healthy
+        let bridge = BackendBridge(paths: peer.paths)
+        peer.mutate {
+            $0.catalog = try! (0..<300).map { try item(String(format: "paged-%03d", $0), parent: "parent-\($0)", pinned: $0 == 299) }
+            $0.limit = nil
+            $0.configured.append(["id": "healthy-page", "smart": true])
+            $0.catalogByDomain["healthy-page"] = [try! item("healthy-file", parent: "healthy-folder")]
+        }
+        let watcher = NativeDomainWatcher(bridge: bridge, system: system, timeout: 0.1)
+        defer { watcher.stop() }
+        try expect(try poll(watcher) == nil, "First bounded watcher page failed")
+        let first = peer.inspect { $0.calls.filter { $0["op"] as? String == "watcher_snapshot" && $0["domain"] as? String == "budget-domain" } }
+        try expect(first.count == 1 && first[0]["id"] == nil && first[0]["anchor"] == nil,
+                   "Initial watcher page was unbounded or carried a stale cursor")
+        try expect(healthy.signalled.contains("healthy-folder"), "A large paged snapshot delayed the healthy later domain")
+        try expect(manager.signalled.contains("root") && !manager.downloads.contains("paged-299"),
+                   "Initial page did not signal root or consumed unseen pin metadata")
+        try expect(try poll(watcher) == nil && manager.downloads.contains("paged-299"),
+                   "Later snapshot page lost a nested pin")
+        let second = peer.inspect { $0.calls.filter { $0["op"] as? String == "watcher_snapshot" && $0["domain"] as? String == "budget-domain" } }
+        try expect(second.count == 2 && second[1]["id"] as? String == "paged-255" && second[1]["anchor"] as? String == "next",
+                   "Watcher did not preserve its initial baseline across pages")
+        try expect(try poll(watcher) == nil && peer.inspect { $0.calls.contains { $0["op"] as? String == "changes" && $0["anchor"] as? String == "next" } },
+                   "Completed watcher snapshot did not catch up from its original baseline")
+
+        manager.signalled = []
+        peer.mutate { $0.catalog = [] }
+        try expect(try poll(watcher) == nil && manager.signalled.contains("working_set"),
+                   "An unseen deletion failed to notify the native working set")
+        peer.mutate { $0.catalog = try! (0..<300).map { try item(String(format: "paged-%03d", $0)) } }
+        let invalid = NativeDomainWatcher(bridge: bridge, system: system, timeout: 0.1)
+        defer { invalid.stop() }
+        peer.mutate { $0.snapshotReply = ["ok": true, "items": $0.catalog, "anchor": "one"] }
+        try expect(try poll(invalid) != nil, "Oversized watcher page was accepted")
+        peer.mutate { $0.snapshotReply = ["ok": true, "items": [], "anchor": "one", "next_id": ""] }
+        try expect(try poll(invalid) != nil, "Empty watcher cursor was accepted")
+        peer.mutate { $0.snapshotReply = ["ok": true, "items": [try! item("a")], "anchor": "one", "next_id": "a"] }
+        try expect(try poll(invalid) == nil, "Valid first page was rejected")
+        peer.mutate { $0.snapshotReply = ["ok": true, "items": [], "anchor": "two"] }
+        try expect(try poll(invalid) != nil, "Changed watcher baseline was accepted")
+        peer.mutate { $0.snapshotReply = ["ok": true, "items": [], "anchor": "one", "next_id": "a"] }
+        try expect(try poll(invalid) != nil, "Nonadvancing watcher cursor was accepted")
+        peer.mutate { $0.snapshotReply = ["ok": false, "error": ["code": "sync_anchor_expired"]] }
+        try expect(try poll(invalid) == nil, "Expired partial snapshot did not reset its own cursor")
+        peer.mutate { $0.snapshotReply = nil; $0.calls = []; $0.catalog = [] }
+        try expect(try poll(invalid) == nil && peer.inspect { $0.calls.contains { $0["op"] as? String == "watcher_snapshot" && $0["id"] == nil && $0["anchor"] == nil } },
+                   "Expired snapshot restarted from a partial cursor")
+    }
+
 }

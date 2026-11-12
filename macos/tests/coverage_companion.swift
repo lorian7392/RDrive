@@ -297,6 +297,7 @@ enum CompanionCoverageTests {
             if request["op"] as? String == "refresh_index" {
                 try expect(request["domain"] as? String == "host" && request["id"] as? String == "root",
                            "Companion refresh changed the domain or root scope")
+                try expect(request["recursive"] as? Bool == true, "Connection refresh did not queue a complete index walk")
                 return refreshResponse
             }
             return request["op"] as? String=="status" ? status:["domains":rows]
@@ -314,13 +315,13 @@ enum CompanionCoverageTests {
         let mapped=try JSONDecoder().decode([RDriveCompanionCoverage.WatchedRoot].self,from:Data(contentsOf:paths.roots))
         try expect(mapped.count==1 && mapped[0].domain=="host","Companion mapped unconfigured/unscoped roots")
         func refreshMenu() -> NSMenu? {
-            host.menu.items.first(where: { $0.title == "Refresh Connection" })?.submenu
+            host.menu.items.first(where: { $0.title == "Refresh Connection Index" })?.submenu
         }
         try expect(refreshMenu()?.items.map(\.title) == ["Host"], "Refresh Connection offered a non-Smart connection")
         let refreshItem = refreshMenu()!.items[0]
         host.refreshConnection(NSMenuItem())
         host.refreshConnection(refreshItem)
-        try UICoverageTests.pump("Companion did not acknowledge the queued root refresh") { messages.contains("Folder list refresh queued.") }
+        try UICoverageTests.pump("Companion did not acknowledge the queued root refresh") { messages.contains("Connection index refresh queued.") }
         refreshResponse = ["queued": false]
         host.refreshConnection(refreshItem)
         try UICoverageTests.pump("Companion ignored a missing refresh acknowledgement") { messages.contains(where: { $0.contains("did not acknowledge") }) }

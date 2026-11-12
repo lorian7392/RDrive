@@ -56,6 +56,10 @@ These locations are not interchangeable. Clean-cache reclamation cannot remove u
 
 [`src/filtering.rs`](https://github.com/lorian7392/RDrive/blob/main/src/filtering.rs) implements relative glob selection, temporary-file rules, and profile overrides. [`src/policies.rs`](https://github.com/lorian7392/RDrive/blob/main/src/policies.rs) implements Smart versions, retention, and explicit conflict policy. Exclusion controls visibility/selection; it does not authorize remote deletion. Automatic replacement still uses the revision established by a persistent decision.
 
+Metadata indexing uses up to four concurrent connection workers in [`src/provider/background_index.rs`](https://github.com/lorian7392/RDrive/blob/main/src/provider/background_index.rs). Each worker plans under the shared coordinator, releases `Store` before connecting or reading the server, and reacquires the coordinator to publish against the latest validated domain, configuration, and catalog. Stale results are discarded. Remote mutations keep serialized replay and their existing publication receipts. The one-shot `smart run` path remains sequential.
+
+The native notification helper reads an initial catalog in pages of at most 256 items. It keeps the first page’s anchor and consumes intervening changes after the final page; expired anchors restart that connection’s bootstrap. Page replies omit metadata that notification and download scheduling do not need. Failure in one connection does not end reconciliation for the others.
+
 ## Metadata and managed repositories
 
 [`src/metadata.rs`](https://github.com/lorian7392/RDrive/blob/main/src/metadata.rs) captures selected user xattrs bound to a content hash. It records prior values before application for rollback and recovery. [`src/metadata_remote.rs`](https://github.com/lorian7392/RDrive/blob/main/src/metadata_remote.rs) stores portable, protected metadata records for ordinary WebDAV/SMB and maintains an independent three-way baseline. Content and sidecars are confirmed in separate steps and need not become visible together.
