@@ -61,15 +61,15 @@ enum Effect {
 impl Code {
     fn effect(self) -> Effect {
         match self {
-            Self::Timeout
-            | Self::AuthenticationFailed
+            Self::AuthenticationFailed
             | Self::AccessDenied
             | Self::Dns
             | Self::Tls
             | Self::Network
             | Self::Server
             | Self::RootUnavailable => Effect::Offline,
-            Self::CredentialsUnavailable
+            Self::Timeout
+            | Self::CredentialsUnavailable
             | Self::ConfigurationChanged
             | Self::ProbeProcess
             | Self::InvalidResponse => Effect::Unknown,
@@ -78,7 +78,7 @@ impl Code {
     }
     fn message(self) -> &'static str {
         match self {
-            Self::Timeout=>"The authenticated connection check exceeded its time limit.",
+            Self::Timeout=>"The connection check timed out before it could establish current reachability.",
             Self::CredentialsUnavailable=>"Configured credentials are unavailable in this process; check the environment reference or Keychain access.",
             Self::AuthenticationFailed=>"The server rejected authentication for this connection.",
             Self::AccessDenied=>"The server denied access to the configured remote location.",

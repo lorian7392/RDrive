@@ -894,3 +894,25 @@ async fn cancelling_a_check_terminates_its_owned_credential_helper_group() {
     }
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
 }
+
+#[tokio::test]
+async fn blocked_credential_lookup_timeout_is_unknown_and_preserves_the_last_success() {
+    let (t, home) = home();
+    let p = profile();
+    set_config(&home, vec![("p", p.clone())]);
+    observe_at(&home, "p", &p, "index.list", 100, 200, None).unwrap();
+    // The same whole-process deadline covers credential lookup and network I/O.
+    // A blocked helper cannot prove that the remote endpoint is offline.
+    let program = script(t.path(), "sleep 60");
+    let checked = probe_with(&program, &home, Some("p"), 1, 1).await.unwrap();
+    let row = &checked["profiles"][0];
+    assert_eq!(row["state"], "unknown");
+    assert_eq!(row["probe_error"]["code"], "timeout");
+    assert_eq!(row["probe_error"]["connection_effect"], "unknown");
+    assert_eq!(row["last_success_at_ms"], 200);
+    assert_eq!(row["last_error"]["detail"]["code"], "timeout");
+    assert_eq!(
+        snapshot(&home, "p", &p, now_ms(), 300).unwrap()["state"],
+        "unknown"
+    );
+}
