@@ -1102,3 +1102,59 @@ fn standalone_sqlite_without_wal_is_read_without_sidecars_and_profile_count_is_b
     assert_eq!(report["configuration"]["status"], "error");
     assert!(report.get("profiles").is_none());
 }
+
+#[test]
+fn large_existing_sqlite_sources_fit_the_fixed_two_gibibyte_bound() {
+    let f = Fixture::new();
+    let path = f.path("large.sqlite3");
+    write(&path, b"");
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_len(628_277_248).unwrap();
+    assert!(
+        Source::open(f.home(), Path::new("large.sqlite3"), MAX_SQLITE)
+            .unwrap()
+            .is_some()
+    );
+    file.set_len(MAX_SQLITE).unwrap();
+    assert!(
+        Source::open(f.home(), Path::new("large.sqlite3"), MAX_SQLITE)
+            .unwrap()
+            .is_some()
+    );
+    file.set_len(MAX_SQLITE + 1).unwrap();
+    let error = sql::<()>(f.home(), "large.sqlite3", |_| Ok(())).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Unavailable>().unwrap().0,
+        "limit_exceeded"
+    );
+}
+#[test]
+fn native_and_global_cache_accounting_survive_an_absent_rust_ledger_without_creating_it() {
+    let f = Fixture::new();
+    f.store.save().unwrap();
+    fs::remove_file(f.path("state.json")).unwrap();
+    write(&f.path("cache/unindexed"), b"data");
+    object(
+        &f.path("native-cache-usage.json"),
+        json!({"version":1,"reports":{"domain":{"used":17,"reserved":3,"pinned":5,"updated":NOW}}}),
+    );
+    let before = inventory(f.home());
+    let r = collect_at(f.home(), None, NOW, 10).unwrap();
+    assert_eq!(r["queue"]["status"], "missing");
+    assert_eq!(r["queue"]["data"], Value::Null);
+    assert_eq!(r["cache"]["status"], "ok");
+    let c = &r["cache"]["data"];
+    assert_eq!(c["rust_ledger_present"], false);
+    assert_eq!(c["native_used_bytes"], 17);
+    assert_eq!(c["native_reserved_bytes"], 3);
+    assert_eq!(c["used_bytes"], 4);
+    assert_eq!(c["accounted_bytes"], 24);
+    assert_eq!(c["max_bytes"], 20);
+    assert!(r.get("queued").is_none());
+    assert!(r.get("cache_files").is_none());
+    assert_eq!(inventory(f.home()), before);
+    f.store.save().unwrap();
+    let r = collect_at(f.home(), None, NOW, 10).unwrap();
+    assert_eq!(r["cache"]["data"]["rust_ledger_present"], true);
+    assert_eq!(r["cache"]["data"]["rust_ledger_source"], "state.json");
+}

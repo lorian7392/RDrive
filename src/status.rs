@@ -19,7 +19,7 @@ use std::{
 };
 
 const MAX_JSON: u64 = 64 * 1024 * 1024;
-const MAX_SQLITE: u64 = 512 * 1024 * 1024;
+const MAX_SQLITE: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_FILES: usize = 4096;
 const DEFAULT_ITEMS: usize = 10;
 
@@ -1302,9 +1302,20 @@ fn collect_observed(
                 report["cache"] = section(
                     "state.json and native-cache-usage.json",
                     "selected_profiles_with_global_admissions",
-                    db.as_ref()
-                        .map(|db| cache(&home, config, db, profile, now))
-                        .transpose(),
+                    {
+                        let empty = state::Database::default();
+                        cache(&home, config, db.as_ref().unwrap_or(&empty), profile, now).map(
+                            |mut value| {
+                                value["rust_ledger_present"] = json!(db.is_some());
+                                value["rust_ledger_source"] = json!(if db.is_some() {
+                                    "state.json"
+                                } else {
+                                    "state.json missing; no Rust cache ledger was recorded"
+                                });
+                                Some(value)
+                            },
+                        )
+                    },
                 );
                 if let Some(db) = db {
                     let entries = db
