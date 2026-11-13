@@ -738,12 +738,15 @@ async fn probe_with(
         .profiles
         .into_iter()
         .filter(|(name, _)| selected.is_none_or(|wanted| name == wanted))
-        .collect();
-    let mut tasks=stream::iter(profiles.into_iter().map(|(name,profile)|async move {
-        match probe_one(executable,home,&name,&profile,timeout_secs).await {
+        .map(|(name, profile)| binding(&profile).map(|scope| (name, profile, scope)))
+        .collect::<Result<_>>()?;
+    let mut tasks=stream::iter(profiles.into_iter().map(|(name,profile,scope)|async move {
+        let mut value = match probe_one(executable,home,&name,&profile,timeout_secs).await {
             Ok(value)=>value,
             Err(error)=>json!({"profile":name,"state":"unknown","checked_now":true,"probe_error":safe_error(&error)}),
-        }
+        };
+        value["configuration_binding"] = json!(scope);
+        value
     })).buffer_unordered(max_parallel);
     let mut values = Vec::new();
     while let Some(value) = tasks.next().await {

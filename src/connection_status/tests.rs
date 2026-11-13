@@ -570,9 +570,11 @@ async fn explicit_probe_uses_scoped_results_and_preserves_per_profile_error_reas
     let result = probe_with(&program, &home, Some("p"), 2, 1).await.unwrap();
     assert_eq!(result["profiles"][0]["state"], "online");
     assert_eq!(result["profiles"][0]["checked_now"], true);
+    assert_eq!(result["profiles"][0]["configuration_binding"], binding(&p).unwrap());
     let failed = output_script(t.path(), &reply(&p, "p", Some(Code::AuthenticationFailed)));
     let result = probe_with(&failed, &home, None, 2, 1).await.unwrap();
     assert_eq!(result["profiles"][0]["state"], "offline");
+    assert_eq!(result["profiles"][0]["configuration_binding"], binding(&p).unwrap());
     assert!(!result["profiles"][0]["last_success_at"].is_null());
     for (timeout, parallel) in [(0, 1), (121, 1), (1, 0), (1, 5)] {
         assert!(probe_with(&program, &home, None, timeout, parallel)
@@ -586,6 +588,7 @@ async fn explicit_probe_uses_scoped_results_and_preserves_per_profile_error_reas
         .await
         .unwrap();
     assert_eq!(unknown["profiles"][0]["state"], "unknown");
+    assert_eq!(unknown["profiles"][0]["configuration_binding"], binding(&p).unwrap());
     assert_eq!(
         unknown["profiles"][0]["probe_error"]["code"],
         "probe_process"
@@ -607,6 +610,7 @@ async fn failed_observation_storage_does_not_hide_a_successful_current_probe() {
     let program = output_script(t.path(), &reply(&p, "p", None));
     let result = probe_with(&program, &home, None, 2, 1).await.unwrap();
     assert_eq!(result["profiles"][0]["state"], "online");
+    assert_eq!(result["profiles"][0]["configuration_binding"], binding(&p).unwrap());
     assert_eq!(
         result["profiles"][0]["source"],
         "current_probe_not_persisted"
@@ -652,6 +656,7 @@ async fn configuration_changes_removal_and_corruption_never_adopt_a_stale_probe(
         }
         let result = task.await.unwrap().unwrap();
         assert_eq!(result["profiles"][0]["state"], "unknown");
+        assert_eq!(result["profiles"][0]["configuration_binding"], binding(&p).unwrap());
         assert!(!home.join("connection-health").exists());
         if mode != "corrupt" {
             assert_eq!(
