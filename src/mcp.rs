@@ -223,6 +223,22 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin, limit: usize) -> Result
     }
 }
 
+/// Status probes own separate process groups for bounded credential helpers.
+/// Let that one command drop its probe futures before the ordinary hard-stop
+/// fallback; other MCP operations retain their existing cancellation behavior.
+async fn stop_operation(child: &mut tokio::process::Child, status_probe: bool) {
+    if status_probe {
+        if let Some(pid) = child.id() {
+            unsafe { libc::kill(pid as i32, libc::SIGINT); }
+            if matches!(tokio::time::timeout(Duration::from_secs(2), child.wait()).await, Ok(Ok(_))) {
+                return;
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 async fn invoke_with_program(
     options: &Options,
     tool: &catalog::Tool,
@@ -252,7 +268,7 @@ async fn invoke_with_program(
         };
         let (stdout,stderr,status)=match outcome {
             Ok(value)=>value,
-            Err(error)=>{let _=child.kill().await;let _=child.wait().await;return Err(error);}
+            Err(error)=>{stop_operation(&mut child,tool.name=="rdrive_status_check_connections").await;return Err(error);}
         };
         let data=if tool.name=="rdrive_read_text" {
             let text=String::from_utf8(stdout).context("remote content is not UTF-8 text; use download")?;
@@ -773,6 +789,40 @@ mod tests {
         assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &Ok(base.join("missing"))).await["isError"], true);
         let unavailable = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Synthetic missing executable identity"));
         assert_eq!(invoke_with_program(&options, status, json!({}), CancellationToken::new(), &unavailable).await["isError"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_probe_stop_uses_a_bounded_grace_before_hard_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let program = base.join("signal-fixture");
+        let ready = base.join("ready");
+        let acknowledged = base.join("interrupted");
+        for cooperative in [true, false] {
+            let _ = std::fs::remove_file(&ready);
+            let _ = std::fs::remove_file(&acknowledged);
+            let handler = if cooperative {
+                format!("def stop(signum, frame):\n pathlib.Path({:?}).write_text('SIGINT')\n raise SystemExit(130)\nsignal.signal(signal.SIGINT, stop)", acknowledged)
+            } else { "signal.signal(signal.SIGINT, signal.SIG_IGN)".into() };
+            std::fs::write(&program,format!("#!/usr/bin/env python3\nimport pathlib, signal\n{handler}\npathlib.Path({ready:?}).write_text('ready')\nwhile True: signal.pause()\n")).unwrap();
+            std::fs::set_permissions(&program,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut child = Command::new(&program).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+            tokio::time::timeout(Duration::from_secs(10),async {
+                while !ready.is_file() {tokio::time::sleep(Duration::from_millis(10)).await;}
+            }).await.unwrap();
+            let started=std::time::Instant::now();
+            stop_operation(&mut child,true).await;
+            assert!(child.id().is_none(),"The owned child must be reaped");
+            assert!(started.elapsed()<Duration::from_secs(5),"Hard fallback must stay bounded");
+            assert_eq!(acknowledged.is_file(),cooperative);
+            if !cooperative {assert!(started.elapsed()>=Duration::from_secs(2));}
+        }
+        let mut exited=Command::new("/bin/sh").args(["-c","exit 0"]).spawn().unwrap();
+        exited.wait().await.unwrap();
+        stop_operation(&mut exited,true).await;
+        assert!(exited.id().is_none());
     }
 
     #[tokio::test]

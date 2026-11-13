@@ -29,6 +29,7 @@ import time
 import uuid
 
 from cli_workflows import Dav
+from mcp_workflows import Client as McpClient
 
 ROOT = Path(__file__).resolve().parents[1]
 PASSWORD_ENV = "RDRIVE_STATUS_TEST_PASSWORD"
@@ -452,6 +453,59 @@ def run(binary, report_path=None):
             assert StatusDav.idle.wait(3)
             passed("interrupting a live status probe exits promptly and leaves no owned helper or credential output behind")
 
+            for mode in ["timeout", "cancellation"]:
+                assert StatusDav.idle.wait(3)
+                with StatusDav.guard:
+                    StatusDav.delayed = True
+                    StatusDav.delay_entered = threading.Event()
+                    StatusDav.release_delay = threading.Event()
+                client = McpClient(binary, fixture.home, fixture.environment, write=True,
+                                   timeout=2 if mode == "timeout" else 30)
+                operation_children, probe_children = [], []
+                try:
+                    client.initialize()
+                    client.counter += 1
+                    client.send({"jsonrpc":"2.0", "id":client.counter, "method":"tools/call", "params":{
+                        "name":"rdrive_status_check_connections", "arguments":{"profile":"fixture", "timeout":10}}})
+                    assert StatusDav.delay_entered.wait(8), "MCP status check did not reach the owned metadata barrier"
+                    descendants = subprocess.run(["pgrep", "-P", str(client.process.pid)], capture_output=True, text=True, timeout=5)
+                    assert descendants.returncode == 0, descendants.stderr
+                    for value in descendants.stdout.split():
+                        item = process_identity(int(value))
+                        if item is None:
+                            continue
+                        assert item["uid"] == os.geteuid() and item["parent"] == client.process.pid
+                        assert Path(item["executable"]).resolve() == binary, item
+                        operation_children.append(item)
+                        probe_children.extend(owned_probe_children(item["pid"], binary))
+                    assert operation_children and probe_children, "The MCP request must own its CLI and isolated probe descendants"
+                    if mode == "cancellation":
+                        client.send({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{
+                            "requestId":client.counter, "reason":"owned status fixture"}})
+                    response = client.receive(timeout=7)
+                    assert response.get("id") == client.counter and response.get("result", {}).get("isError"), response
+                    assert ("timed out" if mode == "timeout" else "cancelled") in json.dumps(response), response
+                    deadline = time.monotonic() + 5
+                    while any(same_process(item) for item in probe_children + operation_children) and time.monotonic() < deadline:
+                        time.sleep(.025)
+                    assert not any(same_process(item) for item in probe_children + operation_children), "MCP left an owned status/probe descendant alive"
+                    assert "fixture-password" not in json.dumps(response)
+                finally:
+                    # Both identity chains were observed before cancellation.
+                    # Cleanup can signal only this test's exact owned processes.
+                    for item in probe_children:
+                        if same_process(item):
+                            os.killpg(item["group"], signal.SIGTERM)
+                    for item in operation_children:
+                        if same_process(item):
+                            os.kill(item["pid"], signal.SIGTERM)
+                    with StatusDav.guard:
+                        StatusDav.delayed = False
+                    StatusDav.release_delay.set()
+                    client.close()
+                assert StatusDav.idle.wait(3)
+                passed(f"MCP {mode} cooperatively stops the status CLI and its separately grouped live probe descendants")
+
             with ResetServer(("127.0.0.1", 0), ResetPeer) as disconnected:
                 disconnected_thread = threading.Thread(target=disconnected.serve_forever, daemon=True)
                 disconnected_thread.start()
@@ -552,6 +606,42 @@ def run(binary, report_path=None):
                 finally:
                     private_write(fixture.home / "config.json", original_config)
             passed("changed account, credential reference, encryption or timeout settings do not reuse previous connection evidence or perform a credential lookup")
+
+            assert StatusDav.idle.wait(3)
+            with StatusDav.guard:
+                StatusDav.delayed = True
+                StatusDav.delay_entered = threading.Event()
+                StatusDav.release_delay = threading.Event()
+            changed_during_probe = subprocess.Popen(fixture.base + ["--json", "status", "--check-connections", "--profile", "fixture", "--timeout", "10"],
+                env=fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            owned_children = []
+            try:
+                assert StatusDav.delay_entered.wait(8), "Configuration-change fixture did not enter metadata read"
+                owned_children = owned_probe_children(changed_during_probe.pid, binary)
+                changed = json.loads(original_config)
+                changed["profiles"]["fixture"]["timeout_secs"] = 4
+                private_write(fixture.home / "config.json", changed)
+                StatusDav.release_delay.set()
+                stdout, stderr = changed_during_probe.communicate(timeout=8)
+                assert changed_during_probe.returncode == 0, (stdout, stderr)
+                current = validate_report(json.loads(stdout))
+                row = connection(current, "fixture")
+                assert row["state"] == "unknown" and row.get("last_success_at") is None, row
+                assert row["probe_error"]["code"] == "configuration_changed", row
+                assert envelope(current, "connections")["status"] == "partial", current["connections"]
+            finally:
+                if changed_during_probe.poll() is None:
+                    changed_during_probe.send_signal(signal.SIGINT)
+                    changed_during_probe.wait(timeout=5)
+                for item in owned_children:
+                    if same_process(item):
+                        os.killpg(item["group"], signal.SIGTERM)
+                private_write(fixture.home / "config.json", original_config)
+                with StatusDav.guard:
+                    StatusDav.delayed = False
+                StatusDav.release_delay.set()
+            assert StatusDav.idle.wait(3)
+            passed("a configuration change during a live check rejects old evidence and reports an explicit partial-result reason")
 
             fixture.add("sync-profile")
             sync_root = root / "ordinary-sync"
