@@ -701,9 +701,8 @@ async fn read_command(cli: &Cli, home: &Path) -> Result<Option<serde_json::Value
         Command::Profile {
             command: ProfileCommand::List,
         } => {
-            return Ok(Some(serde_json::to_value(
-                rdrive::client_read::config(home)?.profiles,
-            )?))
+            let profiles = rdrive::client_read::config(home)?.profiles;
+            return Ok(Some(serde_json::json!(profiles)));
         }
         Command::Info { profile } | Command::Ls { profile, .. } | Command::Stat { profile, .. } => {
             profile
