@@ -4,6 +4,8 @@ Changes are organized from source history and versioned validation records. Date
 
 ## Unreleased
 
+- Expand `rdrive status` into a bounded, source-labelled overview of connections, service, indexes, cache, history, configuration, APFS checkpoints and conflicts. Preserve recent success and safe failure reasons; optional authenticated checks distinguish unknown deadlines from observed server failures.
+
 - Add a dedicated fixed-capacity APFS file checkpoint vault with hourly-capable durable scheduling, crash reconciliation, verified payload recovery and cleanup of owned old checkpoints. Preserve the latest confirmed recovery point during replacement and keep native system snapshots outside automatic cleanup.
 - Reject stale concurrent checkpoint-setting updates and state relocations that would invalidate a retained vault identity.
 

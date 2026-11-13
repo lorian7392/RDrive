@@ -52,7 +52,7 @@ WebDAV needs a reliable strong ETag. SMB verifies identity and SHA-256 and uses 
 
 ## Persistent upload queue and history
 
-`put --queue` retains a persistent snapshot and job. Later modification or removal of the original source does not change queued content. `queue list/run/cancel` inspects, executes, or cancels jobs. `status` summarizes local queue/cache state offline. `history --limit N` shows local completion events, with a default of 20; it is not a server audit log.
+`put --queue` retains a persistent snapshot and job. Later modification or removal of the original source does not change queued content. `queue list/run/cancel` inspects, executes, or cancels jobs. `status` provides a [unified overview](STATUS.md) of connections, service, indexes, cache, history, configuration, checkpoints and retained conflicts. Default inspection uses local evidence; `--check-connections` and `--check-checkpoints` request explicit fresh checks. `history --limit N` shows local completion events, with a default of 20; it is not a server audit log.
 
 A job becomes `done` only after server confirmation. Restart changes unconfirmed `running` work to `interrupted`. `queue run` retries pending work and interrupted work that does not overwrite remote content. Failed work needs `--retry-failed`.
 

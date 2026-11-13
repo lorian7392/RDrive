@@ -49,8 +49,8 @@ def balanced_body(text, opening):
     raise AssertionError("unbalanced Rust declaration")
 
 
-def rust_command_paths():
-    source = source_text(ROOT / "src/main.rs")
+def rust_command_paths(source=None):
+    source = source_text(ROOT / "src/main.rs") if source is None else source
     enums = {}
     for match in re.finditer(r"\benum\s+(\w*Command)\s*\{", source):
         body = balanced_body(source, match.end() - 1)
@@ -65,11 +65,31 @@ def rust_command_paths():
         fragments.append(body[start:].strip())
         variants = []
         for fragment in filter(None, fragments):
-            variant = re.match(r"(\w+)\b", fragment)
+            # Attributes belong to the declaration, but are not the variant
+            # identifier. A hidden internal helper is deliberately absent from
+            # public --help; validate its declaration before excluding it.
+            declaration = fragment
+            attributes = []
+            while declaration.startswith("#["):
+                depth, closing = 1, None
+                for index in range(2, len(declaration)):
+                    depth += (declaration[index] == "[") - (declaration[index] == "]")
+                    if depth == 0:
+                        closing = index + 1
+                        break
+                if closing is None:
+                    raise AssertionError(f"unrecognized subcommand attribute: {fragment}")
+                attributes.append(declaration[:closing])
+                declaration = declaration[closing:].lstrip()
+            variant = re.match(r"(\w+)\b", declaration)
             if not variant:
                 raise AssertionError(f"unrecognized subcommand declaration: {fragment}")
+            if any(re.match(r"#\[\s*command\s*\(", attribute)
+                   and re.search(r"\bhide\s*=\s*true\b", attribute)
+                   for attribute in attributes):
+                continue
             name = re.sub(r"(?<!^)(?=[A-Z])", "-", variant.group(1)).lower()
-            nested = re.search(r"\bcommand\s*:\s*(?:Option\s*<\s*)?(\w+Command)\b", fragment)
+            nested = re.search(r"\bcommand\s*:\s*(?:Option\s*<\s*)?(\w+Command)\b", declaration)
             variants.append((name, nested.group(1) if nested else None))
         enums[match.group(1)] = variants
     result = {()}
@@ -119,6 +139,26 @@ class DocumentationContract(unittest.TestCase):
 
     def test_every_source_subcommand_has_generated_help(self):
         self.assertEqual(rust_command_paths(), {tuple(path) for path, _ in self.records})
+
+    def test_rust_source_parser_preserves_public_attributes_and_excludes_hidden_helpers(self):
+        source = """
+            enum Command {
+                #[allow(dead_code)] #[command(about="")]
+                PublicRead,
+                #[command(hide=false)] Visible { command:VisibleCommand },
+                #[command(name="", hide = true)]
+                StatusProbe { profile:String, command:PrivateCommand },
+            }
+            enum VisibleCommand { #[command(about="")] Child, }
+            enum PrivateCommand { InternalOnly, }
+        """
+        self.assertEqual(rust_command_paths(source), {
+            (), ("public-read",), ("visible",), ("visible", "child"),
+        })
+        for declaration in ["???", "#[command(hide=true)] ???"]:
+            with self.subTest(declaration=declaration):
+                with self.assertRaisesRegex(AssertionError, "unrecognized subcommand declaration"):
+                    rust_command_paths("enum Command { " + declaration + ", }")
 
     def test_reference_exactly_matches_the_executable(self):
         actual = (ROOT / "docs/reference/CLI.md").read_text(encoding="utf-8")

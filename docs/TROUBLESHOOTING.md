@@ -8,6 +8,9 @@ Start with the version, state directory, and exact error. A generated plan, queu
 rdrive --version
 rdrive profile list
 rdrive status
+rdrive status --details
+# Explicit authenticated checks; may access configured credentials.
+rdrive status --check-connections
 rdrive queue list
 rdrive transfers list
 rdrive history --limit 20

@@ -182,6 +182,10 @@ impl Tool {
                 if args.get(name).and_then(Value::as_u64).is_some_and(|n|n==0||n>31_536_000) {bail!("index intervals must be between one second and one year");}
             }
         }
+        if self.name.starts_with("rdrive_status") {
+            if args.get("max_items").and_then(Value::as_u64).is_some_and(|n| !(1..=100).contains(&n)) {bail!("status example limit must be between 1 and 100");}
+            if args.get("timeout").and_then(Value::as_u64).is_some_and(|n| !(1..=120).contains(&n)) {bail!("connection check timeout must be between 1 and 120 seconds");}
+        }
         if self.name == "rdrive_checkpoint_config" {
             if args.get("manual").and_then(Value::as_bool)==Some(true) && args.contains_key("interval_secs") {
                 bail!("manual and interval_secs are mutually exclusive");
@@ -307,11 +311,13 @@ pub fn catalog() -> Vec<Tool> {
     );
     tool!(
         "status",
-        "Inspect local queue and cache summary, without networking.",
+        "Inspect connections, service, index, cache, history, checkpoints and conflicts from local observations; does not probe credentials or mount images.",
         &["status"],
-        vec![],
+        vec![Field::option("profile",String,"--profile"),n("max_items","--max-items")],
         false
     );
+    tool!("status_check_connections","Run bounded authenticated metadata-only connection checks and return the complete status overview.",&["status","--check-connections"],vec![Field::option("profile",String,"--profile"),n("timeout","--timeout"),n("max_items","--max-items")],true);
+    tool!("status_check_checkpoints","Read-only mount verification of checkpoint capacity and record counts, together with the status overview.",&["status","--check-checkpoints"],vec![Field::option("profile",String,"--profile"),n("max_items","--max-items")],true);
     tool!(
         "info",
         "Test a connection and inspect its protocol capabilities.",

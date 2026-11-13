@@ -144,3 +144,38 @@ async fn replay_attempts_keep_failed_pending_intents_and_refresh_the_overlay() {
     let store=Store::open(home.clone()).unwrap();let queue=crate::smart::Queue::open(&store,&domain.id,&journal_binding(&store.config,&domain).unwrap()).unwrap();
     assert!(queue.list().iter().any(|item|item.id==mutation.id&&item.state!=crate::smart::MutationState::Done));
 }
+
+
+struct PendingConnection;
+#[async_trait]
+impl Connector for PendingConnection {
+    async fn connect(&self,_:&config::Profile,_:&str,_:crate::transfer::TransferContext)->Result<Arc<dyn Backend>> {
+        std::future::pending().await
+    }
+}
+#[tokio::test]
+async fn bounded_connect_and_metadata_deadlines_preserve_success_and_record_unknown_reachability() {
+    let(_temporary,home,domain)=setup();
+    let mut store=Store::open(home.clone()).unwrap();
+    store.config.profiles.get_mut(&domain.profile).unwrap().timeout_secs=1;
+    store.save_config().unwrap();let profile=store.config.profiles[&domain.profile].clone();drop(store);
+    let coordinator=Mutex::new(());
+    once(&home,&domain,&coordinator,None,&mut Worker::default(),&connected(Peer::new(vec![],None))).await.unwrap();
+    let success=crate::connection_status::snapshot(&home,&domain.profile,&profile,crate::connection_status::now_ms(),300).unwrap()["last_success_at"].clone();
+    assert!(success.is_string());
+    for connect_phase in [true,false] {
+        reset_scan(&home,&domain);
+        let mut worker=Worker::default();
+        if connect_phase {
+            once(&home,&domain,&coordinator,None,&mut worker,&PendingConnection).await.unwrap();
+        }else {
+            once(&home,&domain,&coordinator,None,&mut worker,&connected(Peer::new(vec![],Some(&domain.remote)))).await.unwrap();
+        }
+        let observed=crate::connection_status::snapshot(&home,&domain.profile,&profile,crate::connection_status::now_ms(),300).unwrap();
+        assert_eq!(observed["state"],"unknown");
+        assert_eq!(observed["last_success_at"],success);
+        assert_eq!(observed["last_error"]["detail"]["code"],"timeout");
+        assert_eq!(journal(&home,&domain).directory_attempts["root"].failures,1);
+        assert!(worker.backends.is_empty());
+    }
+}

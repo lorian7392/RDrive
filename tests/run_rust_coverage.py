@@ -205,7 +205,7 @@ def test_command(obj, library, suite):
     command = [obj["path"]]
     if obj["path"] == str(library):
         if suite == "portable-smb":
-            command.append("smb::")
+            command.extend(["smb::", "status::"])
         # Library fixtures exercise process-global signals and file locks.
         # Isolate unrelated fixtures while preserving concurrency inside each.
         command.append("--test-threads=1")
@@ -224,6 +224,7 @@ def workflows(python, binary, group, output, library):
             ("service", "--output"), ("profile_admin", "--report"),
             ("state_directory", "--report"), ("history", "--report"),
             ("checkpoint", "--report"),
+            ("status", "--report"),
         ]:
             command = [python, str(ROOT / "tests" / (name + "_workflows.py")), str(binary)]
             if flag:
@@ -391,7 +392,7 @@ def main(argv=None):
     parser.add_argument("--target-dir", type=Path, help="Optional reusable build cache; exact Cargo JSON objects are still frozen and verified")
     parser.add_argument("--workflows", choices=["all", "dav", "smb", "none"], default="all")
     parser.add_argument("--test-suite", choices=["all", "portable-smb"], default="all",
-                        help="all runs every regular Rust test; portable-smb runs only SMB library tests and transfer operations before Samba fixtures")
+                        help="all runs every regular Rust test; portable-smb runs SMB and portable status library tests and transfer operations before Samba fixtures")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--rustc", default="rustc")

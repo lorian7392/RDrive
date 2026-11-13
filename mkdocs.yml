@@ -83,6 +83,7 @@ nav:
       - Features and limitations: FEATURES.md
       - Troubleshooting: TROUBLESHOOTING.md
   - Guides:
+      - Status overview: STATUS.md
       - State directory and migration: STATE_DIRECTORY.md
       - Mounting network volumes: MOUNT.md
       - Sync conflicts and recovery: CONFLICTS.md

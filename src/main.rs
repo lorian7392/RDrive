@@ -238,8 +238,23 @@ enum Command {
     },
     /// Uses RDRIVE_WEBDAV_LOCK_TOKEN; tokens are not accepted as arguments.
     Unlock { profile: String, remote: String },
-    /// Local queue/cache summary; works offline.
-    Status,
+    /// Unified local status; optional live checks are explicit and read-only.
+    Status {
+        /// Show one connection and its scoped state; shared limits remain labelled global.
+        #[arg(long)] profile: Option<String>,
+        /// Verify authenticated remote directory metadata, with bounded credential/network waits.
+        #[arg(long)] check_connections: bool,
+        /// Inspect the APFS store through its existing read-only mount interface.
+        #[arg(long)] check_checkpoints: bool,
+        /// Per-connection live-check deadline in seconds.
+        #[arg(long,default_value_t=10,value_parser=clap::value_parser!(u64).range(1..=120))] timeout: u64,
+        /// Include bounded issue examples in the human summary; JSON always contains them.
+        #[arg(long)] details: bool,
+        /// Maximum issue examples per section.
+        #[arg(long,default_value_t=10,value_parser=clap::value_parser!(u64).range(1..=100))] max_items: u64,
+    },
+    #[command(name="__status-probe",hide=true)]
+    StatusProbe { profile: String, binding: String },
     /// Mount through macOS native SMB/WebDAV helpers.
     Mount {
         profile: String,
@@ -678,39 +693,67 @@ async fn connect(store: &Store, name: &str) -> Result<Arc<dyn Backend>> {
     rdrive::factory::connect(&profile(store,name)?,name,rdrive::transfer::global()).await
 }
 
-async fn read_connection(home: &Path, name: &str) -> Result<Arc<dyn Backend>> {
-    let config = rdrive::client_read::config(home)?;
-    rdrive::factory::connect(&configured_profile(&config, home, name)?, name, rdrive::transfer::global()).await
-}
 
 /// Read-only remote operations use one configuration snapshot. They never open
 /// Store's writer lock or recover its unrelated upload/cache journals.
 async fn read_command(cli: &Cli, home: &Path) -> Result<Option<serde_json::Value>> {
-    let value = match &cli.command {
-        Command::Profile { command: ProfileCommand::List } => {
-            serde_json::to_value(rdrive::client_read::config(home)?.profiles)?
+    let name = match &cli.command {
+        Command::Profile {
+            command: ProfileCommand::List,
+        } => {
+            return Ok(Some(serde_json::to_value(
+                rdrive::client_read::config(home)?.profiles,
+            )?))
         }
-        Command::Info { profile } => {
-            let backend = read_connection(home, profile).await?;
-            let root = backend.stat("").await?;
-            serde_json::json!({"capabilities":backend.capabilities(),"root":root,"diagnostics":backend.diagnostics()})
-        }
-        Command::Ls { profile, remote, recursive, contains } => {
-            let remote = path(remote)?;
-            let backend = read_connection(home, profile).await?;
-            let mut entries = if *recursive { backend::walk(backend.as_ref(), &remote).await? }
-                else { backend.list(&remote).await? };
-            if let Some(filter) = contains { entries.retain(|entry| entry.path.contains(filter)); }
-            serde_json::to_value(entries)?
-        }
-        Command::Stat { profile, remote } => {
-            let remote = path(remote)?;
-            let backend = read_connection(home, profile).await?;
-            serde_json::to_value(backend.stat(&remote).await?)?
+        Command::Info { profile } | Command::Ls { profile, .. } | Command::Stat { profile, .. } => {
+            profile
         }
         _ => return Ok(None),
     };
-    Ok(Some(value))
+    let config = rdrive::client_read::config(home)?;
+    let profile = configured_profile(&config, home, name)?;
+    if let Command::Ls { remote, .. } | Command::Stat { remote, .. } = &cli.command {
+        path(remote)?;
+    }
+    let started = rdrive::connection_status::now_ms();
+    let result:Result<serde_json::Value>=async {
+        let backend=rdrive::factory::connect(&profile,name,rdrive::transfer::global()).await?;
+        if let Command::Info{..}=&cli.command {
+            let root=backend.stat_metadata("").await?;
+            return Ok(serde_json::json!({"capabilities":backend.capabilities(),"root":root,"diagnostics":backend.diagnostics()}));
+        }
+        if let Command::Ls{remote,recursive,contains,..}=&cli.command {
+            let remote=path(remote)?;
+            let mut entries=if *recursive {backend::walk(backend.as_ref(),&remote).await?}else{backend.list(&remote).await?};
+            if let Some(filter)=contains {entries.retain(|entry|entry.path.contains(filter));}
+            return Ok(serde_json::to_value(entries)?);
+        }
+        let Command::Stat{remote,..}=&cli.command else{return Ok(serde_json::Value::Null);};
+        Ok(serde_json::to_value(backend.stat(&path(remote)?).await?)?)
+    }.await;
+    // Missing entries alone do not establish authenticated reachability.
+    let proven = result.as_ref().is_ok_and(|value| {
+        !value.is_null()
+            && (!matches!(&cli.command, Command::Info { .. }) || !value["root"].is_null())
+    });
+    if result.is_err() || proven {
+        let operation = if matches!(&cli.command, Command::Ls { .. }) {
+            "list"
+        } else if matches!(&cli.command, Command::Info { .. }) {
+            "info"
+        } else {
+            "stat"
+        };
+        let _ = rdrive::connection_status::observe(
+            home,
+            name,
+            &profile,
+            operation,
+            started,
+            result.as_ref().map(|_| ()),
+        );
+    }
+    result.map(Some)
 }
 
 fn profile_command(cli: &Cli) -> Result<Option<(rdrive::profile_admin::Command, std::time::Duration)>> {
@@ -774,6 +817,17 @@ fn sync_roots(
     Ok((local, remote, baseline))
 }
 
+fn record_sync_status(store:&mut Store,name:&str,local:&Path,remote:&str,report:&sync::SyncReport,
+    metadata:Option<&rdrive::metadata_remote::MetadataSyncReport>)->Result<()> {
+    let mut conflicts=report.conflicts.iter().take(10).map(|item|serde_json::json!({"path":item.path,"reason":item.reason})).collect::<Vec<_>>();
+    if let Some(meta)=metadata {conflicts.extend(meta.conflicts.iter().take(10usize.saturating_sub(conflicts.len())).map(|item|serde_json::json!({"path":item.path,"reason":item.reason})));}
+    let detail=serde_json::json!({"version":1,"binding":rdrive::connection_status::binding(&profile(store,name)?)?,"local_root":local,"remote_root":remote,
+        "phase":if metadata.is_some(){"metadata_plan"}else{"content_plan"},"applied":report.applied,"action_count":report.actions.len(),
+        "conflict_count":report.conflicts.len()+metadata.map_or(0,|meta|meta.conflicts.len()),"stored_examples_limit":10,"conflicts":conflicts,
+        "metadata_conflict_count":metadata.map(|meta|meta.conflicts.len()),"observed_at":state::now()});
+    store.event("sync-status",name,remote,&serde_json::to_string(&detail)?)
+}
+
 async fn do_sync(
     store: &mut Store,
     json: bool,
@@ -788,8 +842,10 @@ async fn do_sync(
     let report = if store.config.history.effective(name).enabled {
         sync::run_with_history(store,backend.as_ref(),name,&local,&remote,&baseline,&options,metadata).await?
     } else {sync::run_with_metadata(backend.as_ref(), &local, &remote, &baseline, &options, metadata).await?};
+    let _=record_sync_status(store,name,&local,&remote,&report,None);
     if metadata&&report.conflicts.is_empty(){
         let meta=rdrive::metadata_remote::sync(backend.as_ref(),&local,&remote,&baseline.with_extension("metadata.json"),&rdrive::metadata_remote::SyncOptions{apply:options.apply,direction:options.direction}).await?;
+        let _=record_sync_status(store,name,&local,&remote,&report,Some(&meta));
         emit(json,&serde_json::json!({"content":report,"metadata":meta}))?;
         if !meta.conflicts.is_empty(){bail!("metadata sync has conflicts; conflicting attributes were preserved");}
     }else{emit(json, &report)?;}
@@ -805,13 +861,14 @@ async fn do_sync(
 async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
     let json = cli.json;
     match &cli.command {
-        Command::Mcp { .. } | Command::Service { .. } | Command::Update { .. } | Command::History {command:Some(_),..} | Command::Checkpoint {..} => unreachable!(),
+        Command::Mcp { .. } | Command::Service { .. } | Command::Update { .. } | Command::History {command:Some(_),..} | Command::Checkpoint {..} | Command::StatusProbe {..} => unreachable!(),
         Command::Conflict { command } => match command {
             ConflictCommand::List { profile, local, remote } => {
                 let (local, remote, baseline) = sync_roots(store, profile, local, remote)?;
                 let backend = connect(store, profile).await?;
                 let options = sync_options(SyncDirection::Both, false, false);
                 let report = sync::run(backend.as_ref(), &local, &remote, &baseline, &options).await?;
+                let _=record_sync_status(store,profile,&local,&remote,&report,None);
                 emit(json, &report.conflicts)?;
             }
             ConflictCommand::Repair {
@@ -839,6 +896,10 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
                     expect.as_deref(),
                 )
                 .await?;
+                if report.applied {
+                    let detail=serde_json::json!({"version":1,"binding":rdrive::connection_status::binding(&self::profile(store,profile)?)?,"local_root":local,"remote_root":remote,"phase":"repair","applied":true,"action_count":1,"conflict_count":null,"conflicts":[],"metadata_conflict_count":null,"resolved_path":path,"observed_at":state::now()});
+                    let _=store.event("sync-status",profile,&remote,&detail.to_string());
+                }
                 emit(json, &report)?;
             }
         },
@@ -1413,10 +1474,7 @@ async fn execute(cli: &Cli, store: &mut Store) -> Result<()> {
             b.unlock(&path(remote)?, &token).await?;
             emit(json, &serde_json::json!({"unlocked":remote}))?;
         }
-        Command::Status => emit(
-            json,
-            &serde_json::json!({"state_directory":store.home,"profiles":store.config.profiles.len(),"queued":store.db.jobs.iter().filter(|j|j.status!="done"&&j.status!="cancelled").count(),"cache_files":store.db.cache.len(),"cache_bytes":store.db.cache.values().map(|c|c.entry.size).sum::<u64>(),"pinned":store.db.cache.values().filter(|c|c.pinned).count()}),
-        )?,
+        Command::Status {..} => emit(json, &rdrive::status::collect(&store.home,None)?)?,
         Command::Transfers { command } => match command {
             TransferCommand::List => emit(json, &rdrive::resume::list(store)?)?,
             TransferCommand::Discard { id } => emit(
@@ -1503,6 +1561,137 @@ async fn history_command(cli:&Cli,home:&Path)->Result<Option<serde_json::Value>>
     Ok(Some(rdrive::profile_admin::dispatch_history(home,&action,Duration::from_secs(300)).await?))
 }
 
+fn checked_connection(
+    probes: Option<&serde_json::Value>,
+    name: &str,
+    profile: &Profile,
+) -> Result<Option<serde_json::Value>> {
+    let binding = rdrive::connection_status::binding(profile)?;
+    Ok(probes
+        .and_then(|value| value["profiles"].as_array())
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row["profile"].as_str() == Some(name)
+                    && row["configuration_binding"].as_str() == Some(binding.as_str())
+            })
+        })
+        .cloned())
+}
+async fn status_connections(
+    home: &Path,
+    selected: Option<&str>,
+    check: bool,
+    timeout: u64,
+    jobs: usize,
+) -> Result<serde_json::Value> {
+    let probe = if check {
+        Some(rdrive::connection_status::probe_profiles(home, selected, timeout, jobs.min(4)).await)
+    } else {
+        None
+    };
+    let config = rdrive::client_read::config(home)?;
+    let mut connections = Vec::new();
+    for (name, profile) in config
+        .profiles
+        .iter()
+        .filter(|(name, _)| selected.is_none_or(|selected| selected == name.as_str()))
+    {
+        let probes = probe.as_ref().and_then(|result| result.as_ref().ok());
+        let checked = checked_connection(probes, name, profile)?;
+        let changed = probes.is_some() && checked.is_none();
+        let mut value = if let Some(value) = checked {
+            value
+        } else {
+            match rdrive::connection_status::snapshot(
+                home,
+                name,
+                profile,
+                rdrive::connection_status::now_ms(),
+                300,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    serde_json::json!({"profile":name,"state":"unknown","source":"unavailable_observation","checked_at":null,"last_success_at":null,"observation_error":rdrive::connection_status::safe_error(&error)})
+                }
+            }
+        };
+        if changed {
+            value["probe_error"] = serde_json::json!({"code":"configuration_changed","message":"Connection settings changed during inspection; repeat the command."});
+        }
+        value["protocol"] = serde_json::json!(profile.protocol);
+        connections.push(value);
+    }
+    let probe_error = probe.as_ref().and_then(|result| result.as_ref().err());
+    let partial = probe_error.is_some()
+        || connections
+            .iter()
+            .any(|row| !row["probe_error"].is_null() || !row["observation_error"].is_null());
+    let current = rdrive::client_read::config(home)?;
+    let same = serde_json::to_value(&config.profiles)? == serde_json::to_value(&current.profiles)?;
+    let changed = !same
+        || connections
+            .iter()
+            .any(|row| row["probe_error"]["code"] == "configuration_changed")
+        || probe
+            .as_ref()
+            .and_then(|p| p.as_ref().ok())
+            .and_then(|p| p["profiles"].as_array())
+            .is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["profile"]
+                        .as_str()
+                        .is_some_and(|name| !config.profiles.contains_key(name))
+                })
+            });
+    Ok(
+        serde_json::json!({"status":if partial||changed{"partial"}else{"ok"},"scope":"profiles","source":"authenticated_operation_observations","observed_at":state::now(),"data":{"profiles":if same{connections}else{Vec::new()},"check_requested":check,"freshness_seconds":300,"configuration_changed":changed},"probe_error":probe_error.map(rdrive::connection_status::safe_error)}),
+    )
+}
+
+async fn status_report(
+    home: &Path,
+    selected: Option<&str>,
+    check_connections: bool,
+    check_checkpoints: bool,
+    timeout: u64,
+    jobs: usize,
+    max_items: usize,
+) -> Result<serde_json::Value> {
+    if check_connections && jobs == 0 {
+        bail!("connection checks require a positive jobs limit");
+    }
+    let mut report = rdrive::status::collect_with_limit(home, selected, max_items)?;
+    report["connections"] = match status_connections(
+        home,
+        selected,
+        check_connections,
+        timeout,
+        jobs,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            serde_json::json!({"status":"error","scope":"profiles","source":"connection_configuration","observed_at":state::now(),"data":null,"error":rdrive::connection_status::safe_error(&error)})
+        }
+    };
+    if check_checkpoints {
+        let verified = rdrive::client_read::config(home)
+            .and_then(|config| rdrive::checkpoints::status(home, &config.checkpoints));
+        report["checkpoints"]["verification"] = match verified {
+            Ok(value) => {
+                serde_json::json!({"status":if value["busy"]==true{"busy"}else if value["available"]==false{"unsupported"}else{"ok"},"observed_at":state::now(),"data":value})
+            }
+            Err(error) => {
+                serde_json::json!({"status":"error","observed_at":state::now(),"error":rdrive::connection_status::safe_error(&error)})
+            }
+        };
+    }
+    report["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    report["read_only"] = serde_json::json!(!check_connections && !check_checkpoints);
+    Ok(report)
+}
+
 async fn run(cli: &Cli) -> Result<()> {
     run_with_native(cli, &NativeCalls::default()).await
 }
@@ -1537,6 +1726,17 @@ async fn run_with_native(cli: &Cli, native: &NativeCalls) -> Result<()> {
     }
     let home = rdrive::shared_home::resolve(cli.home.as_deref())?;
     rdrive::state_directory::guard(&home)?;
+    if let Command::StatusProbe {profile,binding} = &cli.command {
+        return emit(true,&rdrive::connection_status::worker(&home,profile,binding).await?);
+    }
+    if let Command::Status {profile,check_connections,check_checkpoints,timeout,details,max_items} = &cli.command {
+        let report=tokio::select! {
+            _=tokio::signal::ctrl_c()=>bail!("status inspection cancelled"),
+            result=status_report(&home,profile.as_deref(),*check_connections,*check_checkpoints,*timeout,cli.jobs,*max_items as usize)=>result?,
+        };
+        if cli.json {return emit(true,&report);}
+        return rdrive::status_display::write(&report,*details,&mut std::io::stdout().lock());
+    }
     if let Some(value) = history_command(cli, &home).await? {return emit(cli.json, &value);}
     if let Some(value) = read_command(cli, &home).await? { return emit(cli.json, &value); }
     if let Some((request, wait)) = profile_command(cli)? {
@@ -1736,6 +1936,57 @@ mod coverage_cli_tests {
         Cli::try_parse_from(input).unwrap()
     }
 
+    #[test]
+    fn current_connection_probe_rows_require_the_exact_profile_binding() {
+        let mut profile:Profile=serde_json::from_value(serde_json::json!({"protocol":"webdav","url":"https://example.invalid/","username":null,"password_env":null})).unwrap();
+        let binding=rdrive::connection_status::binding(&profile).unwrap();
+        let report=serde_json::json!({"profiles":[{"profile":"dav","configuration_binding":binding,"state":"online","source":"current_probe_not_persisted","observation_error":{"code":"local_storage"}}]});
+        let current=checked_connection(Some(&report),"dav",&profile).unwrap().unwrap();
+        assert_eq!(current["state"],"online");
+        assert_eq!(current["observation_error"]["code"],"local_storage");
+        assert!(checked_connection(None,"dav",&profile).unwrap().is_none());
+        assert!(checked_connection(Some(&serde_json::json!({})),"dav",&profile).unwrap().is_none());
+        assert!(checked_connection(Some(&report),"other",&profile).unwrap().is_none());
+        profile.username=Some("different-account".into());
+        assert!(checked_connection(Some(&report),"dav",&profile).unwrap().is_none());
+        profile.url="invalid".into();
+        assert!(checked_connection(Some(&report),"dav",&profile).is_err());
+    }
+
+    #[tokio::test]
+    async fn unified_status_preserves_invalid_state_and_reports_inspection_errors() {
+        let temporary=tempfile::tempdir().unwrap();
+        let home=temporary.path().join("state");
+        assert!(status_report(&home,None,true,false,1,0,10).await.unwrap_err().to_string().contains("positive jobs"));
+        let passive=status_report(&home,None,false,false,1,0,10).await.unwrap();
+        assert_eq!(passive["read_only"],true);
+        assert!(!home.exists());
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config=home.join("config.json");
+        std::fs::write(&config,b"{").unwrap();
+        std::fs::set_permissions(&config,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let partial=status_report(&home,None,false,true,1,1,10).await.unwrap();
+        assert_eq!(partial["connections"]["status"],"error");
+        assert_eq!(partial["checkpoints"]["verification"]["status"],"error");
+        assert_eq!(std::fs::read(&config).unwrap(),b"{");
+        assert!(status_connections(&home,None,true,1,1).await.is_err());
+        std::fs::write(&config,b"{\"profiles\":{}}").unwrap();
+        let unavailable=status_connections(&home,None,true,0,1).await.unwrap();
+        assert_eq!(unavailable["status"],"partial");
+        assert!(unavailable["probe_error"].is_object());
+        let mut configured=config::Config::default();
+        configured.profiles.insert("dav".into(),serde_json::from_value(serde_json::json!({"protocol":"webdav","url":"https://example.invalid/","username":null,"password_env":null})).unwrap());
+        state::atomic_json(&config,&configured).unwrap();
+        let health=home.join("connection-health");
+        std::fs::write(&health,b"retained invalid path").unwrap();
+        std::fs::set_permissions(&health,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let partial=status_connections(&home,None,false,1,1).await.unwrap();
+        assert_eq!(partial["status"],"partial");
+        assert!(partial["data"]["profiles"][0]["observation_error"].is_object());
+        assert_eq!(std::fs::read(&health).unwrap(),b"retained invalid path");
+    }
+
     #[tokio::test]
     async fn local_commands_persist_profiles_metadata_and_domain_intent() {
         let temp = tempfile::tempdir().unwrap();
@@ -1775,7 +2026,7 @@ mod coverage_cli_tests {
         for args in [vec!["index","config","--disable"],vec!["index","config","--enable","--depth","1"],vec!["index","config","--all","--refresh-seconds","12","--active-refresh-seconds","3"],
                      vec!["provider","domain-add","ordinary","dav"],vec!["provider","domains"],vec!["provider","domain-remove","ordinary"],
                      vec!["smart","setup","smart-one","dav"],vec!["smart","list","smart-one"],vec!["smart","retry","smart-one"],vec!["smart","recovery","smart-one"],vec!["smart","status"],
-                     vec!["transfers","list"],vec!["cache","list","dav"],vec!["cache","unpin","dav","missing","--recursive"],vec!["history","--limit","1"]] {
+                     vec!["transfers","list"],vec!["cache","list","dav"],vec!["cache","unpin","dav","missing","--recursive"],vec!["history","--limit","1"],vec!["status"]] {
             execute(&cli(&home,&args),&mut store).await.unwrap();
         }
         let domain=rdrive::provider::domains(&home).unwrap().into_iter().find(|value|value.id=="smart-one").unwrap();
@@ -1988,7 +2239,7 @@ mod cli_contract {
     fn every_leaf_and_declared_parameter_can_be_parsed_with_typed_values() {
         let mut command=Cli::command(); command.build(); let mut cases=Vec::new(); visit(&command, &[], &mut cases);
         let leaves=cases.iter().map(|case| case["command"].as_str().unwrap()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(leaves.len(),120,"update the public interface inventory when adding a command");
+        assert_eq!(leaves.len(),121,"update the public and hidden interface inventory when adding a command");
         assert!(cases.len()>600,"inherited and positional parameters must remain in the inventory");
         let directory=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/validation"); std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("cli-parameter-cases.json"),serde_json::to_vec_pretty(&serde_json::json!({"leaf_commands":leaves.len(),"parameter_cases":cases})).unwrap()).unwrap();
@@ -2221,7 +2472,10 @@ mod readonly_connection_tests {
             assert!(read_command(&cli(&home, &arguments), &home).await.is_err(), "{arguments:?}");
         }
         assert!(read_command(&cli(&home, &["cache", "list", "pan123"]), &home).await.unwrap().is_none());
-        assert_eq!((std::fs::read(home.join("config.json")).unwrap(), std::fs::read(home.join("state.json")).unwrap(), names(&home)), before);
+        assert_eq!(std::fs::read(home.join("config.json")).unwrap(), before.0);
+        assert_eq!(std::fs::read(home.join("state.json")).unwrap(), before.1);
+        let mut expected_names=before.2;expected_names.insert("connection-health".into());
+        assert_eq!(names(&home),expected_names);
         assert!(Store::open(home.clone()).err().unwrap().to_string().contains("another rdrive process"));
         assert!(dav.seen.lock().unwrap().iter().any(|request| request.contains("/dav/folder/")));
         let absent = temporary.path().join("absent");

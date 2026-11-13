@@ -379,6 +379,9 @@ pub fn current_path(
     Ok(paths.into_iter().next())
 }
 
+pub(crate) fn status_binding(config: &Config, profile: &str) -> Result<String> {
+    binding(config, profile)
+}
 pub fn status(home: &Path, config: &Config, profile: &str) -> Result<Value> {
     let entries = list(home, config, profile, None, None)?;
     let policy = config.history.effective(profile);

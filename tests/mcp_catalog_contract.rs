@@ -30,6 +30,8 @@ fn values(tool: &Tool, field: &Field, local: &Path) -> Vec<Value> {
             json!(["x".repeat(4096)]),
         ],
         Kind::Number => match field.name {
+            "max_items" => vec![json!(1),json!(10),json!(100)],
+            "timeout" if tool.name=="rdrive_status_check_connections" => vec![json!(1),json!(10),json!(120)],
             "max_bytes" if tool.name=="rdrive_checkpoint_config" => vec![json!(268435456_u64),json!(21474836480_u64),json!(9007199254740480_u64)],
             "max_records" => vec![json!(1),json!(48),json!(4096)],
             "interval_secs" => vec![json!(60),json!(3600),json!(31_536_000)],
@@ -432,6 +434,10 @@ fn all_mcp_tools_and_fields_validate_map_and_parse_without_executing() {
             "rdrive_policy_config",
             json!({"clear_exclude":true,"exclude":["*.tmp"]}),
         ),
+        ("rdrive_status", json!({"max_items":0})),
+        ("rdrive_status", json!({"max_items":101})),
+        ("rdrive_status_check_connections", json!({"timeout":0})),
+        ("rdrive_status_check_connections", json!({"timeout":121})),
         ("rdrive_smart_pause", json!({"all":true})),
         ("rdrive_smart_resume", json!({"domain":"unexpected-domain"})),
     ] {

@@ -41,6 +41,7 @@ See [features and limitations](FEATURES.md) for protocol differences, overwrite 
 
 ## Find an answer
 
+- **Status overview:** [connections, background service and retained state](STATUS.md).
 - **History and recovery:** [retained file versions, Finder recovery, and optional APFS checkpoints](HISTORY.md).
 - **File availability:** [cache limits, clearing, and migration](CACHE_MANAGEMENT.md); [Smart operations and recovery](SMART_OPERATIONS.md).
 - **Browsing and discovery:** [SQLite indexing and incremental refresh](DIRECTORY_INDEXING.md), including local index search.

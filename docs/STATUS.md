@@ -86,7 +86,7 @@ rdrive status --json --profile nas --details --max-items 5
 
 The report includes `schema_version`, `observed_at` and `state_directory`. Component sections use an envelope containing `status`, `scope`, `source`, `observed_at`, `data` and an error when inspection cannot complete. The previous top-level `profiles`, `queued`, `cache_files`, `cache_bytes` and `pinned` metrics remain available when their source ledger can be read; profile-scoped reports apply the selected profile to account-owned metrics.
 
-Components are sampled independently. The overview can report a busy, changing or malformed component while continuing to show unrelated sections. It does not replace missing or invalid evidence with a healthy zero. Existing SQLite metadata is read from verified temporary copies, including committed WAL data, without creating live sidecars or acquiring the application's writer lock. A concurrent change can make that component temporarily unavailable; a later status query can inspect a new snapshot.
+Components are sampled independently. The overview can report a busy, changing or malformed component while continuing to show unrelated sections. It does not replace missing or invalid evidence with a healthy zero. Existing SQLite metadata is read from verified temporary copies, including committed WAL data (bounded to 2 GiB per database or WAL file), without creating live sidecars or acquiring the application's writer lock. A concurrent change can make that component temporarily unavailable; a later status query can inspect a new snapshot.
 
 Use the specific section and its observation time when scripting a health decision. A complete JSON document can contain a connection failure or a component requiring attention.
 

@@ -223,7 +223,7 @@ enablement, and actual validation scope.
 
 ## Complete command help
 
-Generated from `rdrive 0.8.3`: **138 command entries** (including groups, excluding the root and automatic `help`), **120 executable leaf commands**, and **981 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
+Generated from `rdrive 0.8.3`: **138 command entries** (including groups, excluding the root and automatic `help`), **120 executable leaf commands**, and **987 option declarations** (including inherited global options; only trailing whitespace in help text is removed).
 
 ### `rdrive`
 
@@ -266,7 +266,7 @@ Commands:
   versions    Save, inspect, restore and prune custom remote file versions
   lock        Acquire a WebDAV write lock; save its token for later writes/unlock
   unlock      Uses RDRIVE_WEBDAV_LOCK_TOKEN; tokens are not accepted as arguments
-  status      Local queue/cache summary; works offline
+  status      Unified local status; optional live checks are explicit and read-only
   mount       Mount through macOS native SMB/WebDAV helpers
   mounts      List mounts reported by the operating system
   unmount     Unmount a native SMB/WebDAV filesystem
@@ -2538,17 +2538,23 @@ Options:
 ### `rdrive status`
 
 ```text
-Local queue/cache summary; works offline
+Unified local status; optional live checks are explicit and read-only
 
 Usage: rdrive status [OPTIONS]
 
 Options:
-      --home <HOME>          State/config directory (also RDRIVE_HOME)
-      --json                 Compact machine-readable JSON. Errors are JSON on stderr
-      --limit <LIMIT>        Aggregate payload bytes/second across all jobs (headers excluded)
-      --progress <PROGRESS>  Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
-      --jobs <JOBS>          Concurrent queue targets. Jobs for the same target retain order [default: 4]
-  -h, --help                 Print help
+      --home <HOME>            State/config directory (also RDRIVE_HOME)
+      --profile <PROFILE>      Show one connection and its scoped state; shared limits remain labelled global
+      --check-connections      Verify authenticated remote directory metadata, with bounded credential/network waits
+      --json                   Compact machine-readable JSON. Errors are JSON on stderr
+      --check-checkpoints      Inspect the APFS store through its existing read-only mount interface
+      --limit <LIMIT>          Aggregate payload bytes/second across all jobs (headers excluded)
+      --progress <PROGRESS>    Live stderr progress; auto uses terminal bars or JSON when redirected [default: auto] [possible values: auto, off, json]
+      --timeout <TIMEOUT>      Per-connection live-check deadline in seconds [default: 10]
+      --details                Include bounded issue examples in the human summary; JSON always contains them
+      --jobs <JOBS>            Concurrent queue targets. Jobs for the same target retain order [default: 4]
+      --max-items <MAX_ITEMS>  Maximum issue examples per section [default: 10]
+  -h, --help                   Print help
 ```
 
 ### `rdrive mount`

@@ -168,7 +168,7 @@ Both existing always-run CI artifact uploads include `phases.json` and the
 `profile-merge-diagnostics/` directory, while valid raw-profile collections are
 not uploaded wholesale. Original command logs remain available alongside them.
 
-`--target-dir PATH` may reuse build caches while retaining fresh profiles and exact current Cargo artifacts. `--offline` disables Cargo networking, and `--cargo-llvm-cov PATH` selects an installed tool. `--workflows dav` collects DAV/IPC, `smb` collects Samba, and `none` runs only Rust tests; none of these subsets is complete acceptance. `--test-suite portable-smb` runs only SMB library tests and operations integration tests and requires `--workflows smb`. It supplements Linux protocol testing; macOS acceptance retains the default `all`.
+`--target-dir PATH` may reuse build caches while retaining fresh profiles and exact current Cargo artifacts. `--offline` disables Cargo networking, and `--cargo-llvm-cov PATH` selects an installed tool. `--workflows dav` collects DAV/IPC, `smb` collects Samba, and `none` runs only Rust tests; none of these subsets is complete acceptance. `--test-suite portable-smb` runs SMB and portable status library tests, plus operations integration tests and requires `--workflows smb`. It supplements Linux protocol testing; macOS acceptance retains the default `all`.
 
 Do not clear collection directories, remove `.profraw`, or replace objects before aggregation. Source changes require new collection; old line mappings cannot be reused for a new revision.
 

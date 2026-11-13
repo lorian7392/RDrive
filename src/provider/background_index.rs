@@ -142,11 +142,29 @@ async fn connect(worker:&mut Worker,plan:&Plan,connector:&dyn Connector)->Result
 async fn once(home:&Path,domain:&Domain,coordinator:&Mutex<()>,priority:Option<&admin::Priority>,worker:&mut Worker,connector:&dyn Connector)->Result<()> {
     let plan={let _guard=coordinator.lock().await;if priority.is_some_and(admin::Priority::requested){return Ok(());}prepare(home,domain,worker)?};
     let Some(plan)=plan else{return Ok(());};let timeout=std::time::Duration::from_secs(plan.profile.timeout_secs.max(5));
+    let started=crate::connection_status::now_ms();
     let connected=admin::read_phase(priority,timeout,connect(worker,&plan,connector)).await;
+    match &connected {
+        admin::ReadPhase::Finished(Err(error))=>note_connection(home,&plan,started,Err(error)),
+        admin::ReadPhase::TimedOut=>note_connection(home,&plan,started,Err(&anyhow::anyhow!("connection attempt timed out"))),
+        _=>(),
+    }
     let backend=match connected {admin::ReadPhase::Finished(Ok(backend))=>Some(backend),admin::ReadPhase::Deferred=>{worker.backends.clear();return Ok(());},_=>None};
-    let observed=if let Some(backend)=&backend {match admin::read_phase(priority,timeout,read(home,backend.as_ref(),&plan)).await {admin::ReadPhase::Finished(Ok(value))=>Some(value),admin::ReadPhase::Deferred=>{worker.backends.clear();return Ok(());},_=>None}}else{None};
+    let observed=if let Some(backend)=&backend {
+        let result=admin::read_phase(priority,timeout,read(home,backend.as_ref(),&plan)).await;
+        match &result {
+            admin::ReadPhase::Finished(Ok(_))=>note_connection(home,&plan,started,Ok(())),
+            admin::ReadPhase::Finished(Err(error))=>note_connection(home,&plan,started,Err(error)),
+            admin::ReadPhase::TimedOut=>note_connection(home,&plan,started,Err(&anyhow::anyhow!("directory metadata request timed out"))),
+            admin::ReadPhase::Deferred=>(),
+        }
+        match result {admin::ReadPhase::Finished(Ok(value))=>Some(value),admin::ReadPhase::Deferred=>{worker.backends.clear();return Ok(());},_=>None}
+    }else{None};
     if observed.is_none(){worker.backends.clear();}
     let _guard=coordinator.lock().await;publish(home,&plan,backend.as_ref().map(AsRef::as_ref),observed)?;Ok(())
+}
+fn note_connection(home:&Path,plan:&Plan,started:i64,result:Result<(),&anyhow::Error>) {
+    let _=crate::connection_status::observe(home,&plan.domain.profile,&plan.profile,"background_metadata",started,result);
 }
 
 #[cfg(test)]

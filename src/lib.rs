@@ -36,3 +36,6 @@ pub mod history;
 pub mod history_control;
 pub mod checkpoints;
 pub mod checkpoint_schedule;
+pub mod connection_status;
+pub mod status;
+pub mod status_display;
